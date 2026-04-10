@@ -1,0 +1,136 @@
+# =============================================================================
+# PMOS Full Stack — docker-compose.yml
+# Redis, Qdrant, and MySQL run on the host — not managed here.
+# Neo4j is AuraDB Cloud — no container needed.
+# =============================================================================
+
+x-python-service: &python-service
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  env_file:
+    - .env
+
+x-node-service: &node-service
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  env_file:
+    - .env
+
+services:
+  gateway:
+    <<: *node-service
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    container_name: pmos-gateway
+    ports:
+      - "4000:4000"
+    environment:
+      - GATEWAY_PORT=4000
+      - ORCHESTRATOR_URL=http://host.docker.internal:8000
+      - AGENT_MGMT_URL=http://host.docker.internal:4001
+      - RAG_SERVICE_URL=http://host.docker.internal:8002
+      - REDIS_URL=redis://host.docker.internal:6379
+      - SCORING_SERVICE_URL=http://host.docker.internal:8003
+      - MEMORY_SERVICE_URL=http://host.docker.internal:8001
+      - META_ASSEMBLY_URL=http://host.docker.internal:8004
+
+  agent-mgmt:
+    <<: *node-service
+    build:
+      context: ./services/agent-mgmt
+      dockerfile: Dockerfile
+    container_name: pmos-agent-mgmt
+    ports:
+      - "4001:4001"
+    environment:
+      - AGENT_MGMT_PORT=4001
+      - MYSQL_HOST=host.docker.internal
+      - REDIS_URL=redis://host.docker.internal:6379
+      - ORCHESTRATOR_URL=http://pmos-orchestrator:8000
+      - MEMORY_SERVICE_URL=http://pmos-memory:8001
+      - SCORING_SERVICE_URL=http://pmos-scoring:8003
+
+  orchestrator:
+    <<: *python-service
+    build:
+      context: ./services/orchestrator
+      dockerfile: Dockerfile
+    container_name: pmos-orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - ORCHESTRATOR_PORT=8000
+      - MYSQL_HOST=host.docker.internal
+      - REDIS_URL=redis://host.docker.internal:6379
+      - QDRANT_HOST=host.docker.internal
+      - MEMORY_SERVICE_URL=http://host.docker.internal:8001
+      - SCORING_SERVICE_URL=http://host.docker.internal:8003
+      - RAG_SERVICE_URL=http://host.docker.internal:8002
+      - META_ASSEMBLY_URL=http://host.docker.internal:8004
+      - AGENT_MGMT_URL=http://host.docker.internal:4001
+
+  memory:
+    <<: *python-service
+    build:
+      context: ./services/memory
+      dockerfile: Dockerfile
+    container_name: pmos-memory
+    ports:
+      - "8001:8001"
+    environment:
+      - MEMORY_PORT=8001
+      - MYSQL_HOST=host.docker.internal
+      - REDIS_URL=redis://host.docker.internal:6379
+      - FAISS_INDEX_PATH=/data/faiss
+    volumes:
+      - faiss-data:/data/faiss
+
+  rag:
+    <<: *python-service
+    build:
+      context: ./services/rag
+      dockerfile: Dockerfile
+    container_name: pmos-rag
+    ports:
+      - "8002:8002"
+    environment:
+      - RAG_PORT=8002
+      - MYSQL_HOST=host.docker.internal
+      - REDIS_URL=redis://host.docker.internal:6379
+      - QDRANT_HOST=host.docker.internal
+      - MEMORY_SERVICE_URL=http://host.docker.internal:8001
+      - FAISS_INDEX_PATH=/data/faiss
+    volumes:
+      - faiss-data:/data/faiss
+
+  scoring:
+    <<: *python-service
+    build:
+      context: ./services/scoring
+      dockerfile: Dockerfile
+    container_name: pmos-scoring
+    ports:
+      - "8003:8003"
+    environment:
+      - SCORING_PORT=8003
+      - MYSQL_HOST=host.docker.internal
+      - REDIS_URL=redis://host.docker.internal:6379
+
+  meta-assembly:
+    <<: *python-service
+    build:
+      context: ./services/meta-assembly
+      dockerfile: Dockerfile
+    container_name: pmos-meta-assembly
+    ports:
+      - "8004:8004"
+    environment:
+      - META_ASSEMBLY_PORT=8004
+      - MYSQL_HOST=host.docker.internal
+      - REDIS_URL=redis://host.docker.internal:6379
+
+volumes:
+  faiss-data:

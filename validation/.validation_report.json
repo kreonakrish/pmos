@@ -1,0 +1,68 @@
+[
+  {
+    "suite": "00_health_check",
+    "passed": 11,
+    "failed": 0,
+    "skipped": 0
+  },
+  {
+    "suite": "01_tool_validation",
+    "passed": 13,
+    "failed": 0,
+    "skipped": 0
+  },
+  {
+    "suite": "02_agent_validation",
+    "passed": 19,
+    "failed": 0,
+    "skipped": 1
+  },
+  {
+    "suite": "03_team_validation",
+    "passed": 11,
+    "failed": 0,
+    "skipped": 0
+  },
+  {
+    "suite": "04_memory_validation",
+    "passed": 3,
+    "failed": 0,
+    "skipped": 2
+  },
+  {
+    "suite": "05_rag_document_validation",
+    "passed": 11,
+    "failed": 0,
+    "skipped": 0
+  },
+  {
+    "suite": "06_scoring_validation",
+    "passed": 7,
+    "failed": 0,
+    "skipped": 0
+  },
+  {
+    "suite": "07_orchestrator_validation",
+    "passed": 6,
+    "failed": 0,
+    "skipped": 0
+  },
+  {
+    "suite": "08_conversation_validation",
+    "passed": 8,
+    "failed": 0,
+    "skipped": 0
+  },
+  {
+    "suite": "09_meta_assembly_validation",
+    "passed": 6,
+    "failed": 0,
+    "skipped": 0
+  },
+  {
+    "suite": "10_end_to_end_validation",
+    "passed": 5,
+    "failed": 0,
+    "skipped": 0
+  }
+]

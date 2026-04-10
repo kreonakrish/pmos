@@ -1,0 +1,62 @@
+{
+  "gap_description": "The task execution failed due to the lack of necessary financial calculation tools and support for amortization schedules in the agents.",
+  "gap_capability_type": "TOOL",
+  "gap_trace_id": "c54d5033-aa7e-4df6-b630-ff75bb7e701e",
+  "generated_spec": {
+    "capability_type": "TOOL",
+    "name": "financial_amortization_calculator",
+    "description": "Calculates amortization schedules for loans.",
+    "spec_json": {
+      "code": "import numpy as np\nimport pandas as pd\n\ndef run(**kwargs):\n    \"\"\"\n    Calculate the amortization schedule for a loan.\n\n    Keyword Arguments:\n    principal -- The initial amount of the loan (float).\n    annual_interest_rate -- The annual interest rate as a percentage (float).\n    years -- The number of years to repay the loan (int).\n\n    Returns:\n    A pandas DataFrame representing the amortization schedule.\n    \"\"\"\n    principal = kwargs.get('principal')\n    annual_interest_rate = kwargs.get('annual_interest_rate')\n    years = kwargs.get('years')\n\n    if principal is None or annual_interest_rate is None or years is None:\n        raise ValueError(\"Missing required arguments: principal, annual_interest_rate, years\")\n\n    monthly_interest_rate = annual_interest_rate / 100 / 12\n    number_of_payments = years * 12\n\n    monthly_payment = np.pmt(monthly_interest_rate, number_of_payments, -principal)\n\n    schedule = []\n    remaining_balance = principal\n\n    for month in range(1, number_of_payments + 1):\n        interest_payment = remaining_balance * monthly_interest_rate\n        principal_payment = monthly_payment - interest_payment\n        remaining_balance -= principal_payment\n        schedule.append((month, monthly_payment, principal_payment, interest_payment, remaining_balance))\n\n    df = pd.DataFrame(schedule, columns=['Month', 'Payment', 'Principal', 'Interest', 'Balance'])\n    return df\n",
+      "config_schema": {
+        "principal": {
+          "type": "float",
+          "description": "The initial amount of the loan."
+        },
+        "annual_interest_rate": {
+          "type": "float",
+          "description": "The annual interest rate as a percentage."
+        },
+        "years": {
+          "type": "int",
+          "description": "The number of years to repay the loan."
+        }
+      },
+      "test_cases": [
+        {
+          "input": {
+            "principal": 1000.0,
+            "annual_interest_rate": 5.0,
+            "years": 1
+          },
+          "expected_output": null,
+          "description": "Test with a small loan amount over one year."
+        },
+        {
+          "input": {
+            "principal": 50000.0,
+            "annual_interest_rate": 3.5,
+            "years": 15
+          },
+          "expected_output": null,
+          "description": "Test with a medium loan amount over fifteen years."
+        },
+        {
+          "input": {
+            "principal": 200000.0,
+            "annual_interest_rate": 4.0,
+            "years": 30
+          },
+          "expected_output": null,
+          "description": "Test with a large loan amount over thirty years."
+        }
+      ],
+      "dependencies": [
+        "numpy",
+        "pandas"
+      ]
+    }
+  },
+  "validation_score": 1.0,
+  "registered_capability_id": "76ded8f4-6c19-48c5-9f6c-428539cf1534"
+}

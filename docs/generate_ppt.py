@@ -1,0 +1,506 @@
+"""Generate PMOS Executive Presentation + Architecture Diagrams."""
+
+from pptx import Presentation
+from pptx.util import Inches, Pt, Emu
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.shapes import MSO_SHAPE
+import os
+
+# Colors
+DARK_BG = RGBColor(0x1A, 0x1A, 0x2E)
+BLUE = RGBColor(0x00, 0x7B, 0xFF)
+LIGHT_BLUE = RGBColor(0x4D, 0xA6, 0xFF)
+GREEN = RGBColor(0x00, 0xC8, 0x53)
+ORANGE = RGBColor(0xFF, 0x9F, 0x00)
+RED = RGBColor(0xF4, 0x43, 0x36)
+PURPLE = RGBColor(0xAB, 0x47, 0xBC)
+WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+GRAY = RGBColor(0xB0, 0xB0, 0xB0)
+LIGHT_BG = RGBColor(0x2D, 0x2D, 0x44)
+CARD_BG = RGBColor(0x35, 0x35, 0x55)
+
+prs = Presentation()
+prs.slide_width = Inches(13.333)
+prs.slide_height = Inches(7.5)
+
+
+def add_dark_bg(slide):
+    bg = slide.background
+    fill = bg.fill
+    fill.solid()
+    fill.fore_color.rgb = DARK_BG
+
+
+def add_textbox(slide, left, top, width, height, text, font_size=14,
+                color=WHITE, bold=False, alignment=PP_ALIGN.LEFT, font_name="Segoe UI"):
+    txBox = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+    tf = txBox.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    p.text = text
+    p.font.size = Pt(font_size)
+    p.font.color.rgb = color
+    p.font.bold = bold
+    p.font.name = font_name
+    p.alignment = alignment
+    return txBox
+
+
+def add_card(slide, left, top, width, height, title, body, accent=BLUE):
+    # Card background
+    shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(left), Inches(top),
+                                    Inches(width), Inches(height))
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = CARD_BG
+    shape.line.fill.background()
+    # Accent bar
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(left), Inches(top),
+                                  Inches(0.06), Inches(height))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = accent
+    bar.line.fill.background()
+    # Title
+    add_textbox(slide, left + 0.2, top + 0.1, width - 0.3, 0.35, title, 13, accent, True)
+    # Body
+    add_textbox(slide, left + 0.2, top + 0.45, width - 0.3, height - 0.55, body, 10, GRAY)
+
+
+def add_box(slide, left, top, width, height, text, fill_color=BLUE, font_size=9, text_color=WHITE):
+    shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(left), Inches(top),
+                                    Inches(width), Inches(height))
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = fill_color
+    shape.line.fill.background()
+    tf = shape.text_frame
+    tf.word_wrap = True
+    tf.paragraphs[0].alignment = PP_ALIGN.CENTER
+    p = tf.paragraphs[0]
+    p.text = text
+    p.font.size = Pt(font_size)
+    p.font.color.rgb = text_color
+    p.font.bold = True
+    p.font.name = "Segoe UI"
+    return shape
+
+
+def add_arrow(slide, x1, y1, x2, y2, color=GRAY):
+    connector = slide.shapes.add_connector(1, Inches(x1), Inches(y1), Inches(x2), Inches(y2))
+    connector.line.color.rgb = color
+    connector.line.width = Pt(1.5)
+
+
+# ==========================================
+# SLIDE 1: Title
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 1, 1.5, 11, 1.2, "PMOS", 60, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 1, 2.8, 11, 0.8, "Perpetual Multi-Agent Orchestration System", 28, WHITE, False, PP_ALIGN.CENTER)
+add_textbox(slide, 2, 4.0, 9, 0.6, "Self-extending AI orchestration that connects structured & unstructured data sources\nthrough collaborative agents for instant cross-domain analytics", 16, GRAY, False, PP_ALIGN.CENTER)
+add_textbox(slide, 4, 5.5, 5, 0.4, "Architecture & Value Proposition", 14, LIGHT_BLUE, False, PP_ALIGN.CENTER)
+
+# ==========================================
+# SLIDE 2: The Problem
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.8, 0.4, 11, 0.6, "The Problem", 32, BLUE, True)
+add_textbox(slide, 0.8, 1.1, 11, 0.5, "Analysts spend 70% of their time finding data, not analyzing it", 18, WHITE, False)
+
+add_card(slide, 0.8, 2.0, 3.7, 1.4, "Data Silos",
+         "SQL databases, graph stores, documents,\nAPIs, and code repos — all disconnected.\nNo unified query layer.", RED)
+add_card(slide, 4.7, 2.0, 3.7, 1.4, "Manual Integration",
+         "Copy-paste between tools. Context\nswitching. Reformatting. Hours spent\non plumbing, not insights.", ORANGE)
+add_card(slide, 8.6, 2.0, 3.7, 1.4, "No Learning",
+         "Every query starts from scratch.\nNo memory of past analyses.\nNo quality feedback loop.", PURPLE)
+
+add_card(slide, 0.8, 3.8, 5.6, 2.5, "A Typical Cross-Domain Analysis Today",
+         "1. Log into MySQL Workbench, write SQL, export CSV\n"
+         "2. Open Neo4j Browser, write Cypher, copy results\n"
+         "3. Read 20-page DOCX report manually for context\n"
+         "4. Open Jupyter, write Python, run calculations\n"
+         "5. Search GitHub for reference implementations\n"
+         "6. Copy everything into PowerPoint\n\n"
+         "Time: 2-4 hours per analysis", RED)
+
+add_card(slide, 6.6, 3.8, 5.6, 2.5, "With PMOS",
+         "Ask a single natural language question.\n\n"
+         "The system automatically:\n"
+         "- Decomposes into sub-tasks\n"
+         "- Selects the right agents & tools\n"
+         "- Queries all data sources in parallel\n"
+         "- Synthesizes into a unified report\n\n"
+         "Time: 15 seconds - 3 minutes", GREEN)
+
+# ==========================================
+# SLIDE 3: Value Proposition
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.8, 0.4, 11, 0.6, "Value Proposition", 32, BLUE, True)
+
+add_card(slide, 0.8, 1.4, 3.7, 2.0, "For Business Analysts",
+         "- Ask questions in plain English\n"
+         "- No SQL/Cypher/Python needed\n"
+         "- Upload docs, get instant answers\n"
+         "- Cross-domain reports in seconds\n"
+         "- Full audit trail of reasoning", GREEN)
+
+add_card(slide, 4.7, 1.4, 3.7, 2.0, "For Data Scientists",
+         "- Rapid hypothesis testing\n"
+         "- Python agent for calculations\n"
+         "- RAG pipeline for any document\n"
+         "- Memory learns from past queries\n"
+         "- RL feedback improves over time", BLUE)
+
+add_card(slide, 8.6, 1.4, 3.7, 2.0, "For Decision Makers",
+         "- Consolidated cross-domain reports\n"
+         "- No waiting for multiple teams\n"
+         "- Confidence scores on every answer\n"
+         "- Audit trail for compliance\n"
+         "- Self-extending capabilities", PURPLE)
+
+add_card(slide, 0.8, 3.8, 5.6, 2.5, "Key Differentiators vs ChatGPT/Copilot",
+         "ChatGPT: Single LLM, no tool access, no memory, hallucinations\n\n"
+         "PMOS:\n"
+         "  - Multiple specialized agents with dedicated tools\n"
+         "  - Direct SQL, Cypher, API access to YOUR systems\n"
+         "  - 4-tier memory (short/long/reasoning/episodic)\n"
+         "  - RL-trained scoring with adaptive quality bands\n"
+         "  - Every claim backed by tool call + audit trail\n"
+         "  - Self-extends: detects gaps, generates new tools", ORANGE)
+
+add_card(slide, 6.6, 3.8, 5.6, 2.5, "Proven Results",
+         "Test: 5-part cross-domain question requiring\n"
+         "MySQL + Neo4j + DOCX + GitHub + Python\n\n"
+         "  73 task nodes decomposed\n"
+         "  43 sub-agents spawned (depth 3)\n"
+         "  213 agent interactions logged\n"
+         "  86 capability bids evaluated\n"
+         "  4 agents coordinated automatically\n"
+         "  Score: 0.70 (within adaptive band)\n"
+         "  Full audit trail in Neo4j graph", BLUE)
+
+# ==========================================
+# SLIDE 4: C1 - System Context
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.8, 0.3, 11, 0.5, "C1 — System Context Diagram", 28, BLUE, True)
+add_textbox(slide, 0.8, 0.8, 11, 0.4, "How PMOS fits in the enterprise ecosystem", 14, GRAY)
+
+# Users
+add_box(slide, 1.5, 1.8, 2.2, 0.8, "Business Analysts\n& Data Scientists", RGBColor(0x2E, 0x7D, 0x32))
+add_box(slide, 5.5, 1.8, 2.2, 0.8, "Decision Makers\n& Managers", RGBColor(0x2E, 0x7D, 0x32))
+add_box(slide, 9.5, 1.8, 2.2, 0.8, "Developers &\nArchitects", RGBColor(0x2E, 0x7D, 0x32))
+
+# PMOS System
+shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(3.5), Inches(3.2), Inches(6), Inches(1.5))
+shape.fill.solid()
+shape.fill.fore_color.rgb = BLUE
+shape.line.fill.background()
+tf = shape.text_frame
+tf.word_wrap = True
+tf.paragraphs[0].alignment = PP_ALIGN.CENTER
+tf.paragraphs[0].text = "PMOS — Perpetual Multi-Agent Orchestration System"
+tf.paragraphs[0].font.size = Pt(14)
+tf.paragraphs[0].font.color.rgb = WHITE
+tf.paragraphs[0].font.bold = True
+p2 = tf.add_paragraph()
+p2.text = "Natural language → Cross-domain analysis → Structured reports"
+p2.font.size = Pt(10)
+p2.font.color.rgb = RGBColor(0xCC, 0xDD, 0xFF)
+p2.alignment = PP_ALIGN.CENTER
+
+# External Systems
+add_box(slide, 0.5, 5.5, 1.8, 0.9, "MySQL\nDatabases", RGBColor(0x1B, 0x5E, 0x20))
+add_box(slide, 2.7, 5.5, 1.8, 0.9, "Neo4j\nGraph DB", RGBColor(0x1B, 0x5E, 0x20))
+add_box(slide, 4.9, 5.5, 1.8, 0.9, "Document\nStore (Qdrant)", RGBColor(0x1B, 0x5E, 0x20))
+add_box(slide, 7.1, 5.5, 1.8, 0.9, "External APIs\n(GitHub, REST)", RGBColor(0x1B, 0x5E, 0x20))
+add_box(slide, 9.3, 5.5, 1.8, 0.9, "LLM Providers\n(OpenAI, etc.)", RGBColor(0x1B, 0x5E, 0x20))
+add_box(slide, 11.3, 5.5, 1.5, 0.9, "Redis\nStreams", RGBColor(0x1B, 0x5E, 0x20))
+
+# Arrows
+add_arrow(slide, 2.6, 2.6, 5.5, 3.2, GRAY)
+add_arrow(slide, 6.6, 2.6, 6.5, 3.2, GRAY)
+add_arrow(slide, 10.6, 2.6, 7.5, 3.2, GRAY)
+for x in [1.4, 3.6, 5.8, 8.0, 10.2, 12.0]:
+    add_arrow(slide, x, 5.5, x, 4.7, GRAY)
+
+# ==========================================
+# SLIDE 5: C2 - Container Diagram
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.8, 0.2, 11, 0.5, "C2 — Container Diagram", 28, BLUE, True)
+add_textbox(slide, 0.8, 0.65, 11, 0.35, "7 microservices + React frontend + 4 backing stores", 13, GRAY)
+
+# Frontend
+add_box(slide, 0.5, 1.3, 2.5, 0.7, "React Frontend\nPort 3000 | Vite + MUI", RGBColor(0x00, 0x97, 0xA7), 9)
+# Gateway
+add_box(slide, 3.5, 1.3, 2.5, 0.7, "API Gateway\nPort 4000 | Express + JWT", RGBColor(0x01, 0x57, 0x9B), 9)
+
+# Backend Services Row 1
+add_box(slide, 0.3, 2.6, 2.0, 1.0, "Orchestrator\nPort 8000\nFastAPI\nPipeline + Graph", BLUE, 8)
+add_box(slide, 2.5, 2.6, 2.0, 1.0, "Agent-Mgmt\nPort 4001\nExpress\nCRUD + Execution", RGBColor(0x28, 0x63, 0x8A), 8)
+add_box(slide, 4.7, 2.6, 2.0, 1.0, "Memory\nPort 8001\nFastAPI\n4-Tier Memory", PURPLE, 8)
+add_box(slide, 6.9, 2.6, 2.0, 1.0, "RAG\nPort 8002\nFastAPI\nChunk + Embed", RGBColor(0x00, 0x69, 0x5C), 8)
+add_box(slide, 9.1, 2.6, 2.0, 1.0, "Scoring\nPort 8003\nFastAPI\nRL + Bands", ORANGE, 8)
+add_box(slide, 11.3, 2.6, 1.7, 1.0, "Meta-Assembly\nPort 8004\nFastAPI\nGap Detection", RGBColor(0x6A, 0x1B, 0x9A), 8)
+
+# Backing Stores
+add_box(slide, 0.3, 4.3, 2.5, 0.8, "MySQL 8.0\nPort 3306\n23 tables | Host-installed", RGBColor(0x33, 0x69, 0x1E), 8)
+add_box(slide, 3.1, 4.3, 2.5, 0.8, "Neo4j AuraDB\nCloud (TLS)\nGraph: Tasks, Agents", RGBColor(0x33, 0x69, 0x1E), 8)
+add_box(slide, 5.9, 4.3, 2.5, 0.8, "Qdrant\nPort 6333\nVector Store (RAG)", RGBColor(0x33, 0x69, 0x1E), 8)
+add_box(slide, 8.7, 4.3, 2.5, 0.8, "Redis 7\nPort 6379\n7 Streams + Rate Limit", RGBColor(0x33, 0x69, 0x1E), 8)
+
+# Data flow labels
+add_textbox(slide, 0.3, 5.4, 12, 1.8,
+    "Data Flow:\n"
+    "User → Frontend → Gateway (auth + rate-limit) → Orchestrator → Pipeline\n"
+    "Pipeline: Decompose → Negotiate (agents bid) → Execute (tool-use loop + sub-agents) → Score → Aggregate → Learn\n"
+    "Streams: memory:writes (103) | scoring:feedback (30) | events:telemetry (210) | events:tool_health (41) | events:documents",
+    10, GRAY)
+
+# ==========================================
+# SLIDE 6: C3 - Orchestrator Components
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.8, 0.2, 11, 0.5, "C3 — Orchestrator Component Diagram", 28, BLUE, True)
+add_textbox(slide, 0.8, 0.65, 11, 0.35, "The brain of the system: 10-step pipeline with recursive sub-agent spawning", 13, GRAY)
+
+# Pipeline steps
+steps = [
+    ("Step 0", "Load Team\nHierarchy", RGBColor(0x45, 0x5A, 0x64)),
+    ("Steps 1-2", "LLM Task\nDecomposition", BLUE),
+    ("Step 3", "Capability\nNegotiation", ORANGE),
+    ("Steps 4-7", "Agentic\nTool Loop", GREEN),
+    ("Step 8", "Result\nAggregation", PURPLE),
+    ("Step 9", "Memory +\nRL Learning", RGBColor(0xC6, 0x28, 0x28)),
+]
+
+x = 0.4
+for label, desc, color in steps:
+    add_box(slide, x, 1.3, 2.0, 0.5, label, color, 9)
+    add_box(slide, x, 1.9, 2.0, 0.6, desc, CARD_BG, 8)
+    if x < 10.4:
+        add_arrow(slide, x + 2.0, 1.55, x + 2.15, 1.55, GRAY)
+    x += 2.1
+
+# Component boxes
+add_card(slide, 0.4, 3.0, 3.0, 1.5, "Capability Negotiation",
+         "- Broadcast bid to all agents\n"
+         "- LLM self-assessment per agent\n"
+         "- Rank: 60% conf + 25% mem + 15% lat\n"
+         "- Assign winner + fallback chain", ORANGE)
+
+add_card(slide, 3.6, 3.0, 3.0, 1.5, "Agentic Tool-Use Loop",
+         "- Max 5 iterations per agent\n"
+         "- Tools: DB, Graph, API, Python, GitHub\n"
+         "- spawn_sub_agent for delegation\n"
+         "- Auto-continue truncated responses", GREEN)
+
+add_card(slide, 6.8, 3.0, 3.0, 1.5, "Sub-Agent Spawning",
+         "- Recursive (max depth 3)\n"
+         "- Own context, tools, memory\n"
+         "- Negotiated from team specialists\n"
+         "- Result → parent as tool_result", BLUE)
+
+add_card(slide, 10.0, 3.0, 3.0, 1.5, "Scoring & Correction",
+         "- S = w1·R + w2·A + w3·P + w4·L + ...\n"
+         "- Adaptive band: mean ± std × k\n"
+         "- Below band → fallback agent\n"
+         "- RL weight updates (Q-learning)", RED)
+
+# Neo4j Graph
+add_card(slide, 0.4, 4.8, 6.0, 2.0, "Neo4j Execution Graph",
+         "TaskGraph → TaskNode (ROOT/SUBTASK/SUB_AGENT)\n"
+         "  └─ SPAWNED_BY → parent TaskNode\n"
+         "  └─ PRODUCED_EVENT → ExecutionEvent (BID_WON, SCORE, etc.)\n"
+         "  └─ HAS_INTERACTION → AgentInteraction\n"
+         "Agent → MEMBER_OF → Team\n\n"
+         "Every execution creates a live, queryable graph", RGBColor(0x00, 0x69, 0x5C))
+
+add_card(slide, 6.6, 4.8, 6.0, 2.0, "Memory Architecture",
+         "SHORT_TERM:  Redis hash, TTL-based, session context\n"
+         "LONG_TERM:   MySQL + FAISS, persistent knowledge\n"
+         "REASONING:   MySQL JSON, distilled patterns\n"
+         "EPISODIC:    MySQL + FAISS, full execution episodes\n\n"
+         "All 4 tiers assembled into system prompt before every\n"
+         "agent execution. Agents learn from past conversations.", PURPLE)
+
+# ==========================================
+# SLIDE 7: C4 - Code Level (Pipeline Flow)
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.8, 0.2, 11, 0.5, "C4 — Code-Level: Pipeline Execution Flow", 28, BLUE, True)
+
+# Flow diagram using boxes and arrows
+add_box(slide, 0.5, 1.2, 2.3, 0.6, "User Message\n(natural language)", RGBColor(0x2E, 0x7D, 0x32), 9)
+add_arrow(slide, 2.8, 1.5, 3.1, 1.5, GRAY)
+add_box(slide, 3.1, 1.2, 2.3, 0.6, "LLM Decompose\n→ TaskGraph", BLUE, 9)
+add_arrow(slide, 5.4, 1.5, 5.7, 1.5, GRAY)
+add_box(slide, 5.7, 1.2, 2.3, 0.6, "Negotiate\n(parallel bids)", ORANGE, 9)
+add_arrow(slide, 8.0, 1.5, 8.3, 1.5, GRAY)
+add_box(slide, 8.3, 1.2, 2.3, 0.6, "Winner Agent\n+ Fallback Chain", RGBColor(0x28, 0x63, 0x8A), 9)
+
+add_arrow(slide, 9.45, 1.8, 9.45, 2.2, GRAY)
+
+# Agent execution loop
+shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.5), Inches(2.2), Inches(12), Inches(4.5))
+shape.fill.solid()
+shape.fill.fore_color.rgb = RGBColor(0x25, 0x25, 0x40)
+shape.line.color.rgb = BLUE
+shape.line.width = Pt(1)
+
+add_textbox(slide, 0.7, 2.3, 3, 0.3, "AGENTIC TOOL-USE LOOP (max 5 iterations)", 11, BLUE, True)
+
+add_box(slide, 0.8, 2.8, 2.2, 0.7, "Assemble Prompt\nMemory (4-tier)\n+ RAG docs", PURPLE, 8)
+add_arrow(slide, 3.0, 3.15, 3.3, 3.15, GRAY)
+add_box(slide, 3.3, 2.8, 2.2, 0.7, "LLM Call\n(with tools as\nfunction defs)", BLUE, 8)
+add_arrow(slide, 5.5, 3.15, 5.8, 3.15, GRAY)
+
+# Decision
+add_box(slide, 5.8, 2.8, 2.0, 0.7, "LLM Response\nText or\nTool Calls?", ORANGE, 8)
+
+# Text path
+add_arrow(slide, 7.8, 2.95, 8.2, 2.95, GREEN)
+add_box(slide, 8.2, 2.8, 1.8, 0.7, "Text Response\n→ Done\n→ Score", GREEN, 8)
+add_arrow(slide, 10.0, 3.15, 10.3, 3.15, GRAY)
+add_box(slide, 10.3, 2.8, 2.0, 0.7, "Score & Band\nCheck\n→ proceed/fix", RGBColor(0xC6, 0x28, 0x28), 8)
+
+# Tool call path
+add_arrow(slide, 6.8, 3.5, 6.8, 3.9, ORANGE)
+add_textbox(slide, 6.2, 3.55, 1.5, 0.3, "tool calls", 8, ORANGE)
+
+# Tool types
+add_box(slide, 0.8, 4.0, 1.6, 0.7, "DATABASE\nMySQL query", RGBColor(0x33, 0x69, 0x1E), 8)
+add_box(slide, 2.6, 4.0, 1.6, 0.7, "GRAPH\nNeo4j Cypher", RGBColor(0x33, 0x69, 0x1E), 8)
+add_box(slide, 4.4, 4.0, 1.6, 0.7, "API / GITHUB\nHTTP calls", RGBColor(0x33, 0x69, 0x1E), 8)
+add_box(slide, 6.2, 4.0, 1.6, 0.7, "PYTHON\nSandbox exec", RGBColor(0x33, 0x69, 0x1E), 8)
+
+# spawn_sub_agent
+add_box(slide, 8.0, 4.0, 2.2, 0.7, "spawn_sub_agent\n→ Negotiate\n→ Recurse (depth+1)", RGBColor(0xFF, 0x70, 0x43), 8)
+
+add_arrow(slide, 9.1, 4.7, 9.1, 5.1, RGBColor(0xFF, 0x70, 0x43))
+add_box(slide, 8.0, 5.1, 2.2, 0.7, "Sub-Agent Loop\n(own tools+memory)\nmax depth 3", RGBColor(0xBF, 0x36, 0x0C), 8)
+
+# Result back
+add_box(slide, 10.5, 4.0, 1.8, 0.7, "tool_result\n→ back to LLM\n→ next iteration", RGBColor(0x28, 0x63, 0x8A), 8)
+
+# Bottom: output
+add_box(slide, 3.0, 5.8, 3.0, 0.7, "Memory Write\n(episodic + Redis stream)", PURPLE, 8)
+add_box(slide, 6.3, 5.8, 3.0, 0.7, "RL Feedback\n(scoring:feedback stream)", ORANGE, 8)
+add_box(slide, 9.6, 5.8, 3.0, 0.7, "Final Response\n→ Gateway → User", GREEN, 8)
+
+# ==========================================
+# SLIDE 8: Use Cases
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.8, 0.4, 11, 0.6, "High-Value Use Cases", 32, BLUE, True)
+
+cases = [
+    ("Portfolio Risk Analysis", "\"How does our loan portfolio risk compare\nto the MBA industry forecast?\"", "Graph + Document (RAG)", GREEN),
+    ("Compliance Cross-Check", "\"Which loans in CA and NY need enhanced\nTRID/TILA review per our policy memo?\"", "Graph + Document + MySQL", BLUE),
+    ("Stress Testing", "\"Run a stress test on HELOC portfolio\nassuming rates increase 200bps\"", "Graph + Python + Policies", ORANGE),
+    ("Market Intelligence", "\"Find open-source amortization tools and\ncompare their approaches to our models\"", "GitHub + Python + Database", PURPLE),
+    ("Borrower 360", "\"Give me everything about LOAN001 —\nborrower, property, payments, compliance\"", "Neo4j Graph (single query)", RGBColor(0x00, 0x69, 0x5C)),
+    ("Cross-Domain Report", "\"Top film revenues vs mortgage portfolio\nperformance with Python projections\"", "MySQL + Graph + Python + RAG", RED),
+]
+
+for i, (title, question, sources, color) in enumerate(cases):
+    row = i // 3
+    col = i % 3
+    x = 0.5 + col * 4.2
+    y = 1.4 + row * 2.8
+    add_card(slide, x, y, 3.9, 2.4, title, f"{question}\n\nSources: {sources}", color)
+
+# ==========================================
+# SLIDE 9: Tech Stack
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.8, 0.4, 11, 0.6, "Technology Stack", 32, BLUE, True)
+
+add_card(slide, 0.5, 1.3, 4.0, 2.5, "Frontend",
+         "React 18 + TypeScript\n"
+         "Vite (dev server, port 3000)\n"
+         "Material UI 5\n"
+         "D3.js (sequence diagrams, force graphs)\n"
+         "React Query (data fetching)\n"
+         "Zustand (state management)\n"
+         "15 pages: Chat, Agent Studio, Monitors", BLUE)
+
+add_card(slide, 4.7, 1.3, 4.0, 2.5, "Backend Services",
+         "2 Node.js (Express 5 + TypeScript)\n"
+         "  - Gateway (auth, routing, WebSocket)\n"
+         "  - Agent-Mgmt (CRUD, tool execution)\n\n"
+         "5 Python (FastAPI 0.109)\n"
+         "  - Orchestrator, Memory, RAG,\n"
+         "    Scoring, Meta-Assembly\n"
+         "  - All Dockerized", GREEN)
+
+add_card(slide, 8.9, 1.3, 4.0, 2.5, "Data Stores",
+         "MySQL 8.0 — 23 tables\n"
+         "  Agents, tools, scores, memory, docs\n\n"
+         "Neo4j AuraDB — Cloud graph\n"
+         "  Tasks, execution events, interactions\n\n"
+         "Qdrant — Vector store (RAG)\n"
+         "Redis 7 — Streams + rate limiting\n"
+         "FAISS — Local vector backup", ORANGE)
+
+add_card(slide, 0.5, 4.2, 4.0, 2.5, "AI & ML",
+         "LLM: OpenAI GPT-4o / GPT-4o-mini\n"
+         "  (pluggable: Anthropic, Google, Ollama)\n\n"
+         "Embeddings: sentence-transformers\n"
+         "  all-mpnet-base-v2 (768-dim)\n\n"
+         "Re-ranking: cross-encoder/ms-marco\n\n"
+         "RL: Q-learning weight updates\n"
+         "Scoring: 6-factor weighted formula", PURPLE)
+
+add_card(slide, 4.7, 4.2, 4.0, 2.5, "Document Processing",
+         "PDF: PyPDF2 (text extraction)\n"
+         "DOCX: python-docx (paragraphs + tables)\n"
+         "XLSX: openpyxl (multi-sheet)\n"
+         "HTML: BeautifulSoup4\n"
+         "CSV, JSON, Markdown, TXT\n\n"
+         "Chunking: fixed / sentence / paragraph\n"
+         "Configurable chunk size + overlap\n"
+         "Selectable embedding model", RGBColor(0x00, 0x69, 0x5C))
+
+add_card(slide, 8.9, 4.2, 4.0, 2.5, "Infrastructure",
+         "Docker Compose — 7 containers\n"
+         "pmos.sh — service manager\n\n"
+         "Observability:\n"
+         "  Structured JSON logs (trace_id)\n"
+         "  Prometheus metrics on every service\n"
+         "  OpenTelemetry spans\n\n"
+         "Circuit breakers + retry (tenacity)\n"
+         "Redis Streams for async events", RGBColor(0x45, 0x5A, 0x64))
+
+# ==========================================
+# SLIDE 10: Summary
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 1, 1.0, 11, 1.0, "PMOS", 54, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 1, 2.2, 11, 0.6, "Connect any data source. Ask any question.\nGet answers in minutes, not hours.", 22, WHITE, False, PP_ALIGN.CENTER)
+
+add_textbox(slide, 1.5, 3.5, 10, 3.0,
+    "7 microservices  |  4 data stores  |  6 agents  |  7 Redis streams\n\n"
+    "Recursive sub-agent spawning  |  Capability negotiation  |  RL scoring\n\n"
+    "4-tier memory  |  RAG pipeline  |  Full audit trail  |  Self-extending\n\n"
+    "PDF, DOCX, XLSX, HTML, CSV, JSON, Markdown  |  MySQL, Neo4j, Qdrant\n\n"
+    "One question → decompose → negotiate → execute → score → learn → respond",
+    15, GRAY, False, PP_ALIGN.CENTER)
+
+add_textbox(slide, 3, 6.3, 7, 0.5, "github.com/kreonakrish  |  localhost:3000", 13, LIGHT_BLUE, False, PP_ALIGN.CENTER)
+
+# Save
+output_path = os.path.join(os.path.dirname(__file__), "..", "PMOS_Architecture_Presentation.pptx")
+prs.save(output_path)
+print(f"Saved: {output_path}")
