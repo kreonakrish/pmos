@@ -676,25 +676,260 @@ add_card(slide, 6.8, 4.0, 6.0, 2.9,
 
 
 # ==========================================
-# SLIDE 15: Summary
+# SLIDE 15: Market Category
 # ==========================================
 slide = prs.slides.add_slide(prs.slide_layouts[6])
 add_dark_bg(slide)
-add_textbox(slide, 1, 0.8, 11, 1.0, "PMOS", 54, BLUE, True, PP_ALIGN.CENTER)
-add_textbox(slide, 1, 2.0, 11, 0.6,
+add_textbox(slide, 0.5, 0.3, 12, 0.6, "Market Category — Semantic Layer for Federated Data", 26, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 0.5, 0.9, 12, 0.4,
+            "What we're building has a name — and several marketing labels — depending on which slice the vendor is selling",
+            13, GRAY, False, PP_ALIGN.CENTER)
+
+# Marketing label table (left) + the common loop (right)
+add_textbox(slide, 0.5, 1.6, 6.0, 0.3, "MARKETING LABELS", 12, LIGHT_BLUE, True)
+labels = [
+    ("Semantic layer", "dbt, Cube, AtScale, Looker, Power BI"),
+    ("Universal semantic layer", "Cube, AtScale (vendor-neutral)"),
+    ("Metric layer / metric store", "dbt MetricFlow"),
+    ("Data catalog with AI", "Alation, Collibra, Atlan, Informatica"),
+    ("Knowledge graph for data", "Stardog, data.world, Neo4j, Anzo"),
+    ("Conversational analytics", "ThoughtSpot, Tableau, Hex, Mode"),
+    ("Text-to-SQL", "Defog, Vanna, WrenAI, Numbers Station"),
+    ("Cortex Analyst", "Snowflake (first-party, late 2024)"),
+]
+y = 2.0
+for lbl, vendors in labels:
+    add_textbox(slide, 0.5, y, 2.6, 0.32, lbl, 11, WHITE, True)
+    add_textbox(slide, 3.1, y, 3.3, 0.32, vendors, 10, GRAY)
+    y += 0.42
+
+# The common loop on the right
+add_textbox(slide, 7.0, 1.6, 6.0, 0.3, "THE COMMON LOOP — EVERYONE IMPLEMENTS THIS", 12, LIGHT_BLUE, True)
+loop_steps = [
+    ("1  CRAWL",   "physical metadata from sources",    LIGHT_BLUE),
+    ("2  MAP",     "to a semantic layer (LLM + human)", ORANGE),
+    ("3  STORE",   "in a graph / catalog / git",        PURPLE),
+    ("4  RETRIEVE","relevant semantic context",         GREEN),
+    ("5  GENERATE","SQL / SPARQL / Cypher / KQL",       BLUE),
+    ("6  EXECUTE", "+ self-correct / re-rank",          GREEN),
+]
+y = 2.0
+for t, sub, c in loop_steps:
+    add_box(slide, 7.0, y, 2.0, 0.42, t, fill_color=c, font_size=11)
+    add_textbox(slide, 9.15, y + 0.07, 4.0, 0.3, sub, 11, GRAY)
+    y += 0.52
+
+add_textbox(slide, 7.0, 5.4, 6.0, 1.0,
+            "Differentiation lives in the details of steps 2 (mapping quality), "
+            "4 (retrieval relevance), and 5 (generation grounding). "
+            "PMOS shares the loop — it competes on how it implements each step.",
+            11, WHITE, False)
+
+
+# ==========================================
+# SLIDE 16: Competitive Landscape — 6 Groups
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.5, 0.3, 12, 0.6, "Competitive Landscape — Six Groups of Players", 26, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 0.5, 0.9, 12, 0.4,
+            "The category is real and crowded; vendors that started in different buckets are converging on the same shape",
+            13, GRAY, False, PP_ALIGN.CENTER)
+
+# 2x3 grid of cards
+add_card(slide, 0.4, 1.4, 4.15, 2.7,
+         "1. KNOWLEDGE-GRAPH NATIVE",
+         "Closest architectural cousins to PMOS.\n\n"
+         "• Stardog — RDF KG + Voicebox NL→SPARQL\n"
+         "• data.world — graph-native, regulated industries\n"
+         "• Anzo (Cambridge Semantics) — enterprise KG\n"
+         "• Neo4j — GraphRAG framework + reference arch\n\n"
+         "Years on ontology + entity resolution.",
+         accent=PURPLE)
+
+add_card(slide, 4.7, 1.4, 4.15, 2.7,
+         "2. MODERN DATA CATALOGS",
+         "Catalogs catching up by bolting LLMs on top.\n\n"
+         "• Alation — Alation Aurora\n"
+         "• Collibra — Collibra AI\n"
+         "• Atlan — most aggressive AI positioning\n"
+         "• Informatica — CLAIRE GPT\n\n"
+         "Strong on metadata + distribution; thin AI layers.",
+         accent=BLUE)
+
+add_card(slide, 9.0, 1.4, 4.15, 2.7,
+         "3. SEMANTIC / METRIC LAYER",
+         "Define metrics in code, query through them.\n\n"
+         "• dbt Labs — Semantic Layer + MetricFlow\n"
+         "• Cube — universal semantic layer\n"
+         "• AtScale — enterprise semantic layer\n"
+         "• Looker (Google) — LookML + Gemini\n"
+         "• Power BI / Tableau — Copilot + Pulse\n\n"
+         "Strong BI; weak on cross-source federation.",
+         accent=ORANGE)
+
+add_card(slide, 0.4, 4.25, 4.15, 2.7,
+         "4. TEXT-TO-SQL OSS",
+         "Most directly comparable to PMOS internals.\n\n"
+         "• WrenAI (Canner) — closest architecturally\n"
+         "• Vanna.ai — RAG-to-SQL, simpler\n"
+         "• Defog SQLCoder — fine-tuned SQL models\n"
+         "• Numbers Station — foundation-model approach\n"
+         "• Dataherald — pluggable NL-to-SQL\n\n"
+         "Read WrenAI's codebase before adding crawlers.",
+         accent=GREEN)
+
+add_card(slide, 4.7, 4.25, 4.15, 2.7,
+         "5. CLOUD PLATFORMS",
+         "Late but heavy hitters; will commoditize the easy 80%.\n\n"
+         "• Snowflake Cortex Analyst (late 2024)\n"
+         "• Databricks Genie\n"
+         "• BigQuery + Gemini\n"
+         "• AWS Q for Business (laggard, fragmented)\n\n"
+         "Polished for their own data; "
+         "weak on legacy systems they don't own.",
+         accent=RED)
+
+add_card(slide, 9.0, 4.25, 4.15, 2.7,
+         "6. IN-HOUSE ENTERPRISE",
+         "Case studies, not products; prove pattern at scale.\n\n"
+         "• Uber QueryGPT — multi-agent, well-documented\n"
+         "• LinkedIn DARWIN / SQLGen\n"
+         "• Pinterest Querybot\n"
+         "• Airbnb internal text-to-SQL\n"
+         "• Meta + Stripe internal versions\n\n"
+         "Architectures public via papers and posts.",
+         accent=LIGHT_BLUE)
+
+
+# ==========================================
+# SLIDE 17: Where PMOS Differentiates
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.5, 0.3, 12, 0.6, "Where PMOS Does What Others Don't", 26, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 0.5, 0.9, 12, 0.4,
+            "Three differences that make PMOS more than yet-another text-to-SQL tool",
+            13, GRAY, False, PP_ALIGN.CENTER)
+
+add_card(slide, 0.5, 1.6, 4.0, 5.4,
+         "1. MULTI-AGENT BIDDING + RL",
+         "None of the named products treat agent selection "
+         "as a contextual bandit.\n\n"
+         "They have ONE LLM (or a fixed router) doing everything.\n\n"
+         "PMOS has a population of agents that:\n"
+         "• Compete for tasks via bidding\n"
+         "• Get scored after execution\n"
+         "• Receive RL feedback (rewards)\n"
+         "• Converge over time\n\n"
+         "Catalog vendors don't think this way at all — "
+         "their world is one agent answering one question.",
+         accent=PURPLE)
+
+add_card(slide, 4.7, 1.6, 4.0, 5.4,
+         "2. INFERENCE TRACEABILITY UI",
+         "The Model Governance page shows the full hop-by-hop "
+         "reasoning chain:\n\n"
+         "user → bid → task nodes → tool calls → scoring → "
+         "RL feedback → response\n\n"
+         "as a layered timeline an operator can read like a "
+         "flight recorder.\n\n"
+         "Stardog and data.world come closest because the "
+         "knowledge graph naturally records the path — "
+         "but neither surfaces it as a UI the way PMOS does.",
+         accent=GREEN)
+
+add_card(slide, 8.9, 1.6, 4.0, 5.4,
+         "3. AGENTS + DATA IN ONE GRAPH",
+         "Most products keep the catalog (data side) and the "
+         "orchestration runtime (agent side) in SEPARATE stores.\n\n"
+         "PMOS puts in ONE Neo4j instance:\n"
+         "• TaskNode + AgentInteraction (runtime)\n"
+         "• BusinessEntity + DataAsset (catalog)\n"
+         "• MAPS_TO + SPAWNED_BY edges\n\n"
+         "The bet: the JOIN between 'what the agent did' "
+         "and 'what the data means' is itself a useful query "
+         "target — and the system that learns from its own "
+         "behavior needs that join.",
+         accent=ORANGE)
+
+
+# ==========================================
+# SLIDE 18: Honest Gaps + Strategic Positioning
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.5, 0.3, 12, 0.6, "Honest Gaps and Strategic Positioning", 26, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 0.5, 0.9, 12, 0.4,
+            "What others do better than PMOS today, and where PMOS should choose to compete",
+            13, GRAY, False, PP_ALIGN.CENTER)
+
+# Two columns
+add_card(slide, 0.5, 1.5, 6.0, 3.0,
+         "WHAT OTHERS DO BETTER",
+         "• Ontology curation tooling — Stardog, Atlan: years of "
+         "entity resolution, glossary, lineage propagation\n"
+         "• Connector library — Alation/Collibra/Atlan/Informatica "
+         "have hundreds of connectors; PMOS has one (MySQL)\n"
+         "• Enterprise security — column ACLs, masking, ABAC, "
+         "audit-log compliance\n"
+         "• BI tool integration — dbt/Cube/AtScale plug into "
+         "Tableau, Power BI, Looker, ThoughtSpot natively",
+         accent=RED)
+
+add_card(slide, 6.8, 1.5, 6.0, 3.0,
+         "WHERE PMOS SHOULD COMPETE",
+         "NOT 'another text-to-SQL on Snowflake' — that race is "
+         "over before it starts (Cortex Analyst already won).\n\n"
+         "INSTEAD: 'Multi-agent reasoning system with KG-based "
+         "semantic substrate, full inference traceability, and "
+         "RL-driven self-improvement, designed for FEDERATED data "
+         "estates the cloud vendors don't own.'\n\n"
+         "Buyers: financial services, healthcare, government, "
+         "large industrials — anywhere data sprawls across "
+         "30 systems no one will migrate.",
+         accent=GREEN)
+
+# Bottom strip — three things to watch
+add_textbox(slide, 0.5, 4.8, 12, 0.4, "THREE COMPETITORS TO WATCH CLOSELY", 14, LIGHT_BLUE, True, PP_ALIGN.CENTER)
+add_box(slide, 0.5, 5.3, 4.1, 1.8,
+        "WrenAI (open source)\n\n"
+        "Architecturally closest. If they add the agent-bidding "
+        "layer, they become a direct competitor.",
+        fill_color=CARD_BG, font_size=11)
+add_box(slide, 4.7, 5.3, 4.1, 1.8,
+        "Snowflake Cortex Analyst\n\n"
+        "If they make it easy to register external sources via "
+        "their semantic model, they capture every Snowflake customer.",
+        fill_color=CARD_BG, font_size=11)
+add_box(slide, 8.9, 5.3, 4.1, 1.8,
+        "Atlan (catalog vendor)\n\n"
+        "Most likely catalog vendor to add a governance trace UI. "
+        "If they ship it, the differentiation gap closes on that axis.",
+        fill_color=CARD_BG, font_size=11)
+
+
+# ==========================================
+# SLIDE 19: Summary
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 1, 0.6, 11, 1.0, "PMOS", 54, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 1, 1.8, 11, 0.6,
             "Connect any data source. Ask any question.\nGet deterministic answers in minutes, not hours.",
             22, WHITE, False, PP_ALIGN.CENTER)
 
-add_textbox(slide, 1.5, 3.2, 10, 3.5,
+add_textbox(slide, 1.5, 3.0, 10, 3.7,
     "7 microservices  |  4 data stores  |  6 agents  |  7 Redis streams\n\n"
     "Home-lending business domain — 6 schemas, 27 tables  |  Cross-system queries\n\n"
     "Model Governance — full inference traceability per trace_id\n\n"
-    "ML Insights — bandits, Node2Vec, learned scorer, SOP discovery, all shadow-mode\n\n"
-    "Data Catalog — metadata crawler framework + semantic knowledge graph + auditor RL\n\n"
-    "One question → decompose → negotiate → execute → score → learn → respond",
+    "ML Insights — bandits, Node2Vec, learned scorer, SOP discovery, shadow-mode\n\n"
+    "Data Catalog — metadata crawler + semantic KG + auditor RL feedback\n\n"
+    "Positioning: federated reasoning system, NOT text-to-SQL-on-Snowflake\n\n"
+    "Closest cousins: Stardog, data.world, WrenAI  |  Watch: Cortex, Atlan",
     14, GRAY, False, PP_ALIGN.CENTER)
 
-add_textbox(slide, 3, 6.7, 7, 0.5,
+add_textbox(slide, 3, 6.85, 7, 0.5,
             "github.com/kreonakrish/pmos  |  localhost:3000",
             13, LIGHT_BLUE, False, PP_ALIGN.CENTER)
 
