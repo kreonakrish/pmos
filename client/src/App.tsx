@@ -21,6 +21,8 @@ import GraphPage from '@/pages/Graph';
 import ScoringPage from '@/pages/Scoring';
 import MemoryPage from '@/pages/Memory';
 import DocumentsPage from '@/pages/Documents';
+import ModelGovernancePage from '@/pages/ModelGovernance';
+import MLInsightsPage from '@/pages/MLInsights';
 import SettingsPage from '@/pages/Settings';
 
 export default function App() {
@@ -101,6 +103,8 @@ export default function App() {
               <Route path="/scoring" element={<ScoringPage />} />
               <Route path="/memory" element={<MemoryPage />} />
               <Route path="/documents" element={<DocumentsPage />} />
+              <Route path="/model-governance" element={<ModelGovernancePage />} />
+              <Route path="/ml-insights" element={<MLInsightsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               {/* Legacy redirects */}
               <Route path="/chat" element={<Navigate to="/conversations" replace />} />

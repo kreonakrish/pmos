@@ -269,4 +269,91 @@ router.get('/graph/tasks', async (req: Request, res: Response): Promise<void> =>
   });
 });
 
+// ─── Model Governance routes ────────────────────────────────────────────────
+
+/**
+ * GET /v1/governance/traces — list recent traces
+ */
+router.get('/governance/traces', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  logger.info('proxy_governance_list', { layer: 'router', trace_id: traceId });
+  const qs = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/governance/traces${qs}`,
+  });
+});
+
+/**
+ * GET /v1/governance/traces/by-conversation/:cid
+ */
+router.get('/governance/traces/by-conversation/:cid', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const { cid } = req.params;
+  logger.info('proxy_governance_by_conv', { layer: 'router', trace_id: traceId, conversation_id: cid });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/governance/traces/by-conversation/${cid}`,
+  });
+});
+
+/**
+ * GET /v1/governance/traces/:targetTraceId — full reasoning chain
+ */
+router.get('/governance/traces/:targetTraceId', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const { targetTraceId } = req.params;
+  logger.info('proxy_governance_trace', {
+    layer: 'router',
+    trace_id: traceId,
+    target_trace_id: targetTraceId,
+  });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/governance/traces/${targetTraceId}`,
+  });
+});
+
+// ─── ML Insights routes ─────────────────────────────────────────────────────
+// Bandit + embedding observability for the learning loop.
+
+function mlProxy(pathname: string) {
+  return async (req: Request, res: Response): Promise<void> => {
+    const traceId = (req as Request & { id?: string }).id;
+    const qs = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+    logger.info('proxy_ml', { layer: 'router', trace_id: traceId, path: pathname });
+    await proxyRequest(req, res, {
+      targetUrl: `${config.ORCHESTRATOR_URL}${pathname}${qs}`,
+    });
+  };
+}
+
+router.get('/ml/bandits/summary',     mlProxy('/v1/ml/bandits/summary'));
+router.get('/ml/bandits/state',       mlProxy('/v1/ml/bandits/state'));
+router.get('/ml/bandits/decisions',   mlProxy('/v1/ml/bandits/decisions'));
+router.get('/ml/bandits/convergence', mlProxy('/v1/ml/bandits/convergence'));
+router.get('/ml/embeddings/summary',    mlProxy('/v1/ml/embeddings/summary'));
+router.get('/ml/embeddings/projection', mlProxy('/v1/ml/embeddings/projection'));
+router.get('/ml/embeddings/similar',    mlProxy('/v1/ml/embeddings/similar'));
+
+// Learned scorer (1B) + SOP discovery (2D)
+router.get('/ml/learned-scorer/summary',     mlProxy('/v1/ml/learned-scorer/summary'));
+router.get('/ml/learned-scorer/predictions', mlProxy('/v1/ml/learned-scorer/predictions'));
+router.get('/ml/sops/proposals',             mlProxy('/v1/ml/sops/proposals'));
+
+router.post('/ml/sops/proposals/:id/promote', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const { id } = req.params;
+  logger.info('proxy_ml_sop_promote', { layer: 'router', trace_id: traceId, proposal_id: id });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/ml/sops/proposals/${id}/promote`,
+  });
+});
+
+router.post('/ml/sops/proposals/:id/reject', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const { id } = req.params;
+  logger.info('proxy_ml_sop_reject', { layer: 'router', trace_id: traceId, proposal_id: id });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/ml/sops/proposals/${id}/reject`,
+  });
+});
+
 export default router;

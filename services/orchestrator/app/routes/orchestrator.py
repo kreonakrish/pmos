@@ -519,7 +519,14 @@ async def list_sops(
             {},
             trace_id=trace_id,
         )
-        sops = [dict(r["s"]) for r in (rows or [])]
+        # Coerce neo4j.time.DateTime and other native types to JSON-safe values
+        sops = []
+        for r in (rows or []):
+            sop = {
+                k: (str(v) if not isinstance(v, (str, int, float, bool, list, type(None))) else v)
+                for k, v in dict(r["s"]).items()
+            }
+            sops.append(sop)
         return {"sops": sops, "trace_id": trace_id}
     except Exception:
         return {"sops": [], "trace_id": trace_id}

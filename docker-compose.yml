@@ -71,6 +71,9 @@ services:
       - RAG_SERVICE_URL=http://host.docker.internal:8002
       - META_ASSEMBLY_URL=http://host.docker.internal:8004
       - AGENT_MGMT_URL=http://host.docker.internal:4001
+      - PMOS_MODEL_DIR=/app/models
+    volumes:
+      - ./infra/ml_models:/app/models:ro
 
   memory:
     <<: *python-service

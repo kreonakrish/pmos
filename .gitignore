@@ -42,3 +42,6 @@ htmlcov/
 # Python virtual envs
 venv/
 .venv/
+
+# Claude Code session state
+.claude/

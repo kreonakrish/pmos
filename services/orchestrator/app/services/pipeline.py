@@ -34,7 +34,9 @@ from app.config import settings
 from app.models.bid import BidRequest, BidResponse, NegotiationResult
 from app.models.task import Criticality, NodeType, TaskGraph
 from app.services.agent_selector import Agent, AgentSelector
+from app.services.bandit_selector import BanditDecision, BanditSelector
 from app.services.capability_negotiation import CapabilityNegotiationService
+from app.services.learned_scorer import LearnedScorer
 from app.services.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError
 from app.services.course_corrector import CourseAction, CourseCorrector
 from app.services.graph_manager import GraphManager
@@ -89,6 +91,23 @@ class PipelineService:
 
         # Interaction logger (fire-and-forget)
         self._interaction_logger = InteractionLogger(neo4j)
+
+        # Contextual bandit agent selector (shadow mode — logs decisions,
+        # does not yet override _step3_negotiate's winner).
+        self._bandit = BanditSelector()
+
+        # Shadow learned-quality scorer (1B). Loads the active model if any
+        # exists under /app/models. Predictions are logged but do NOT influence
+        # the live score until w7_learned_quality > 0 in scoring_weights.
+        self._learned_scorer = LearnedScorer()
+        try:
+            self._learned_scorer.load_active()
+        except Exception as exc:
+            logger.warning(
+                "LearnedScorer load_active failed at startup",
+                layer="service",
+                error=str(exc),
+            )
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -156,14 +175,17 @@ class PipelineService:
             # Capability Negotiation: broadcast bids for each subtask
             all_agents = ([primary] if primary else []) + fallbacks
             negotiation_results: Dict[str, NegotiationResult] = {}
+            bandit_decisions: Dict[str, BanditDecision] = {}
             agent_assignments: Dict[str, Agent] = {}
 
             if all_agents and node_descriptions:
-                negotiation_results = await self._step3_negotiate(
+                negotiation_results, bandit_decisions = await self._step3_negotiate(
                     graph_id=graph_id,
                     node_descriptions=node_descriptions,
                     team_agents=all_agents,
                     trace_id=trace_id,
+                    team_id=team_id,
+                    session_id=session_id,
                 )
                 # Build agent assignments from negotiation winners
                 for desc, neg_result in negotiation_results.items():
@@ -189,6 +211,69 @@ class PipelineService:
                 negotiation_results=negotiation_results,
                 team_context=team_context,
             )
+
+            # Bandit reward back-fill: for each node result we have a score,
+            # feed it back to the bandit so its per-(agent, context) Beta
+            # distributions update. Runs after execution so the current request
+            # path is not blocked.
+            if bandit_decisions:
+                for nr in node_results:
+                    desc = nr.get("description") or ""
+                    decision = bandit_decisions.get(desc)
+                    if not decision:
+                        continue
+                    score = nr.get("score")
+                    if score is None:
+                        continue
+                    try:
+                        self._bandit.record_reward(
+                            decision_id=decision.decision_id,
+                            reward=float(score),
+                            trace_id=trace_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Bandit reward update failed (non-fatal)",
+                            layer="service",
+                            decision_id=decision.decision_id,
+                            error=str(exc),
+                            trace_id=trace_id,
+                        )
+
+            # Learned-scorer shadow predictions (1B). Runs once per node_result,
+            # logs to learned_scorer_predictions for later comparison against the
+            # heuristic scorer. Never blocks on failure.
+            if self._learned_scorer.is_loaded():
+                for nr in node_results:
+                    try:
+                        score_val = nr.get("score")
+                        if score_val is None:
+                            continue
+                        self._learned_scorer.predict_and_log(
+                            ctx={
+                                "content": nr.get("llm_response") or "",
+                                "heuristic_score": float(score_val),
+                                "latency_ms": int(nr.get("latency_ms") or 0),
+                                "tool_call_count": len(nr.get("tools_used") or []),
+                                "n_task_nodes": len(node_results),
+                                "context_len_chars": len(message or ""),
+                                "graph_depth": 1,
+                            },
+                            trace_id=trace_id,
+                            session_id=session_id,
+                            graph_id=graph_id,
+                            node_id=str(nr.get("node_id") or ""),
+                            agent_id=str(nr.get("agent_id") or ""),
+                            agent_name=str(nr.get("agent_name") or ""),
+                            heuristic_score=float(score_val),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "LearnedScorer shadow prediction failed (non-fatal)",
+                            layer="service",
+                            error=str(exc),
+                            trace_id=trace_id,
+                        )
 
             # Step 8: AGGREGATION
             final_response = await self._step8_aggregation(
@@ -569,9 +654,18 @@ class PipelineService:
         node_descriptions: List[str],
         team_agents: List[Agent],
         trace_id: str,
-    ) -> Dict[str, NegotiationResult]:
-        """Run capability negotiation for each subtask description."""
+        team_id: str = "",
+        session_id: str = "",
+    ) -> Tuple[Dict[str, NegotiationResult], Dict[str, BanditDecision]]:
+        """Run capability negotiation for each subtask description.
+
+        In addition to bidding, this also invokes the contextual bandit in
+        SHADOW mode so we can log what the bandit would have picked for each
+        decision alongside the bid winner. The bandit does not yet influence
+        selection; reward back-fill happens after scoring completes.
+        """
         results: Dict[str, NegotiationResult] = {}
+        bandit_decisions: Dict[str, BanditDecision] = {}
 
         # Get graph nodes to map descriptions to node IDs
         graph_nodes = await self._graph_mgr.get_graph_nodes(graph_id, trace_id=trace_id)
@@ -598,6 +692,33 @@ class PipelineService:
                     trace_id=trace_id,
                 )
                 results[desc] = neg_result
+
+                # Shadow-mode bandit decision alongside the bid
+                try:
+                    context_bucket = f"team:{team_id or 'default'}|type:{bid_request.task_type}"
+                    winner_id = neg_result.winner.agent_id if neg_result.winner else ""
+                    winner_name = neg_result.winner.agent_name if neg_result.winner else ""
+                    bd = self._bandit.select(
+                        candidates=team_agents,
+                        context_bucket=context_bucket,
+                        actual_winner_id=winner_id,
+                        actual_winner_name=winner_name,
+                        trace_id=trace_id,
+                        session_id=session_id,
+                        graph_id=graph_id,
+                        node_id=node_id,
+                        mode="SHADOW",
+                    )
+                    if bd is not None:
+                        bandit_decisions[desc] = bd
+                except Exception as exc:
+                    logger.warning(
+                        "Bandit shadow decision failed (non-fatal)",
+                        layer="service",
+                        description=desc[:80],
+                        error=str(exc),
+                        trace_id=trace_id,
+                    )
 
                 # Log negotiation as an interaction (fire-and-forget)
                 if neg_result.winner:
@@ -626,7 +747,7 @@ class PipelineService:
                     trace_id=trace_id,
                 )
 
-        return results
+        return results, bandit_decisions
 
     # ------------------------------------------------------------------
     # Steps 4-7: EXECUTION with correction and expansion
