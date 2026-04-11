@@ -24,6 +24,12 @@ import {
   DialogActions,
   Tooltip,
   Divider,
+  MenuItem,
+  Select,
+  InputLabel,
+  FormControl,
+  FormControlLabel,
+  Switch,
 } from '@mui/material';
 import StorageIcon from '@mui/icons-material/Storage';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
@@ -36,6 +42,8 @@ import CloseIcon from '@mui/icons-material/Close';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import KeyIcon from '@mui/icons-material/Key';
 import LinkIcon from '@mui/icons-material/Link';
+import AddIcon from '@mui/icons-material/Add';
+import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import {
   useCrawlers,
   useCrawlRuns,
@@ -46,6 +54,8 @@ import {
   useMappingDecisions,
   useMappingDecisionsSummary,
   useReviewMapping,
+  useCreateCrawler,
+  CreateCrawlerInput,
   Crawler,
   MappingDecision,
 } from '@/api/catalog';
@@ -57,6 +67,251 @@ function fmt(n: number | null | undefined, digits = 2): string {
 function fmtTs(ts: string | null | undefined): string {
   if (!ts) return '';
   try { return new Date(ts).toLocaleString(); } catch { return String(ts); }
+}
+
+// ---------------------------------------------------------------------------
+// Source-type field schema for the Create Crawler form.
+// Each source type has its own connection + options field list. Adding a new
+// source type means: add an entry here, and (eventually) implement the
+// matching <Type>Crawler in services/orchestrator/app/services/crawler/.
+// ---------------------------------------------------------------------------
+type FieldType = 'text' | 'password' | 'number' | 'boolean' | 'csv';
+interface FieldDef {
+  name: string;
+  label: string;
+  type: FieldType;
+  required?: boolean;
+  default?: string | number | boolean;
+  helper?: string;
+}
+interface SourceSchema {
+  label: string;
+  description: string;
+  implemented: boolean;
+  connection: FieldDef[];
+  options: FieldDef[];
+}
+
+const SOURCE_SCHEMAS: Record<string, SourceSchema> = {
+  MYSQL: {
+    label: 'MySQL',
+    description: 'Crawls INFORMATION_SCHEMA over JDBC. Supports multiple schemas in one run.',
+    implemented: true,
+    connection: [
+      { name: 'host', label: 'Host', type: 'text', required: true, default: 'host.docker.internal' },
+      { name: 'port', label: 'Port', type: 'number', required: true, default: 3306 },
+      { name: 'user', label: 'User', type: 'text', required: true, default: 'root' },
+      { name: 'password', label: 'Password', type: 'password', helper: 'Optional — falls back to MYSQL_PASSWORD env in the orchestrator container' },
+      { name: 'database', label: 'Database', type: 'text', required: true },
+      { name: 'schemas', label: 'Schemas (comma-separated)', type: 'csv', helper: 'Defaults to the database name if empty' },
+    ],
+    options: [
+      { name: 'include_views', label: 'Include views', type: 'boolean', default: true },
+      { name: 'sample_rows', label: 'Sample rows per column', type: 'number', default: 3 },
+      { name: 'skip_sensitive', label: 'Skip sensitive columns (PII regex)', type: 'boolean', default: true },
+    ],
+  },
+  POSTGRES: {
+    label: 'PostgreSQL',
+    description: 'JDBC-style. Crawls pg_catalog and information_schema.',
+    implemented: false,
+    connection: [
+      { name: 'host', label: 'Host', type: 'text', required: true },
+      { name: 'port', label: 'Port', type: 'number', required: true, default: 5432 },
+      { name: 'user', label: 'User', type: 'text', required: true },
+      { name: 'password', label: 'Password', type: 'password' },
+      { name: 'database', label: 'Database', type: 'text', required: true },
+      { name: 'schemas', label: 'Schemas (comma-separated)', type: 'csv', default: 'public' },
+      { name: 'sslmode', label: 'SSL mode', type: 'text', default: 'prefer' },
+    ],
+    options: [
+      { name: 'include_views', label: 'Include views', type: 'boolean', default: true },
+      { name: 'include_materialized_views', label: 'Include materialized views', type: 'boolean', default: true },
+      { name: 'sample_rows', label: 'Sample rows per column', type: 'number', default: 3 },
+    ],
+  },
+  SQLSERVER: {
+    label: 'SQL Server',
+    description: 'JDBC-style. Crawls sys.* views.',
+    implemented: false,
+    connection: [
+      { name: 'host', label: 'Host', type: 'text', required: true },
+      { name: 'port', label: 'Port', type: 'number', required: true, default: 1433 },
+      { name: 'user', label: 'User', type: 'text', required: true },
+      { name: 'password', label: 'Password', type: 'password' },
+      { name: 'database', label: 'Database', type: 'text', required: true },
+      { name: 'schemas', label: 'Schemas (comma-separated)', type: 'csv', default: 'dbo' },
+      { name: 'encrypt', label: 'Encrypt connection', type: 'boolean', default: true },
+    ],
+    options: [
+      { name: 'include_views', label: 'Include views', type: 'boolean', default: true },
+      { name: 'include_procedures', label: 'Extract stored procedure metadata', type: 'boolean', default: false },
+      { name: 'sample_rows', label: 'Sample rows per column', type: 'number', default: 3 },
+    ],
+  },
+  ORACLE: {
+    label: 'Oracle',
+    description: 'JDBC-style. Crawls ALL_TABLES, ALL_TAB_COLUMNS, ALL_CONSTRAINTS.',
+    implemented: false,
+    connection: [
+      { name: 'host', label: 'Host', type: 'text', required: true },
+      { name: 'port', label: 'Port', type: 'number', required: true, default: 1521 },
+      { name: 'service_name', label: 'Service name (or SID)', type: 'text', required: true },
+      { name: 'user', label: 'User', type: 'text', required: true },
+      { name: 'password', label: 'Password', type: 'password' },
+      { name: 'schemas', label: 'Schemas (comma-separated)', type: 'csv', helper: 'Oracle schemas = users; defaults to the connecting user' },
+    ],
+    options: [
+      { name: 'include_views', label: 'Include views', type: 'boolean', default: true },
+      { name: 'include_packages', label: 'Include PL/SQL packages', type: 'boolean', default: false },
+      { name: 'sample_rows', label: 'Sample rows per column', type: 'number', default: 3 },
+    ],
+  },
+  TERADATA: {
+    label: 'Teradata',
+    description: 'Crawls DBC.* dictionary views.',
+    implemented: false,
+    connection: [
+      { name: 'host', label: 'Host', type: 'text', required: true },
+      { name: 'user', label: 'User', type: 'text', required: true },
+      { name: 'password', label: 'Password', type: 'password' },
+      { name: 'databases', label: 'Databases (comma-separated)', type: 'csv', required: true },
+      { name: 'logmech', label: 'Auth mechanism', type: 'text', default: 'TD2' },
+    ],
+    options: [
+      { name: 'sample_rows', label: 'Sample rows per column', type: 'number', default: 3 },
+      { name: 'skip_temp_tables', label: 'Skip temp tables', type: 'boolean', default: true },
+    ],
+  },
+  SNOWFLAKE: {
+    label: 'Snowflake',
+    description: 'Crawls INFORMATION_SCHEMA per database. Supports key-pair or password auth.',
+    implemented: false,
+    connection: [
+      { name: 'account', label: 'Account', type: 'text', required: true, helper: 'e.g. xy12345.us-east-1' },
+      { name: 'warehouse', label: 'Warehouse', type: 'text', required: true },
+      { name: 'database', label: 'Database', type: 'text', required: true },
+      { name: 'schema', label: 'Schema', type: 'text', helper: 'Optional — defaults to all schemas in the database' },
+      { name: 'role', label: 'Role', type: 'text' },
+      { name: 'user', label: 'User', type: 'text', required: true },
+      { name: 'password', label: 'Password', type: 'password' },
+    ],
+    options: [
+      { name: 'include_views', label: 'Include views', type: 'boolean', default: true },
+      { name: 'include_secure_views', label: 'Include secure views', type: 'boolean', default: false },
+      { name: 'sample_rows', label: 'Sample rows per column', type: 'number', default: 3 },
+    ],
+  },
+  GLUE: {
+    label: 'AWS Glue Data Catalog',
+    description: 'Reads Glue databases and tables via the AWS API. Picks up S3-backed tables and partitions.',
+    implemented: false,
+    connection: [
+      { name: 'aws_region', label: 'AWS region', type: 'text', required: true, default: 'us-east-1' },
+      { name: 'aws_access_key_id', label: 'AWS access key id', type: 'text', helper: 'Or leave blank to use the orchestrator container IAM role' },
+      { name: 'aws_secret_access_key', label: 'AWS secret access key', type: 'password' },
+      { name: 'databases', label: 'Glue databases (comma-separated)', type: 'csv', helper: 'Empty = all databases visible to the credentials' },
+    ],
+    options: [
+      { name: 'include_partitions', label: 'Include partition keys', type: 'boolean', default: true },
+      { name: 'sample_rows', label: 'Sample rows per table (S3 read)', type: 'number', default: 0 },
+    ],
+  },
+  S3: {
+    label: 'AWS S3 (object metadata)',
+    description: 'Lists objects under a bucket/prefix and infers schemas from Parquet/CSV/JSON files.',
+    implemented: false,
+    connection: [
+      { name: 'bucket', label: 'Bucket', type: 'text', required: true },
+      { name: 'prefix', label: 'Prefix (folder path)', type: 'text' },
+      { name: 'aws_region', label: 'AWS region', type: 'text', required: true, default: 'us-east-1' },
+      { name: 'aws_access_key_id', label: 'AWS access key id', type: 'text' },
+      { name: 'aws_secret_access_key', label: 'AWS secret access key', type: 'password' },
+    ],
+    options: [
+      { name: 'file_patterns', label: 'File patterns (comma-separated globs)', type: 'csv', default: '*.parquet,*.csv,*.json' },
+      { name: 'max_files', label: 'Max files per crawl', type: 'number', default: 100 },
+      { name: 'sample_lines', label: 'Sample lines per file', type: 'number', default: 5 },
+      { name: 'detect_partitioning', label: 'Detect Hive-style partitioning', type: 'boolean', default: true },
+    ],
+  },
+  EXCEL: {
+    label: 'Excel workbook',
+    description: 'Reads .xlsx files. Each sheet becomes a DataAsset; columns inferred from the header row.',
+    implemented: false,
+    connection: [
+      { name: 'file_path', label: 'File path on the orchestrator host', type: 'text', required: true, helper: 'Absolute path inside /app/data (mounted volume)' },
+    ],
+    options: [
+      { name: 'sheet_filter', label: 'Sheet name filter (comma-separated, empty = all)', type: 'csv' },
+      { name: 'header_row', label: 'Header row (1-indexed)', type: 'number', default: 1 },
+      { name: 'sample_rows', label: 'Sample rows per column', type: 'number', default: 5 },
+    ],
+  },
+  CSV: {
+    label: 'CSV file',
+    description: 'Reads a single CSV file. Useful for quick imports of flat extracts.',
+    implemented: false,
+    connection: [
+      { name: 'file_path', label: 'File path on the orchestrator host', type: 'text', required: true },
+      { name: 'encoding', label: 'Encoding', type: 'text', default: 'utf-8' },
+      { name: 'delimiter', label: 'Delimiter', type: 'text', default: ',' },
+    ],
+    options: [
+      { name: 'has_header', label: 'Has header row', type: 'boolean', default: true },
+      { name: 'sample_lines', label: 'Sample lines for type inference', type: 'number', default: 100 },
+    ],
+  },
+  SSRS_RDL: {
+    label: 'SQL Server Reporting Services (RDL)',
+    description: 'Reads RDL XML files from an SSRS server. Each report becomes a DataAsset; embedded SQL is extracted via LLM.',
+    implemented: false,
+    connection: [
+      { name: 'server_url', label: 'SSRS server URL', type: 'text', required: true, helper: 'e.g. http://reports.corp/ReportServer' },
+      { name: 'folder_path', label: 'Folder path', type: 'text', helper: 'Empty = root folder' },
+      { name: 'user', label: 'User', type: 'text' },
+      { name: 'password', label: 'Password', type: 'password' },
+      { name: 'auth_type', label: 'Auth type', type: 'text', default: 'NTLM', helper: 'NTLM / BASIC / NEGOTIATE' },
+    ],
+    options: [
+      { name: 'extract_sql', label: 'Extract embedded dataset SQL via LLM', type: 'boolean', default: true },
+      { name: 'recurse_folders', label: 'Recurse subfolders', type: 'boolean', default: true },
+    ],
+  },
+};
+
+function defaultValuesFor(fields: FieldDef[]): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const f of fields) {
+    if (f.default !== undefined) out[f.name] = f.default;
+    else if (f.type === 'boolean') out[f.name] = false;
+    else if (f.type === 'csv') out[f.name] = '';
+    else out[f.name] = '';
+  }
+  return out;
+}
+
+function coerceFields(fields: FieldDef[], values: Record<string, any>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const f of fields) {
+    const raw = values[f.name];
+    if (raw === undefined || raw === null || raw === '') {
+      if (f.required) out[f.name] = ''; // let server reject if truly required
+      continue;
+    }
+    if (f.type === 'number') {
+      const n = Number(raw);
+      out[f.name] = Number.isNaN(n) ? raw : n;
+    } else if (f.type === 'boolean') {
+      out[f.name] = Boolean(raw);
+    } else if (f.type === 'csv') {
+      const arr = String(raw).split(',').map((s) => s.trim()).filter(Boolean);
+      out[f.name] = arr;
+    } else {
+      out[f.name] = String(raw);
+    }
+  }
+  return out;
 }
 
 export default function DataCatalogPage() {
@@ -99,6 +354,7 @@ function CrawlersTab() {
   const crawlersQ = useCrawlers();
   const runCrawler = useRunCrawler();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
   const runsQ = useCrawlRuns(selectedId, 20);
 
   const crawlers = crawlersQ.data?.crawlers ?? [];
@@ -114,6 +370,15 @@ function CrawlersTab() {
             <Typography variant="subtitle2" sx={{ flex: 1 }}>
               Registered crawlers ({crawlers.length})
             </Typography>
+            <Button
+              size="small"
+              variant="contained"
+              startIcon={<AddIcon />}
+              onClick={() => setCreateOpen(true)}
+              sx={{ mr: 0.5 }}
+            >
+              Create
+            </Button>
             <IconButton size="small" onClick={() => crawlersQ.refetch()}>
               <RefreshIcon fontSize="small" />
             </IconButton>
@@ -122,7 +387,8 @@ function CrawlersTab() {
             <Skeleton height={300} />
           ) : crawlers.length === 0 ? (
             <Alert severity="info">
-              No crawlers. Seed one via <code>infra/mysql/catalog_seed.sql</code>.
+              No crawlers yet. Click <strong>Create</strong> to add one for any
+              of the supported source systems.
             </Alert>
           ) : (
             <Box sx={{ flex: 1, overflowY: 'auto' }}>
@@ -198,6 +464,15 @@ function CrawlersTab() {
           )}
         </Paper>
       </Grid>
+
+      <CreateCrawlerDialog
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        onCreated={(id) => {
+          setSelectedId(id);
+          setCreateOpen(false);
+        }}
+      />
     </Grid>
   );
 }
@@ -258,6 +533,277 @@ function CrawlerRow({
         </Button>
       </Stack>
     </Paper>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Create Crawler dialog
+// ---------------------------------------------------------------------------
+function CreateCrawlerDialog({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: (crawlerId: string) => void;
+}) {
+  const create = useCreateCrawler();
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [sourceType, setSourceType] = useState<string>('MYSQL');
+  const [scheduleCron, setScheduleCron] = useState('');
+  const [connectionValues, setConnectionValues] = useState<Record<string, any>>(
+    () => defaultValuesFor(SOURCE_SCHEMAS.MYSQL.connection),
+  );
+  const [optionsValues, setOptionsValues] = useState<Record<string, any>>(
+    () => defaultValuesFor(SOURCE_SCHEMAS.MYSQL.options),
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  const schema = SOURCE_SCHEMAS[sourceType];
+
+  // When source type changes, reset field values to that schema's defaults.
+  const handleSourceTypeChange = (next: string) => {
+    setSourceType(next);
+    setConnectionValues(defaultValuesFor(SOURCE_SCHEMAS[next].connection));
+    setOptionsValues(defaultValuesFor(SOURCE_SCHEMAS[next].options));
+    setError(null);
+  };
+
+  const handleClose = () => {
+    if (create.isPending) return;
+    setName('');
+    setDescription('');
+    setSourceType('MYSQL');
+    setConnectionValues(defaultValuesFor(SOURCE_SCHEMAS.MYSQL.connection));
+    setOptionsValues(defaultValuesFor(SOURCE_SCHEMAS.MYSQL.options));
+    setScheduleCron('');
+    setError(null);
+    onClose();
+  };
+
+  const handleSubmit = () => {
+    setError(null);
+    if (!name.trim()) {
+      setError('Name is required');
+      return;
+    }
+    // Required-field check
+    for (const f of schema.connection) {
+      if (f.required) {
+        const v = connectionValues[f.name];
+        if (v === undefined || v === null || v === '') {
+          setError(`Connection field "${f.label}" is required`);
+          return;
+        }
+      }
+    }
+    const body: CreateCrawlerInput = {
+      name: name.trim(),
+      description: description.trim() || undefined,
+      source_type: sourceType,
+      connection: coerceFields(schema.connection, connectionValues),
+      options: coerceFields(schema.options, optionsValues),
+      schedule_cron: scheduleCron.trim() || undefined,
+    };
+    create.mutate(body, {
+      onSuccess: (data) => onCreated(data.crawler_id),
+      onError: (err: any) => {
+        const detail = err?.response?.data?.detail;
+        const msg =
+          (detail && typeof detail === 'object' && detail.error) ||
+          err?.message ||
+          'Failed to create crawler';
+        setError(String(msg));
+      },
+    });
+  };
+
+  return (
+    <Dialog open={open} onClose={handleClose} maxWidth="md" fullWidth>
+      <DialogTitle>
+        <Stack direction="row" alignItems="center" spacing={1}>
+          <AddIcon fontSize="small" />
+          <span>Create crawler</span>
+        </Stack>
+      </DialogTitle>
+      <DialogContent dividers>
+        <Grid container spacing={2}>
+          <Grid item xs={12} md={6}>
+            <TextField
+              fullWidth size="small" label="Name" required margin="dense"
+              value={name} onChange={(e) => setName(e.target.value)}
+            />
+          </Grid>
+          <Grid item xs={12} md={6}>
+            <FormControl fullWidth size="small" margin="dense">
+              <InputLabel>Source type</InputLabel>
+              <Select
+                label="Source type"
+                value={sourceType}
+                onChange={(e) => handleSourceTypeChange(String(e.target.value))}
+              >
+                {Object.entries(SOURCE_SCHEMAS).map(([key, s]) => (
+                  <MenuItem key={key} value={key}>
+                    {s.label} {!s.implemented && '· (impl pending)'}
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          </Grid>
+          <Grid item xs={12}>
+            <TextField
+              fullWidth size="small" label="Description" margin="dense"
+              multiline minRows={1} maxRows={3}
+              value={description} onChange={(e) => setDescription(e.target.value)}
+            />
+          </Grid>
+          <Grid item xs={12}>
+            <Typography variant="caption" color="text.secondary">
+              {schema.description}
+            </Typography>
+          </Grid>
+
+          {!schema.implemented && (
+            <Grid item xs={12}>
+              <Alert severity="warning" icon={<WarningAmberIcon />}>
+                The <strong>{schema.label}</strong> crawler implementation is
+                pending. Saving registers the configuration so it shows up in the
+                catalog, but clicking <strong>Run</strong> will fail until the
+                matching <code>{sourceType}Crawler</code> is added under
+                <code> services/orchestrator/app/services/crawler/</code> and
+                registered in <code>runner.py:CRAWLER_CLASSES</code>.
+              </Alert>
+            </Grid>
+          )}
+
+          <Grid item xs={12}>
+            <Divider sx={{ my: 1 }}>
+              <Chip label="Connection" size="small" />
+            </Divider>
+          </Grid>
+          {schema.connection.map((f) => (
+            <Grid item xs={12} sm={6} key={`conn-${f.name}`}>
+              <DynamicField
+                field={f}
+                value={connectionValues[f.name]}
+                onChange={(v) =>
+                  setConnectionValues((prev) => ({ ...prev, [f.name]: v }))
+                }
+              />
+            </Grid>
+          ))}
+
+          <Grid item xs={12}>
+            <Divider sx={{ my: 1 }}>
+              <Chip label="Options" size="small" />
+            </Divider>
+          </Grid>
+          {schema.options.length === 0 ? (
+            <Grid item xs={12}>
+              <Typography variant="caption" color="text.secondary">
+                No crawler-specific options for this source type.
+              </Typography>
+            </Grid>
+          ) : (
+            schema.options.map((f) => (
+              <Grid item xs={12} sm={6} key={`opt-${f.name}`}>
+                <DynamicField
+                  field={f}
+                  value={optionsValues[f.name]}
+                  onChange={(v) =>
+                    setOptionsValues((prev) => ({ ...prev, [f.name]: v }))
+                  }
+                />
+              </Grid>
+            ))
+          )}
+
+          <Grid item xs={12}>
+            <Divider sx={{ my: 1 }} />
+          </Grid>
+          <Grid item xs={12} md={6}>
+            <TextField
+              fullWidth size="small" label="Schedule cron (optional)" margin="dense"
+              placeholder="e.g. 0 3 * * *"
+              helperText="Reserved — runs are manual until a scheduler is wired up"
+              value={scheduleCron}
+              onChange={(e) => setScheduleCron(e.target.value)}
+            />
+          </Grid>
+
+          {error && (
+            <Grid item xs={12}>
+              <Alert severity="error">{error}</Alert>
+            </Grid>
+          )}
+        </Grid>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={handleClose} disabled={create.isPending}>
+          Cancel
+        </Button>
+        <Button
+          variant="contained"
+          onClick={handleSubmit}
+          disabled={create.isPending}
+          startIcon={<AddIcon />}
+        >
+          {create.isPending ? 'Creating…' : 'Create crawler'}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+function DynamicField({
+  field,
+  value,
+  onChange,
+}: {
+  field: FieldDef;
+  value: any;
+  onChange: (v: any) => void;
+}) {
+  if (field.type === 'boolean') {
+    return (
+      <FormControlLabel
+        control={
+          <Switch
+            size="small"
+            checked={!!value}
+            onChange={(e) => onChange(e.target.checked)}
+          />
+        }
+        label={
+          <Box>
+            <Typography variant="body2">{field.label}</Typography>
+            {field.helper && (
+              <Typography variant="caption" color="text.secondary">
+                {field.helper}
+              </Typography>
+            )}
+          </Box>
+        }
+      />
+    );
+  }
+
+  const isPassword = field.type === 'password';
+  const isNumber = field.type === 'number';
+  return (
+    <TextField
+      fullWidth
+      size="small"
+      margin="dense"
+      label={field.label + (field.required ? ' *' : '')}
+      type={isPassword ? 'password' : isNumber ? 'number' : 'text'}
+      value={value ?? ''}
+      onChange={(e) => onChange(isNumber ? e.target.value : e.target.value)}
+      helperText={field.helper}
+      InputProps={isPassword ? { autoComplete: 'new-password' } : undefined}
+    />
   );
 }
 

@@ -144,6 +144,28 @@ export function useRunCrawler() {
   });
 }
 
+export interface CreateCrawlerInput {
+  name: string;
+  description?: string;
+  source_type: string;
+  connection: Record<string, unknown>;
+  options?: Record<string, unknown>;
+  schedule_cron?: string;
+}
+
+export function useCreateCrawler() {
+  const qc = useQueryClient();
+  return useMutation<{ crawler_id: string; status: string }, Error, CreateCrawlerInput>({
+    mutationFn: async (body) => {
+      const { data } = await apiClient.post('/v1/catalog/crawlers', body);
+      return data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog', 'crawlers'] });
+    },
+  });
+}
+
 export function useCatalogAssets(sourceName?: string) {
   return useQuery<{ assets: CatalogAsset[] }>({
     queryKey: ['catalog', 'assets', sourceName ?? ''],
