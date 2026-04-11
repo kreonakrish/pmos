@@ -23,6 +23,7 @@ import DescriptionIcon from '@mui/icons-material/Description';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import PolicyIcon from '@mui/icons-material/Policy';
 import ScienceIcon from '@mui/icons-material/Science';
+import StorageIcon from '@mui/icons-material/Storage';
 import SettingsIcon from '@mui/icons-material/Settings';
 import { useUIStore } from '@/store/uiStore';
 
@@ -65,6 +66,12 @@ const NAV_SECTIONS: NavSection[] = [
       { label: 'Scoring & RL', path: '/scoring', icon: <AnalyticsIcon /> },
       { label: 'Memory Explorer', path: '/memory', icon: <MemoryIcon /> },
       { label: 'Documents', path: '/documents', icon: <DescriptionIcon /> },
+    ],
+  },
+  {
+    title: 'Data Sources',
+    items: [
+      { label: 'Data Catalog', path: '/data-catalog', icon: <StorageIcon /> },
     ],
   },
   {

@@ -483,22 +483,220 @@ add_card(slide, 8.9, 4.2, 4.0, 2.5, "Infrastructure",
          "Redis Streams for async events", RGBColor(0x45, 0x5A, 0x64))
 
 # ==========================================
-# SLIDE 10: Summary
+# SLIDE 11: Business Domain Data (home lending)
 # ==========================================
 slide = prs.slides.add_slide(prs.slide_layouts[6])
 add_dark_bg(slide)
-add_textbox(slide, 1, 1.0, 11, 1.0, "PMOS", 54, BLUE, True, PP_ALIGN.CENTER)
-add_textbox(slide, 1, 2.2, 11, 0.6, "Connect any data source. Ask any question.\nGet answers in minutes, not hours.", 22, WHITE, False, PP_ALIGN.CENTER)
+add_textbox(slide, 0.5, 0.3, 12, 0.6, "Business Domain Data — Home Lending Lifecycle", 28, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 0.5, 0.9, 12, 0.4,
+            "Six MySQL schemas modeling the full customer → origination → servicing journey, "
+            "queryable end-to-end via registered DATABASE tools",
+            13, GRAY, False, PP_ALIGN.CENTER)
 
-add_textbox(slide, 1.5, 3.5, 10, 3.0,
+# Lifecycle pipeline row
+pipeline = [
+    ("Chase My Home", "Explore / Buy / Manage", GREEN),
+    ("Marketing", "Campaigns, leads, attribution", LIGHT_BLUE),
+    ("Sales", "Officers, pipeline, commissions", LIGHT_BLUE),
+    ("Origination", "Consumer + Correspondent", ORANGE),
+    ("Servicing", "Loans, defaults, FC, REDS", PURPLE),
+]
+x = 0.35
+w = 2.5
+for i, (t, sub, c) in enumerate(pipeline):
+    add_box(slide, x, 1.7, w, 1.1, f"{t}\n\n{sub}", fill_color=c, font_size=11)
+    if i < len(pipeline) - 1:
+        add_arrow(slide, x + w, 2.25, x + w + 0.1, 2.25, color=WHITE)
+    x += w + 0.1
+
+# Stats band
+add_textbox(slide, 0.5, 3.2, 12, 0.5,
+            "27 tables • 230 seed rows • 6 DATABASE tools registered in pmos.tools • cross-schema referential integrity",
+            14, WHITE, True, PP_ALIGN.CENTER)
+
+# Example insight cards
+add_card(slide, 0.5, 4.0, 4.0, 2.9,
+         "LIVE EXAMPLE",
+         "Q: Which loans are in DEFAULT or FORECLOSURE?\n\n"
+         "• L0007 Northern Light — $790K — Annaly REIT\n"
+         "• L0009 Atlas — $340K — AGNC REIT\n\n"
+         "Agent used servicing_db tool, returned deterministic SQL answer in 21s.",
+         accent=PURPLE)
+
+add_card(slide, 4.7, 4.0, 4.0, 2.9,
+         "CROSS-SYSTEM QUERY",
+         "Neo4j TaskGraphs joined with MySQL home-lending data.\n\n"
+         "5 illustrative questions answered by scripts/cross_system_query.py:\n"
+         "risk lifecycle, marketing funnel, investor distress exposure, agent routing.",
+         accent=LIGHT_BLUE)
+
+add_card(slide, 8.9, 4.0, 4.0, 2.9,
+         "7 LAWS ENFORCED",
+         "• LLM decomposes every request\n"
+         "• Scoring bands adapt via RL\n"
+         "• Prompts assembled at runtime\n"
+         "• Every tool defined in MySQL\n"
+         "• trace_id on every path",
+         accent=GREEN)
+
+
+# ==========================================
+# SLIDE 12: Model Governance (inference traceability)
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.5, 0.3, 12, 0.6, "Model Governance — Inference Traceability", 28, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 0.5, 0.9, 12, 0.4,
+            "For any answer the system produces, show the full layered reasoning chain",
+            13, GRAY, False, PP_ALIGN.CENTER)
+
+# Layered timeline mock
+layers = [
+    ("USER MESSAGE", BLUE),
+    ("TASK NODE", PURPLE),
+    ("PIPELINE STEP", LIGHT_BLUE),
+    ("TOOL CALL", GREEN),
+    ("SCORING", ORANGE),
+    ("RL FEEDBACK", RED),
+    ("AGENT INTERACTION", CARD_BG),
+    ("ASSISTANT RESPONSE", GREEN),
+]
+y = 1.6
+for lab, col in layers:
+    add_box(slide, 1.0, y, 3.0, 0.4, lab, fill_color=col, font_size=11)
+    add_textbox(slide, 4.3, y + 0.05, 8, 0.3,
+                f"→ tracked in MySQL + Neo4j, joined on trace_id", 11, GRAY)
+    y += 0.55
+
+# Endpoint card
+add_card(slide, 0.5, 6.3, 12.3, 1.0,
+         "GET /v1/governance/traces/{trace_id}",
+         "Aggregates messages, execution_graph_log, tool_execution_history, score_history, "
+         "rl_feedback_log, TaskNodes, AgentInteractions into one time-sorted timeline. "
+         "Used to diagnose the v2 'silent fallback' bug and prove v3 agents actually called servicing_db.",
+         accent=GREEN)
+
+
+# ==========================================
+# SLIDE 13: ML Insights (learning loop observability)
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.5, 0.3, 12, 0.6, "ML Insights — Self-Improving Orchestration", 28, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 0.5, 0.9, 12, 0.4,
+            "Four learning loops tapped into the pipeline, all visible in one operator page",
+            13, GRAY, False, PP_ALIGN.CENTER)
+
+# Four quadrants
+add_card(slide, 0.5, 1.5, 6.0, 2.6,
+         "1A — Contextual Bandits (SHADOW)",
+         "Thompson Sampling over Beta(α, β) per (agent, context).\n"
+         "Hooked into Step 3 negotiation. Logs what the bandit would pick alongside "
+         "the bid winner. Flipping to LIVE is one line once arms reach 20 pulls.\n"
+         "60% baseline prior per operator request.",
+         accent=PURPLE)
+
+add_card(slide, 6.8, 1.5, 6.0, 2.6,
+         "2C — Node2Vec TaskNode Embeddings",
+         "Real Node2Vec (networkx + gensim) over Neo4j TaskGraph.\n"
+         "595 nodes embedded across 116 graphs.\n"
+         "Feeds the learned scorer; reusable feature surface for future GNN work.\n"
+         "Pure-Python spectral-embedding fallback for zero-dep inference.",
+         accent=LIGHT_BLUE)
+
+add_card(slide, 0.5, 4.3, 6.0, 2.6,
+         "1B — Learned Quality Scorer (SHADOW)",
+         "Logistic regression trained offline on thumbs-up/down + 60% bootstrap.\n"
+         "val_accuracy 0.786, val_auc 0.875 on the first 70 samples.\n"
+         "Pure-Python sigmoid inference in orchestrator container (no numpy/sklearn).\n"
+         "22 shadow predictions logged per conversation.",
+         accent=ORANGE)
+
+add_card(slide, 6.8, 4.3, 6.0, 2.6,
+         "2D — SOP Auto-Discovery",
+         "TF-IDF + DBSCAN clustering of recent user messages.\n"
+         "8 proposals produced from 40 real messages on first run.\n"
+         "Human-in-loop review: Promote writes SOPNode into Neo4j, "
+         "Reject/Correct feed reinforcement signal.",
+         accent=GREEN)
+
+
+# ==========================================
+# SLIDE 14: Data Catalog (systems integration)
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 0.5, 0.3, 12, 0.6, "Data Catalog — Semantic Knowledge Graph", 28, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 0.5, 0.9, 12, 0.4,
+            "Crawl physical metadata → LLM maps to business ontology → auditor RL feedback loop",
+            13, GRAY, False, PP_ALIGN.CENTER)
+
+# Flow row
+flow = [
+    ("CRAWL", "INFORMATION_SCHEMA", LIGHT_BLUE),
+    ("MAP", "LLM proposes\nDomain/Entity/Attribute", ORANGE),
+    ("WRITE", "Neo4j ontology\n+ MySQL audit", PURPLE),
+    ("REVIEW", "Auditor:\nconfirm/correct/reject", GREEN),
+    ("FEEDBACK", "RL reward\n+1 / −0.5 / −1", RED),
+]
+x = 0.4
+w = 2.4
+for i, (t, sub, c) in enumerate(flow):
+    add_box(slide, x, 1.7, w, 1.2, f"{t}\n\n{sub}", fill_color=c, font_size=11)
+    if i < len(flow) - 1:
+        add_arrow(slide, x + w, 2.3, x + w + 0.1, 2.3, color=WHITE)
+    x += w + 0.1
+
+# Stats
+add_textbox(slide, 0.5, 3.2, 12, 0.5,
+            "Phase 1: MySQL crawler → pmos_servicing • 9 assets • 63 columns • 63 auto-mappings in 44s",
+            14, WHITE, True, PP_ALIGN.CENTER)
+
+# Node labels card
+add_card(slide, 0.5, 4.0, 6.0, 2.9,
+         "KNOWLEDGE GRAPH ONTOLOGY",
+         "(:DataSource)─[HAS_ASSET]→(:DataAsset)\n"
+         "           ─[HAS_COLUMN]→(:DataColumn)\n\n"
+         "(:BusinessDomain)─[HAS_ENTITY]→(:BusinessEntity)\n"
+         "              ─[HAS_ATTRIBUTE]→(:BusinessAttribute)\n"
+         "                      ─[MAPS_TO]→(:DataColumn)\n\n"
+         "(:DataColumn)─[REFERENCES]→(:DataColumn)  (physical FK)",
+         accent=BLUE)
+
+add_card(slide, 6.8, 4.0, 6.0, 2.9,
+         "LIVE RESULTS",
+         "• Domain: Servicing\n"
+         "• Entities: Loan, Payment, Investor, Default,\n"
+         "  Bankruptcy, Foreclosure, EarlyResolution,\n"
+         "  RiskAssessment, RegulatoryFiling\n"
+         "• avg confidence: 0.957\n"
+         "• LLM enriched: term_months → loan_term_months,\n"
+         "  origination_ref → origination_reference",
+         accent=GREEN)
+
+
+# ==========================================
+# SLIDE 15: Summary
+# ==========================================
+slide = prs.slides.add_slide(prs.slide_layouts[6])
+add_dark_bg(slide)
+add_textbox(slide, 1, 0.8, 11, 1.0, "PMOS", 54, BLUE, True, PP_ALIGN.CENTER)
+add_textbox(slide, 1, 2.0, 11, 0.6,
+            "Connect any data source. Ask any question.\nGet deterministic answers in minutes, not hours.",
+            22, WHITE, False, PP_ALIGN.CENTER)
+
+add_textbox(slide, 1.5, 3.2, 10, 3.5,
     "7 microservices  |  4 data stores  |  6 agents  |  7 Redis streams\n\n"
-    "Recursive sub-agent spawning  |  Capability negotiation  |  RL scoring\n\n"
-    "4-tier memory  |  RAG pipeline  |  Full audit trail  |  Self-extending\n\n"
-    "PDF, DOCX, XLSX, HTML, CSV, JSON, Markdown  |  MySQL, Neo4j, Qdrant\n\n"
+    "Home-lending business domain — 6 schemas, 27 tables  |  Cross-system queries\n\n"
+    "Model Governance — full inference traceability per trace_id\n\n"
+    "ML Insights — bandits, Node2Vec, learned scorer, SOP discovery, all shadow-mode\n\n"
+    "Data Catalog — metadata crawler framework + semantic knowledge graph + auditor RL\n\n"
     "One question → decompose → negotiate → execute → score → learn → respond",
-    15, GRAY, False, PP_ALIGN.CENTER)
+    14, GRAY, False, PP_ALIGN.CENTER)
 
-add_textbox(slide, 3, 6.3, 7, 0.5, "github.com/kreonakrish  |  localhost:3000", 13, LIGHT_BLUE, False, PP_ALIGN.CENTER)
+add_textbox(slide, 3, 6.7, 7, 0.5,
+            "github.com/kreonakrish/pmos  |  localhost:3000",
+            13, LIGHT_BLUE, False, PP_ALIGN.CENTER)
 
 # Save
 output_path = os.path.join(os.path.dirname(__file__), "..", "PMOS_Architecture_Presentation.pptx")

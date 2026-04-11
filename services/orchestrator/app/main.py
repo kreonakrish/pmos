@@ -20,6 +20,7 @@ from app.adapters.rag_adapter import RAGAdapter
 from app.adapters.redis_adapter import RedisAdapter
 from app.adapters.scoring_adapter import ScoringAdapter
 from app.config import settings
+from app.routes import catalog as catalog_router
 from app.routes import conversations as conv_router
 from app.routes import governance as gov_router
 from app.routes import health as health_router
@@ -266,3 +267,4 @@ app.include_router(conv_router.router)
 app.include_router(sandbox_router.router)
 app.include_router(gov_router.router)
 app.include_router(ml_router.router)
+app.include_router(catalog_router.router)

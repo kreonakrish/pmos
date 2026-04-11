@@ -356,4 +356,60 @@ router.post('/ml/sops/proposals/:id/reject', async (req: Request, res: Response)
   });
 });
 
+// ─── Data Catalog (systems integration) routes ─────────────────────────────
+function catalogProxy(pathname: string) {
+  return async (req: Request, res: Response): Promise<void> => {
+    const traceId = (req as Request & { id?: string }).id;
+    const qs = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+    logger.info('proxy_catalog', { layer: 'router', trace_id: traceId, path: pathname });
+    await proxyRequest(req, res, {
+      targetUrl: `${config.ORCHESTRATOR_URL}${pathname}${qs}`,
+    });
+  };
+}
+
+router.get('/catalog/crawlers', catalogProxy('/v1/catalog/crawlers'));
+router.post('/catalog/crawlers', catalogProxy('/v1/catalog/crawlers'));
+router.get('/catalog/assets', catalogProxy('/v1/catalog/assets'));
+router.get('/catalog/ontology', catalogProxy('/v1/catalog/ontology'));
+router.get('/catalog/mapping-decisions', catalogProxy('/v1/catalog/mapping-decisions'));
+router.get('/catalog/mapping-decisions/summary', catalogProxy('/v1/catalog/mapping-decisions/summary'));
+
+router.get('/catalog/crawlers/:id/runs', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const { id } = req.params;
+  logger.info('proxy_catalog_runs', { layer: 'router', trace_id: traceId, crawler_id: id });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/catalog/crawlers/${id}/runs`,
+  });
+});
+
+router.post('/catalog/crawlers/:id/run', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const { id } = req.params;
+  logger.info('proxy_catalog_run', { layer: 'router', trace_id: traceId, crawler_id: id });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/catalog/crawlers/${id}/run`,
+    timeout: 300_000,
+  });
+});
+
+router.get('/catalog/assets/:fqName', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const fq = (req.params as Record<string, string>).fqName || '';
+  logger.info('proxy_catalog_asset_detail', { layer: 'router', trace_id: traceId, fq });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/catalog/assets/${encodeURIComponent(fq)}`,
+  });
+});
+
+router.post('/catalog/mapping-decisions/:id/review', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const { id } = req.params;
+  logger.info('proxy_catalog_review', { layer: 'router', trace_id: traceId, decision_id: id });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/catalog/mapping-decisions/${id}/review`,
+  });
+});
+
 export default router;
