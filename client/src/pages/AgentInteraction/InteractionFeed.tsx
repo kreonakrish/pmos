@@ -84,6 +84,8 @@ const InteractionFeed: React.FC<Props> = ({ interactions, onSelect, selectedId }
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
+        width: '100%',
+        flex: 1,
       }}
     >
       {/* Toolbar */}

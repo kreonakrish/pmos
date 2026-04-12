@@ -13,6 +13,8 @@ import {
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ExpandLessIcon from '@mui/icons-material/ExpandLess';
+import FullscreenIcon from '@mui/icons-material/Fullscreen';
+import FullscreenExitIcon from '@mui/icons-material/FullscreenExit';
 import type { SelectChangeEvent } from '@mui/material';
 import type { TaskNode } from '@/types';
 
@@ -33,6 +35,7 @@ const TaskDecompositionPage: React.FC = () => {
   const [selectedMessageId, setSelectedMessageId] = useState<string | undefined>(undefined);
   const [selectedNode, setSelectedNode] = useState<TaskNode | null>(null);
   const [ganttOpen, setGanttOpen] = useState(true);
+  const [ganttMaximized, setGanttMaximized] = useState(false);
 
   const {
     data: messages,
@@ -160,7 +163,7 @@ const TaskDecompositionPage: React.FC = () => {
             </Box>
           </Box>
 
-          {/* Gantt toggle */}
+          {/* Gantt toggle header */}
           <Box
             sx={{
               display: 'flex',
@@ -170,23 +173,42 @@ const TaskDecompositionPage: React.FC = () => {
               py: 0.5,
               borderTop: `1px solid ${theme.palette.divider}`,
               bgcolor: 'background.paper',
-              cursor: 'pointer',
             }}
-            onClick={() => setGanttOpen((prev) => !prev)}
           >
-            <Typography variant="body2" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-              Execution Timeline
-            </Typography>
-            {ganttOpen ? (
-              <ExpandLessIcon fontSize="small" sx={{ color: 'text.secondary' }} />
-            ) : (
-              <ExpandMoreIcon fontSize="small" sx={{ color: 'text.secondary' }} />
+            <Box
+              sx={{ display: 'flex', alignItems: 'center', gap: 1, cursor: 'pointer', flex: 1 }}
+              onClick={() => setGanttOpen((prev) => !prev)}
+            >
+              <Typography variant="body2" sx={{ fontWeight: 600, color: 'text.secondary' }}>
+                Execution Timeline
+              </Typography>
+              {ganttOpen ? (
+                <ExpandLessIcon fontSize="small" sx={{ color: 'text.secondary' }} />
+              ) : (
+                <ExpandMoreIcon fontSize="small" sx={{ color: 'text.secondary' }} />
+              )}
+            </Box>
+            {ganttOpen && (
+              <IconButton
+                size="small"
+                onClick={() => setGanttMaximized((prev) => !prev)}
+                sx={{ color: 'text.secondary' }}
+              >
+                {ganttMaximized ? <FullscreenExitIcon fontSize="small" /> : <FullscreenIcon fontSize="small" />}
+              </IconButton>
             )}
           </Box>
 
-          {/* Gantt chart (collapsible) */}
+          {/* Gantt chart (collapsible + maximizable) */}
           <Collapse in={ganttOpen}>
-            <Box sx={{ maxHeight: 260, overflow: 'auto' }}>
+            <Box
+              sx={{
+                height: ganttMaximized ? 'calc(100vh - 200px)' : undefined,
+                maxHeight: ganttMaximized ? undefined : 260,
+                overflow: 'auto',
+                transition: 'height 0.3s ease, max-height 0.3s ease',
+              }}
+            >
               <ExecutionGantt
                 nodes={decomposition.nodes}
                 onTaskSelect={handleNodeSelect}

@@ -298,13 +298,14 @@ const AgentInteractionPage: React.FC = () => {
             )}
           </Box>
 
-          {/* Feed (collapsible + maximizable) */}
+          {/* Feed (collapsible + maximizable, full width) */}
           <Collapse in={feedOpen}>
             <Box
               sx={{
                 height: feedMaximized ? 'calc(100vh - 200px)' : 320,
                 overflow: 'auto',
                 display: 'flex',
+                width: '100%',
                 transition: 'height 0.3s ease',
               }}
             >
