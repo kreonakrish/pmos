@@ -9,6 +9,8 @@ import {
   Collapse,
   Skeleton,
   useTheme,
+  Autocomplete,
+  TextField,
 } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
@@ -18,7 +20,7 @@ import FullscreenExitIcon from '@mui/icons-material/FullscreenExit';
 import type { SelectChangeEvent } from '@mui/material';
 import type { TaskNode } from '@/types';
 
-import { useConversationMessages } from '@/api/conversations';
+import { useConversations, useConversationMessages } from '@/api/conversations';
 import { useTaskDecomposition } from '@/api/decomposition';
 import ErrorCard from '@/components/common/ErrorCard';
 import EmptyState from '@/components/common/EmptyState';
@@ -28,9 +30,16 @@ import TaskDetailPanel from './TaskDetailPanel';
 import ExecutionGantt from './ExecutionGantt';
 
 const TaskDecompositionPage: React.FC = () => {
-  const { id: conversationId } = useParams<{ id: string }>();
+  const { id: routeConversationId } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const theme = useTheme();
+
+  // Standalone mode: no conversation in URL → show a picker
+  const isStandalone = !routeConversationId;
+  const [pickedConversationId, setPickedConversationId] = useState<string | null>(null);
+  const conversationId = routeConversationId ?? pickedConversationId ?? undefined;
+
+  const { data: allConversations } = useConversations();
 
   const [selectedMessageId, setSelectedMessageId] = useState<string | undefined>(undefined);
   const [selectedNode, setSelectedNode] = useState<TaskNode | null>(null);
@@ -80,35 +89,71 @@ const TaskDecompositionPage: React.FC = () => {
           flexWrap: 'wrap',
         }}
       >
-        <IconButton size="small" onClick={() => navigate('/chat')}>
-          <ArrowBackIcon fontSize="small" />
-        </IconButton>
+        {!isStandalone && (
+          <IconButton size="small" onClick={() => navigate('/conversations')}>
+            <ArrowBackIcon fontSize="small" />
+          </IconButton>
+        )}
 
-        <Typography
-          variant="h6"
-          noWrap
-          sx={{ flex: 1, minWidth: 120 }}
-        >
-          {conversationTitle}
-        </Typography>
+        {isStandalone ? (
+          <>
+            <Typography variant="h6" noWrap sx={{ minWidth: 160 }}>
+              Task Decomposition
+            </Typography>
+            <Autocomplete
+              size="small"
+              sx={{ minWidth: 320, flex: 1 }}
+              options={allConversations ?? []}
+              getOptionLabel={(c) => c.title || c.id.slice(0, 8)}
+              value={allConversations?.find((c) => c.id === pickedConversationId) ?? null}
+              onChange={(_, val) => {
+                setPickedConversationId(val?.id ?? null);
+                setSelectedMessageId(undefined);
+                setSelectedNode(null);
+              }}
+              renderInput={(params) => (
+                <TextField {...params} placeholder="Select a conversation..." />
+              )}
+              renderOption={(props, c) => (
+                <li {...props} key={c.id}>
+                  <Box>
+                    <Typography variant="body2" noWrap>
+                      {c.title || 'Untitled'}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      {c.id.slice(0, 12)}
+                    </Typography>
+                  </Box>
+                </li>
+              )}
+              isOptionEqualToValue={(opt, val) => opt.id === val.id}
+            />
+          </>
+        ) : (
+          <Typography variant="h6" noWrap sx={{ flex: 1, minWidth: 120 }}>
+            {conversationTitle}
+          </Typography>
+        )}
 
-        {/* Message selector */}
-        <Select
-          size="small"
-          displayEmpty
-          value={selectedMessageId ?? ''}
-          onChange={handleMessageChange}
-          sx={{ minWidth: 220, fontSize: '0.85rem' }}
-        >
-          <MenuItem value="">
-            <em>All messages</em>
-          </MenuItem>
-          {messages?.filter((m) => m.role === 'user').map((m) => (
-            <MenuItem key={m.id} value={m.id}>
-              {m.content.length > 50 ? m.content.slice(0, 49) + '\u2026' : m.content}
+        {/* Message selector — only show when a conversation is selected */}
+        {conversationId && (
+          <Select
+            size="small"
+            displayEmpty
+            value={selectedMessageId ?? ''}
+            onChange={handleMessageChange}
+            sx={{ minWidth: 220, fontSize: '0.85rem' }}
+          >
+            <MenuItem value="">
+              <em>All messages</em>
             </MenuItem>
-          ))}
-        </Select>
+            {messages?.filter((m) => m.role === 'user').map((m) => (
+              <MenuItem key={m.id} value={m.id}>
+                {m.content.length > 50 ? m.content.slice(0, 49) + '\u2026' : m.content}
+              </MenuItem>
+            ))}
+          </Select>
+        )}
       </Box>
 
       {/* Loading state */}
@@ -128,8 +173,16 @@ const TaskDecompositionPage: React.FC = () => {
         </Box>
       )}
 
-      {/* Empty state */}
-      {!isLoading && !decompError && decomposition && decomposition.nodes.length === 0 && (
+      {/* Empty / no-selection state */}
+      {!isLoading && !decompError && !conversationId && (
+        <Box sx={{ flex: 1 }}>
+          <EmptyState
+            title="Select a conversation"
+            description="Choose a conversation from the dropdown above to view its task decomposition graph."
+          />
+        </Box>
+      )}
+      {!isLoading && !decompError && conversationId && decomposition && decomposition.nodes.length === 0 && (
         <Box sx={{ flex: 1 }}>
           <EmptyState
             title="No task decomposition"

@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
+  Autocomplete,
   Box,
   IconButton,
   Typography,
@@ -8,6 +9,7 @@ import {
   MenuItem,
   Collapse,
   Skeleton,
+  TextField,
   ToggleButton,
   ToggleButtonGroup,
   useTheme,
@@ -22,7 +24,7 @@ import FullscreenExitIcon from '@mui/icons-material/FullscreenExit';
 import type { SelectChangeEvent } from '@mui/material';
 import type { AgentInteraction } from '@/types';
 
-import { useConversationMessages } from '@/api/conversations';
+import { useConversations, useConversationMessages } from '@/api/conversations';
 import { useAgents } from '@/api/agents';
 import { useAgentInteractions } from '@/api/decomposition';
 import ErrorCard from '@/components/common/ErrorCard';
@@ -33,9 +35,16 @@ import InteractionDetail from './InteractionDetail';
 import InteractionFeed from './InteractionFeed';
 
 const AgentInteractionPage: React.FC = () => {
-  const { id: conversationId } = useParams<{ id: string }>();
+  const { id: routeConversationId } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const theme = useTheme();
+
+  // Standalone mode: no conversation in URL → show a picker
+  const isStandalone = !routeConversationId;
+  const [pickedConversationId, setPickedConversationId] = useState<string | null>(null);
+  const conversationId = routeConversationId ?? pickedConversationId ?? undefined;
+
+  const { data: allConversations } = useConversations();
 
   const [selectedMessageId, setSelectedMessageId] = useState<string | undefined>(undefined);
   const [selectedInteraction, setSelectedInteraction] = useState<AgentInteraction | null>(null);
@@ -154,33 +163,67 @@ const AgentInteractionPage: React.FC = () => {
           flexWrap: 'wrap',
         }}
       >
-        <IconButton size="small" onClick={() => navigate('/chat')}>
-          <ArrowBackIcon fontSize="small" />
-        </IconButton>
+        {!isStandalone && (
+          <IconButton size="small" onClick={() => navigate('/conversations')}>
+            <ArrowBackIcon fontSize="small" />
+          </IconButton>
+        )}
 
         <Typography variant="h6" noWrap sx={{ minWidth: 100 }}>
           Agent Interactions
         </Typography>
 
-        {/* Message selector */}
-        <Select
-          size="small"
-          displayEmpty
-          value={selectedMessageId ?? ''}
-          onChange={handleMessageChange}
-          sx={{ minWidth: 200, fontSize: '0.85rem' }}
-        >
-          <MenuItem value="">
-            <em>All messages</em>
-          </MenuItem>
-          {messages?.filter((m) => m.role === 'user').map((m) => (
-            <MenuItem key={m.id} value={m.id}>
-              {m.content.length > 50 ? m.content.slice(0, 49) + '\u2026' : m.content}
-            </MenuItem>
-          ))}
-        </Select>
+        {/* Conversation picker — standalone mode */}
+        {isStandalone && (
+          <Autocomplete
+            size="small"
+            sx={{ minWidth: 300, flex: 1 }}
+            options={allConversations ?? []}
+            getOptionLabel={(c) => c.title || c.id.slice(0, 8)}
+            value={allConversations?.find((c) => c.id === pickedConversationId) ?? null}
+            onChange={(_, val) => {
+              setPickedConversationId(val?.id ?? null);
+              setSelectedMessageId(undefined);
+              setSelectedInteraction(null);
+              setReplayIdx(null);
+              setIsPlaying(false);
+            }}
+            renderInput={(params) => (
+              <TextField {...params} placeholder="Select a conversation..." />
+            )}
+            renderOption={(props, c) => (
+              <li {...props} key={c.id}>
+                <Box>
+                  <Typography variant="body2" noWrap>{c.title || 'Untitled'}</Typography>
+                  <Typography variant="caption" color="text.secondary">{c.id.slice(0, 12)}</Typography>
+                </Box>
+              </li>
+            )}
+            isOptionEqualToValue={(opt, val) => opt.id === val.id}
+          />
+        )}
 
-        <Box sx={{ flex: 1 }} />
+        {/* Message selector — only show when a conversation is selected */}
+        {conversationId && (
+          <Select
+            size="small"
+            displayEmpty
+            value={selectedMessageId ?? ''}
+            onChange={handleMessageChange}
+            sx={{ minWidth: 200, fontSize: '0.85rem' }}
+          >
+            <MenuItem value="">
+              <em>All messages</em>
+            </MenuItem>
+            {messages?.filter((m) => m.role === 'user').map((m) => (
+              <MenuItem key={m.id} value={m.id}>
+                {m.content.length > 50 ? m.content.slice(0, 49) + '\u2026' : m.content}
+              </MenuItem>
+            ))}
+          </Select>
+        )}
+
+        <Box sx={{ flex: isStandalone ? 0 : 1 }} />
 
         {/* Replay controls */}
         <IconButton
@@ -226,8 +269,16 @@ const AgentInteractionPage: React.FC = () => {
         </Box>
       )}
 
-      {/* Empty state */}
-      {!isLoading && !intError && interactions.length === 0 && (
+      {/* Empty / no-selection state */}
+      {!isLoading && !intError && !conversationId && (
+        <Box sx={{ flex: 1 }}>
+          <EmptyState
+            title="Select a conversation"
+            description="Choose a conversation from the dropdown above to view its agent interactions."
+          />
+        </Box>
+      )}
+      {!isLoading && !intError && conversationId && interactions.length === 0 && (
         <Box sx={{ flex: 1 }}>
           <EmptyState
             title="No agent interactions"
