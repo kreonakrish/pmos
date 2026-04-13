@@ -24,6 +24,7 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import PolicyIcon from '@mui/icons-material/Policy';
 import ScienceIcon from '@mui/icons-material/Science';
 import StorageIcon from '@mui/icons-material/Storage';
+import TerminalIcon from '@mui/icons-material/Terminal';
 import SettingsIcon from '@mui/icons-material/Settings';
 import PeopleIcon from '@mui/icons-material/People';
 import VerifiedUserIcon from '@mui/icons-material/VerifiedUser';
@@ -71,6 +72,7 @@ const NAV_SECTIONS: NavSection[] = [
       { label: 'Scoring & RL',    path: '/scoring',   icon: <AnalyticsIcon />,  anyOf: ['scoring.read'] },
       { label: 'Memory Explorer', path: '/memory',    icon: <MemoryIcon />,     anyOf: ['memory.read'] },
       { label: 'Documents',       path: '/documents', icon: <DescriptionIcon />, anyOf: ['documents.read'] },
+      { label: 'Service Logs',    path: '/logs',      icon: <TerminalIcon />,   anyOf: ['logs.read'] },
     ],
   },
   {

@@ -115,7 +115,9 @@ INSERT IGNORE INTO permissions (name, resource, action, description) VALUES
   ('settings.read',        'settings',      'read',   'View system settings'),
   ('settings.write',       'settings',      'write',  'Modify system settings'),
   -- SRE / operational
-  ('system.admin',         'system',        'admin',  'Operational control: restarts, breakers, health');
+  ('system.admin',         'system',        'admin',  'Operational control: restarts, breakers, health'),
+  -- Observability
+  ('logs.read',            'logs',          'read',   'View service logs');
 
 -- -----------------------------------------------------------------------------
 -- Seed roles
@@ -195,7 +197,8 @@ WHERE r.name = 'sre'
     'ml_insights.read',
     'agents.read','tools.read','teams.read',
     'memory.read','documents.read','catalog.read',
-    'conversations.read','users.read','roles.read'
+    'conversations.read','users.read','roles.read',
+    'logs.read'
   );
 
 -- catalog_steward

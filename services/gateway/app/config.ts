@@ -36,6 +36,8 @@ const configSchema = z.object({
   LOG_LEVEL: z.enum(['DEBUG', 'INFO', 'WARN', 'ERROR']).default('INFO'),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   DOWNSTREAM_TIMEOUT_MS: z.coerce.number().default(3000),
+  LOG_SOURCE: z.enum(['docker', 'k8s', 'loki']).default('docker'),
+  DOCKER_SOCKET_PATH: z.string().default('/var/run/docker.sock'),
 });
 
 function loadConfig() {

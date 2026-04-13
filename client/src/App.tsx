@@ -30,6 +30,7 @@ import ModelGovernancePage from '@/pages/ModelGovernance';
 import MLInsightsPage from '@/pages/MLInsights';
 import DataCatalogPage from '@/pages/DataCatalog';
 import SettingsPage from '@/pages/Settings';
+import LogsPage from '@/pages/Logs';
 
 export default function App() {
   const themeMode = useUIStore((s) => s.themeMode);
@@ -154,6 +155,9 @@ export default function App() {
               } />
               <Route path="/data-catalog" element={
                 <PermissionGate anyOf={['catalog.read']} redirect><DataCatalogPage /></PermissionGate>
+              } />
+              <Route path="/logs" element={
+                <PermissionGate anyOf={['logs.read']} redirect><LogsPage /></PermissionGate>
               } />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/admin/users" element={

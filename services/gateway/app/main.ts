@@ -15,6 +15,7 @@ import scoringRouter from './routes/scoring';
 import memoryRouter from './routes/memory';
 import authRouter from './routes/auth';
 import usersRouter from './routes/users';
+import logsRouter from './routes/logs';
 import { attachWebSocketServer } from './websocket/streamHandler';
 import { seedBootstrapUsers } from './services/authService';
 
@@ -87,6 +88,7 @@ app.use('/v1', agentMgmtRouter);
 app.use('/v1', ragRouter);
 app.use('/v1', scoringRouter);
 app.use('/v1', memoryRouter);
+app.use('/v1', logsRouter);
 
 // 7. Global error handler (must be last)
 app.use(errorHandler);
