@@ -43,6 +43,10 @@ services:
       # Mount Docker socket so the gateway can tail container logs.
       # On Windows Docker Desktop, swap for: //./pipe/docker_engine://./pipe/docker_engine
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Docker socket is root:root 0660 inside the container; the gateway
+    # process runs as non-root. Add it to the root group so it can read.
+    group_add:
+      - "0"
 
   agent-mgmt:
     <<: *node-service

@@ -54,7 +54,7 @@ export default function LogsPage() {
 
   useEffect(() => {
     if (autoScroll && logBoxRef.current) {
-      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+      logBoxRef.current.scrollTop = 0;
     }
   }, [lines, autoScroll]);
 
@@ -97,6 +97,8 @@ export default function LogsPage() {
         l.raw.toLowerCase().includes(needle),
     );
   }, [lines, filterText]);
+
+  const displayed = useMemo(() => [...filtered].reverse(), [filtered]);
 
   return (
     <Box>
@@ -209,12 +211,12 @@ export default function LogsPage() {
           fontSize: 12.5,
         }}
       >
-        {filtered.length === 0 && (
+        {displayed.length === 0 && (
           <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
             {streaming ? 'Waiting for logs…' : 'Pick a service and press Tail.'}
           </Typography>
         )}
-        {filtered.map((l, i) => (
+        {displayed.map((l, i) => (
           <Box
             key={i}
             sx={{
