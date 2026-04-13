@@ -125,7 +125,23 @@ class MemoryWriteConsumer:
         elif tier == MemoryTier.REASONING.value:
             await self._reasoning.store(agent_id, content, metadata)
         elif tier == MemoryTier.EPISODIC.value:
-            await self._episodic.store_episode(agent_id, {"content": content, **metadata})
+            # Build a properly-populated episode so `content` doesn't render as
+            # the placeholder "Task: \nOutput: ". `content` from the stream is
+            # the agent's final output; `task_description` / `task_id` /
+            # `outcome` / `score` come from the metadata payload.
+            episode = {
+                "task_description": metadata.get("task_description", ""),
+                "output": content or "",
+                "task_id": metadata.get("task_id", ""),
+                "steps": metadata.get("steps", []),
+                "score": metadata.get("score", 0.0),
+                "outcome": metadata.get("outcome", "SUCCESS"),
+                "importance": metadata.get("importance", 0.5),
+                "metadata": {k: v for k, v in metadata.items() if k not in {
+                    "task_description", "task_id", "steps", "score", "outcome", "importance",
+                }},
+            }
+            await self._episodic.store_episode(agent_id, episode)
         else:
             logger.warning(
                 "Unknown memory tier in stream message",

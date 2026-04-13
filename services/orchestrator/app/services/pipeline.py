@@ -21,6 +21,7 @@ import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
+import mysql.connector
 
 from app.adapters.agent_mgmt_adapter import AgentMgmtAdapter
 from app.adapters.llm_adapter import LLMAdapter
@@ -79,6 +80,9 @@ class PipelineService:
         self._cb_meta = CircuitBreaker("meta")
         self._cb_agent_mgmt = CircuitBreaker("agent_mgmt")
 
+        # Cache of UUID → MySQL agents.id lookups (populated lazily by _resolve_agent_db_id).
+        self._agent_db_id_cache: Dict[str, int] = {}
+
         # Capability negotiation service
         self._negotiation = CapabilityNegotiationService(
             neo4j=neo4j,
@@ -108,6 +112,65 @@ class PipelineService:
                 layer="service",
                 error=str(exc),
             )
+
+    # ------------------------------------------------------------------
+    # Agent DB-ID resolver
+    # ------------------------------------------------------------------
+    def _resolve_agent_db_id(self, agent: Optional[Agent]) -> Optional[int]:
+        """Return the MySQL integer agents.id for the given Agent.
+
+        Agent.agent_id is a UUID string; memory/scoring rows require the integer
+        primary key. Looks it up from MySQL and caches on the Agent instance and
+        in the per-pipeline cache. Returns None when unresolvable — callers must
+        SKIP writes rather than fall back to a phantom id.
+        """
+        if agent is None:
+            return None
+        if agent.db_id is not None:
+            return agent.db_id
+        if agent.agent_id and agent.agent_id.isdigit():
+            agent.db_id = int(agent.agent_id)
+            return agent.db_id
+        cached = self._agent_db_id_cache.get(agent.agent_id or "")
+        if cached is not None:
+            agent.db_id = cached
+            return cached
+        uuid_or_name = agent.agent_id or agent.name
+        if not uuid_or_name:
+            return None
+        try:
+            conn = mysql.connector.connect(
+                host=settings.mysql_host,
+                port=settings.mysql_port,
+                user=settings.mysql_user,
+                password=settings.mysql_password,
+                database=settings.mysql_db,
+                connection_timeout=3,
+            )
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id FROM agents WHERE agent_id = %s OR name = %s LIMIT 1",
+                    (uuid_or_name, agent.name or uuid_or_name),
+                )
+                row = cur.fetchone()
+                cur.close()
+                if row:
+                    db_id = int(row[0])
+                    agent.db_id = db_id
+                    self._agent_db_id_cache[agent.agent_id or ""] = db_id
+                    return db_id
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning(
+                "agent_db_id_lookup_failed",
+                layer="service",
+                agent_id=agent.agent_id,
+                agent_name=agent.name,
+                error=str(exc),
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -285,14 +348,24 @@ class PipelineService:
             )
 
             # Step 9: RESPONSE & LEARNING
-            await self._step9_learning(
-                session_id=session_id,
-                graph_id=graph_id,
-                agent_id=int(primary.agent_id) if (primary and primary.agent_id.isdigit()) else 0,
-                final_response=final_response,
-                node_results=node_results,
-                trace_id=trace_id,
-            )
+            primary_db_id = self._resolve_agent_db_id(primary)
+            if primary_db_id is None:
+                logger.warning(
+                    "step9_skipped_no_agent_db_id",
+                    layer="service",
+                    trace_id=trace_id,
+                    agent_uuid=(primary.agent_id if primary else None),
+                )
+            else:
+                await self._step9_learning(
+                    session_id=session_id,
+                    graph_id=graph_id,
+                    agent_id=primary_db_id,
+                    final_response=final_response,
+                    node_results=node_results,
+                    trace_id=trace_id,
+                    task_description=message,
+                )
 
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
             logger.info(
@@ -938,7 +1011,7 @@ class PipelineService:
         Does NOT update Neo4j node status — used for speculative execution
         where two agents race and only the winner's result is applied.
         """
-        agent_id = int(agent.agent_id) if agent.agent_id.isdigit() else 0
+        agent_id = self._resolve_agent_db_id(agent) or 0
         agent_uuid = agent.agent_id
         start = time.monotonic()
 
@@ -1211,7 +1284,7 @@ class PipelineService:
 
         agent = primary
         agent_uuid = agent.agent_id if agent else ""
-        agent_id = int(agent.agent_id) if (agent and agent.agent_id.isdigit()) else 0
+        agent_id = self._resolve_agent_db_id(agent) or 0
         fallback_index = 0
 
         while True:
@@ -1394,7 +1467,7 @@ class PipelineService:
                     failed_agent_name = agent.name if agent else "unknown"
                     agent = fallbacks[fallback_index]
                     agent_uuid = agent.agent_id if agent else ""
-                    agent_id = int(agent.agent_id) if (agent and agent.agent_id.isdigit()) else 0
+                    agent_id = self._resolve_agent_db_id(agent) or 0
                     fallback_index += 1
                     logger.info(
                         "Switching to fallback agent (score below band)",
@@ -1472,7 +1545,7 @@ class PipelineService:
                 if fallback_index < len(fallbacks):
                     agent = fallbacks[fallback_index]
                     agent_uuid = agent.agent_id if agent else ""
-                    agent_id = int(agent.agent_id) if (agent and agent.agent_id.isdigit()) else 0
+                    agent_id = self._resolve_agent_db_id(agent) or 0
                     fallback_index += 1
                     logger.info(
                         "Switching to fallback agent (error recovery)",
@@ -1801,8 +1874,13 @@ class PipelineService:
         final_response: str,
         node_results: List[Dict[str, Any]],
         trace_id: str,
+        task_description: str = "",
     ) -> None:
         """Persist session memories and publish scoring feedback."""
+        avg_score_pre = (
+            sum(float(r.get("score", 0.0) or 0.0) for r in node_results) / len(node_results)
+            if node_results else 0.0
+        )
         # Async memory write via Redis stream
         try:
             await self._redis.publish_memory_write(
@@ -1812,6 +1890,9 @@ class PipelineService:
                 task_id=graph_id,
                 importance=0.7,
                 trace_id=trace_id,
+                task_description=task_description or "(no task description)",
+                score=round(avg_score_pre, 4),
+                outcome="SUCCESS" if avg_score_pre >= 0.5 else "PARTIAL",
             )
         except Exception as exc:
             logger.error(

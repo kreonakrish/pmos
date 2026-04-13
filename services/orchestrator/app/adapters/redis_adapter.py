@@ -79,20 +79,27 @@ class RedisAdapter:
         task_id: str,
         importance: float = 0.5,
         trace_id: str = "",
+        task_description: str = "",
+        score: Optional[float] = None,
+        outcome: str = "SUCCESS",
     ) -> str:
+        metadata: Dict[str, Any] = {
+            "task_id": task_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "importance": importance,
+            "outcome": outcome,
+        }
+        if task_description:
+            metadata["task_description"] = task_description[:2000]
+        if score is not None:
+            metadata["score"] = score
         return await self.publish_to_stream(
             "memory:writes",
             {
                 "agent_id": str(agent_id),
                 "tier": tier,
                 "content": content,
-                "metadata": json.dumps(
-                    {
-                        "task_id": task_id,
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "importance": importance,
-                    }
-                ),
+                "metadata": json.dumps(metadata),
             },
             trace_id=trace_id,
         )

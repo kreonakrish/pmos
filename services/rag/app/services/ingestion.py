@@ -78,8 +78,10 @@ class IngestionService:
         # 3. Embed
         vectors = await embed_texts(embedding_model, chunks)
 
-        # 4. Upsert to primary vector store
-        # 5. Upsert to local FAISS (mirror)
+        # 4. Upsert to vector stores (Qdrant primary, FAISS mirror) + collect
+        #    chunk rows for MySQL persistence.
+        vector_upserts_ok = 0
+        chunk_rows: List[Dict[str, Any]] = []
         for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
             chunk_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{document_id}_{i}"))
             metadata = {
@@ -91,10 +93,26 @@ class IngestionService:
                 "team_id": team_id,
                 "conversation_id": conversation_id or "",
             }
-            await self._vector_store.upsert(chunk_id, vec, metadata)
-            await self._faiss.upsert(chunk_id, vec, {**metadata, "_collection": "documents"})
+            try:
+                await self._vector_store.upsert(chunk_id, vec, metadata)
+                vector_upserts_ok += 1
+            except Exception as exc:
+                log.error("Vector store upsert failed",
+                          doc_id=document_id, chunk_id=chunk_id, error=str(exc))
+            try:
+                await self._faiss.upsert(chunk_id, vec, {**metadata, "_collection": "documents"})
+            except Exception as exc:
+                log.warning("FAISS mirror upsert failed",
+                            doc_id=document_id, chunk_id=chunk_id, error=str(exc))
+            chunk_rows.append({
+                "chunk_id": chunk_id,
+                "chunk_index": i,
+                "content": chunk,
+                "embedding_id": chunk_id,
+                "metadata": {k: v for k, v in metadata.items() if k != "content"},
+            })
 
-        # 6. Insert metadata to MySQL (full content for FTS)
+        # 5. Insert document metadata to MySQL (actual chunk count)
         await self._mysql.insert_document(
             doc_id=document_id,
             content=cleaned,
@@ -102,7 +120,14 @@ class IngestionService:
             team_id=team_id,
             agent_id=agent_id,
             conversation_id=conversation_id,
+            chunk_count=len(chunks),
         )
+        # 6. Persist chunk text to MySQL so retrieval works even if Qdrant
+        #    is cleared (and as a secondary BM25-style fallback).
+        await self._mysql.insert_chunks(doc_id=document_id, chunks=chunk_rows)
+        log.info("Chunks persisted to MySQL",
+                 doc_id=document_id, chunks=len(chunk_rows),
+                 vector_upserts_ok=vector_upserts_ok)
 
         elapsed_ms = int(time.monotonic() * 1000) - start_ms
         log.info(

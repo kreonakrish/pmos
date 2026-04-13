@@ -82,13 +82,23 @@ fi
 $MYSQL_CMD < "$PMOS_DIR/infra/mysql/schema.sql"
 success "MySQL schema created (database: ${MYSQL_DB:-pmos})"
 
+# Auth / RBAC schema (idempotent)
+if [ -f "$PMOS_DIR/infra/mysql/auth_schema.sql" ]; then
+  $MYSQL_CMD "${MYSQL_DB:-pmos}" < "$PMOS_DIR/infra/mysql/auth_schema.sql"
+  success "MySQL auth/RBAC schema applied"
+fi
+
 # ---------------------------------------------------------------------------
 # STEP 3: Seed Neo4j constraints & indexes
 # ---------------------------------------------------------------------------
 
 info "=== Seeding Neo4j constraints ==="
 
-NEO4J_URI_ACTUAL="${NEO4J_URI:-neo4j+s://8414810d.databases.neo4j.io}"
+NEO4J_URI_ACTUAL="${NEO4J_URI:-}"
+if [ -z "$NEO4J_URI_ACTUAL" ]; then
+  error "NEO4J_URI is not set in .env. Set it before bootstrapping (e.g. neo4j+s://<host> or bolt://<host>:7687)."
+  exit 1
+fi
 NEO4J_USER_ACTUAL="${NEO4J_USER:-neo4j}"
 NEO4J_PASSWORD_ACTUAL="${NEO4J_PASSWORD:-}"
 

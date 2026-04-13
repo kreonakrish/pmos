@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Box,
   Typography,
@@ -16,10 +17,15 @@ import {
   Skeleton,
   Stack,
   Alert,
+  Tabs,
+  Tab,
 } from '@mui/material';
 import SaveIcon from '@mui/icons-material/Save';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import { useHealth } from '@/api/health';
+import MyAccessTab from './MyAccessTab';
+import ChangePasswordTab from './ChangePasswordTab';
+import { useAuthStore } from '@/store/authStore';
 
 const SERVICES = [
   { name: 'Gateway', key: 'gateway', port: 4000 },
@@ -60,9 +66,24 @@ function statusDot(status: string) {
   );
 }
 
+type TabKey = 'system' | 'access' | 'password';
+
 export default function SettingsPage() {
   const healthQuery = useHealth();
   const healthData = healthQuery.data;
+  const [searchParams, setSearchParams] = useSearchParams();
+  const canSeeSystem = useAuthStore((s) => s.has('settings.read'));
+  const initialTab = (searchParams.get('tab') as TabKey) || (canSeeSystem ? 'system' : 'access');
+  const [tab, setTab] = useState<TabKey>(initialTab);
+  useEffect(() => {
+    const current = (searchParams.get('tab') as TabKey) || null;
+    if (current !== tab) {
+      const next = new URLSearchParams(searchParams);
+      next.set('tab', tab);
+      setSearchParams(next, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
 
   // LLM config
   const [model, setModel] = useState('gpt-4o');
@@ -87,10 +108,20 @@ export default function SettingsPage() {
 
   return (
     <Box sx={{ p: 3, maxWidth: 900, mx: 'auto' }}>
-      <Typography variant="h5" fontWeight={700} sx={{ mb: 3 }}>
+      <Typography variant="h5" fontWeight={700} sx={{ mb: 2 }}>
         Settings
       </Typography>
 
+      <Tabs value={tab} onChange={(_, v: TabKey) => setTab(v)} sx={{ mb: 3, borderBottom: 1, borderColor: 'divider' }}>
+        {canSeeSystem && <Tab value="system" label="System" />}
+        <Tab value="access" label="My Access" />
+        <Tab value="password" label="Change Password" />
+      </Tabs>
+
+      {tab === 'access'   && <MyAccessTab />}
+      {tab === 'password' && <ChangePasswordTab />}
+
+      {tab === 'system' && canSeeSystem && <>
       {saved && (
         <Alert severity="success" sx={{ mb: 2 }}>
           Settings saved successfully.
@@ -292,6 +323,7 @@ export default function SettingsPage() {
           Save Settings
         </Button>
       </Box>
+      </>}
     </Box>
   );
 }

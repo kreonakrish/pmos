@@ -44,12 +44,21 @@ User → React Frontend (3000) → Gateway (4000) → Orchestrator (8000)
 # 1. Clone and configure
 cp .env.example .env  # fill in OPENAI_API_KEY, MYSQL_PASSWORD, NEO4J_PASSWORD
 
-# 2. Start everything
-./pmos.sh start       # Redis, Qdrant, 7 Docker services, frontend
+# 2. Start everything (one-shot fresh-server install)
+./scripts/deploy.sh install   # Redis, Qdrant, 7 services, dockerized client
+
+# Day-to-day:
+./scripts/deploy.sh up        # start everything
+./scripts/deploy.sh down      # stop everything
+./scripts/deploy.sh status    # health + container status
 
 # 3. Open
 open http://localhost:3000
 ```
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full deployment guide,
+per-component commands (`up gateway`, `restart rag`, `logs orchestrator`, etc.),
+and production hardening checklist.
 
 ## Documentation
 

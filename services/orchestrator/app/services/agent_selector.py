@@ -11,7 +11,7 @@ from app.utils.logger import logger
 
 @dataclass
 class Agent:
-    agent_id: str
+    agent_id: str                              # UUID (from Neo4j / agents.agent_id)
     name: str = ""
     status: str = "IDLE"
     accuracy_rate: float = 0.5
@@ -22,6 +22,7 @@ class Agent:
     execution_mode: str = "sequential"
     criticality: str = "MEDIUM"
     raw: Dict[str, Any] = field(default_factory=dict)
+    db_id: Optional[int] = None                # MySQL agents.id (int). Resolved lazily.
 
 
 class AgentSelector:

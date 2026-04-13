@@ -39,7 +39,7 @@ router.get('/memory/entries', async (req: Request, res: Response): Promise<void>
   const traceId = (req as Request & { id?: string }).id;
   logger.info('proxy_memory_entries', { layer: 'router', trace_id: traceId });
   await proxyRequest(req, res, {
-    targetUrl: `${config.MEMORY_SERVICE_URL}/v1/memory/retrieve`,
+    targetUrl: `${config.MEMORY_SERVICE_URL}/v1/memory/entries`,
   });
 });
 

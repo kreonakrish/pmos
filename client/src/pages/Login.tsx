@@ -10,7 +10,7 @@ import {
   CircularProgress,
 } from '@mui/material';
 import LockOutlinedIcon from '@mui/icons-material/LockOutlined';
-import apiClient from '@/api/axios';
+import { login, fetchMe, changePassword } from '@/api/auth';
 
 interface LoginProps {
   onLoginSuccess: () => void;
@@ -19,31 +19,55 @@ interface LoginProps {
 export default function Login({ onLoginSuccess }: LoginProps) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [mustChangeStep, setMustChangeStep] = useState(false);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+
+  function extractError(err: unknown, fallback: string): string {
+    if (err && typeof err === 'object' && 'response' in err) {
+      const axiosErr = err as { response?: { data?: { error?: string }; status?: number } };
+      return axiosErr.response?.data?.error ?? `${fallback} (status ${axiosErr.response?.status ?? 'unknown'})`;
+    }
+    return 'Unable to connect to the server. Please try again.';
+  }
+
+  const finishLogin = async () => {
+    await fetchMe();
+    onLoginSuccess();
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError('');
     setLoading(true);
-
     try {
-      const response = await apiClient.post('/v1/auth/login', {
-        username,
-        password,
-      });
-      localStorage.setItem('pmos_token', response.data.token);
-      onLoginSuccess();
-    } catch (err: unknown) {
-      if (err && typeof err === 'object' && 'response' in err) {
-        const axiosErr = err as { response?: { data?: { error?: string }; status?: number } };
-        setError(
-          axiosErr.response?.data?.error ??
-            `Login failed (status ${axiosErr.response?.status ?? 'unknown'})`,
-        );
-      } else {
-        setError('Unable to connect to the server. Please try again.');
+      const res = await login(username, password);
+      if (res.user.must_change_password) {
+        setMustChangeStep(true);
+        setLoading(false);
+        return;
       }
+      await finishLogin();
+    } catch (err: unknown) {
+      setError(extractError(err, 'Login failed'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleChangePassword = async (e: FormEvent) => {
+    e.preventDefault();
+    setError('');
+    if (newPassword.length < 8) { setError('New password must be at least 8 characters.'); return; }
+    if (newPassword !== confirmPassword) { setError('Passwords do not match.'); return; }
+    setLoading(true);
+    try {
+      await changePassword(password, newPassword);
+      await finishLogin();
+    } catch (err: unknown) {
+      setError(extractError(err, 'Password change failed'));
     } finally {
       setLoading(false);
     }
@@ -104,37 +128,53 @@ export default function Login({ onLoginSuccess }: LoginProps) {
             </Alert>
           )}
 
-          <Box component="form" onSubmit={handleSubmit} noValidate>
-            <TextField
-              label="Username"
-              fullWidth
-              required
-              autoFocus
-              autoComplete="username"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              sx={{ mb: 2 }}
-            />
-            <TextField
-              label="Password"
-              type="password"
-              fullWidth
-              required
-              autoComplete="current-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              sx={{ mb: 3 }}
-            />
-            <Button
-              type="submit"
-              variant="contained"
-              fullWidth
-              size="large"
-              disabled={loading || !username || !password}
-            >
-              {loading ? <CircularProgress size={24} color="inherit" /> : 'Sign In'}
-            </Button>
-          </Box>
+          {!mustChangeStep ? (
+            <Box component="form" onSubmit={handleSubmit} noValidate>
+              <TextField
+                label="Username"
+                fullWidth required autoFocus autoComplete="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                sx={{ mb: 2 }}
+              />
+              <TextField
+                label="Password" type="password"
+                fullWidth required autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                sx={{ mb: 3 }}
+              />
+              <Button type="submit" variant="contained" fullWidth size="large"
+                disabled={loading || !username || !password}>
+                {loading ? <CircularProgress size={24} color="inherit" /> : 'Sign In'}
+              </Button>
+            </Box>
+          ) : (
+            <Box component="form" onSubmit={handleChangePassword} noValidate>
+              <Alert severity="info" sx={{ mb: 2 }}>
+                You must set a new password before continuing.
+              </Alert>
+              <TextField
+                label="New password" type="password"
+                fullWidth required autoFocus autoComplete="new-password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                helperText="Minimum 8 characters"
+                sx={{ mb: 2 }}
+              />
+              <TextField
+                label="Confirm new password" type="password"
+                fullWidth required autoComplete="new-password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                sx={{ mb: 3 }}
+              />
+              <Button type="submit" variant="contained" fullWidth size="large"
+                disabled={loading || !newPassword || !confirmPassword}>
+                {loading ? <CircularProgress size={24} color="inherit" /> : 'Set new password'}
+              </Button>
+            </Box>
+          )}
         </CardContent>
       </Card>
     </Box>

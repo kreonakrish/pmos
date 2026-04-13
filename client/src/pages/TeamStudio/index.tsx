@@ -64,9 +64,6 @@ export default function TeamStudioPage() {
       const agentHierarchy: TeamAgentHierarchy[] = [];
       const allAgents = agents ?? [];
 
-      // Find orchestrator node (type='orchestratorNode')
-      const orchNode = nodes.find((n) => n.type === 'orchestratorNode');
-
       for (const node of nodes) {
         const agentId = node.data?.agentId;
         if (!agentId) continue;

@@ -14,7 +14,9 @@ import ragRouter from './routes/rag';
 import scoringRouter from './routes/scoring';
 import memoryRouter from './routes/memory';
 import authRouter from './routes/auth';
+import usersRouter from './routes/users';
 import { attachWebSocketServer } from './websocket/streamHandler';
+import { seedBootstrapUsers } from './services/authService';
 
 // ─── Prometheus registry ──────────────────────────────────────────────────────
 const registry = new Registry();
@@ -79,6 +81,7 @@ app.use('/v1', authMiddleware);
 app.use('/v1', rateLimiter);
 
 // 6. Versioned API routes
+app.use('/v1', usersRouter);
 app.use('/v1', orchestratorRouter);
 app.use('/v1', agentMgmtRouter);
 app.use('/v1', ragRouter);
@@ -98,6 +101,11 @@ const server = httpServer.listen(config.GATEWAY_PORT, () => {
     layer: 'service',
     port: config.GATEWAY_PORT,
     env: config.NODE_ENV,
+  });
+  // Seed bootstrap users (idempotent; only creates if missing)
+  seedBootstrapUsers().catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error('seed_bootstrap_users_failed', { reason: msg });
   });
 });
 

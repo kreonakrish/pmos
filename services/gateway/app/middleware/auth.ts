@@ -4,10 +4,64 @@ import { config } from '../config';
 import { logger } from '../utils/logger';
 
 export interface JwtPayload {
-  sub: string;
+  sub: string;           // username
+  uid?: number;          // user id
+  roles?: string[];
+  permissions?: string[];
+  must_change_password?: boolean;
   iat?: number;
   exp?: number;
   [key: string]: unknown;
+}
+
+/**
+ * Require one or more permissions on the authenticated user.
+ * Usage: router.delete('/agents/:id', requirePermission('agents.delete'), handler)
+ */
+export function requirePermission(...needed: string[]) {
+  return function (req: Request, res: Response, next: NextFunction): void {
+    const user = (req as Request & { user?: JwtPayload }).user;
+    const traceId = (req as Request & { id?: string }).id;
+    if (!user) {
+      res.status(401).json({ error: 'Not authenticated', code: 'AUTH_FAILED', trace_id: traceId });
+      return;
+    }
+    const perms = new Set(user.permissions ?? []);
+    const missing = needed.filter((p) => !perms.has(p));
+    if (missing.length > 0) {
+      logger.warn('rbac_denied', { trace_id: traceId, sub: user.sub, missing });
+      res.status(403).json({
+        error: `Access denied — missing permission: ${missing.join(', ')}`,
+        code: 'FORBIDDEN',
+        missing,
+        trace_id: traceId,
+      });
+      return;
+    }
+    next();
+  };
+}
+
+/** Require the user to hold at least one of the named roles. */
+export function requireAnyRole(...roles: string[]) {
+  return function (req: Request, res: Response, next: NextFunction): void {
+    const user = (req as Request & { user?: JwtPayload }).user;
+    const traceId = (req as Request & { id?: string }).id;
+    if (!user) {
+      res.status(401).json({ error: 'Not authenticated', code: 'AUTH_FAILED', trace_id: traceId });
+      return;
+    }
+    const held = new Set(user.roles ?? []);
+    if (!roles.some((r) => held.has(r))) {
+      res.status(403).json({
+        error: `Access denied — requires one of roles: ${roles.join(', ')}`,
+        code: 'FORBIDDEN',
+        trace_id: traceId,
+      });
+      return;
+    }
+    next();
+  };
 }
 
 /** Routes that bypass authentication entirely. */

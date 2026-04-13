@@ -1,8 +1,11 @@
 import axios from 'axios';
 
-// In dev mode, use empty baseURL so requests go through Vite's proxy (/v1 → localhost:4000)
-// In production (Docker/nginx), the proxy is handled by nginx.conf
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
+// Resolution order:
+//   1. window.__PMOS_CONFIG__.apiBaseUrl   (runtime, set by /config.js in prod container)
+//   2. VITE_API_BASE_URL                   (build-time override)
+//   3. '' (relative URLs — same-origin via Vite proxy in dev or nginx in prod)
+const runtimeCfg = (typeof window !== 'undefined' && (window as any).__PMOS_CONFIG__) || {};
+const API_BASE_URL: string = runtimeCfg.apiBaseUrl || import.meta.env.VITE_API_BASE_URL || '';
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,

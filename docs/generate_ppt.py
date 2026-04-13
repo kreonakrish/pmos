@@ -474,7 +474,7 @@ add_card(slide, 4.7, 4.2, 4.0, 2.5, "Document Processing",
 
 add_card(slide, 8.9, 4.2, 4.0, 2.5, "Infrastructure",
          "Docker Compose — 7 containers\n"
-         "pmos.sh — service manager\n\n"
+         "scripts/deploy.sh — service manager\n\n"
          "Observability:\n"
          "  Structured JSON logs (trace_id)\n"
          "  Prometheus metrics on every service\n"

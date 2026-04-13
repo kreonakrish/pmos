@@ -5,8 +5,8 @@ class Settings(BaseSettings):
     service_name: str = "orchestrator"
     orchestrator_port: int = 8000
 
-    # Neo4j (AuraDB Cloud)
-    neo4j_uri: str = "neo4j+s://8414810d.databases.neo4j.io"
+    # Neo4j (set NEO4J_URI in .env; no hardcoded default)
+    neo4j_uri: str = ""
     neo4j_user: str = "neo4j"
     neo4j_password: str = ""
     neo4j_database: str = "neo4j"

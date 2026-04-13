@@ -34,9 +34,13 @@ export function connectForStream(onMessage?: (event: WSEvent) => void): WebSocke
   const token = localStorage.getItem('pmos_token');
   if (!token) return null;
 
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const host = window.location.host;
-  const url = `${protocol}//${host}/v1/ws/chat?token=${encodeURIComponent(token)}`;
+  const runtimeCfg = (window as any).__PMOS_CONFIG__ || {};
+  let base: string = runtimeCfg.wsBaseUrl || '';
+  if (!base) {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    base = `${protocol}//${window.location.host}`;
+  }
+  const url = `${base.replace(/\/$/, '')}/v1/ws/chat?token=${encodeURIComponent(token)}`;
 
   const wsStore = useWSStore.getState();
 

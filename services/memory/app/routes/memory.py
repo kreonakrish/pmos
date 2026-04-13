@@ -21,6 +21,7 @@ from app.services.long_term import LongTermMemoryService
 from app.services.prompt_assembler import PromptAssembler
 from app.services.reasoning import ReasoningMemoryService
 from app.services.short_term import ShortTermMemoryService
+from app.adapters.mysql_adapter import get_mysql_adapter
 from app.utils.logger import get_logger, new_span_id
 from prometheus_client import Counter, Histogram
 
@@ -95,6 +96,74 @@ async def write_memory(body: MemoryWriteRequest, request: Request) -> MemoryWrit
             layer="router",
             agent_id=body.agent_id,
             tier=body.tier.value,
+            error=str(exc),
+            trace_id=trace_id,
+            span_id=span_id,
+        )
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/entries")
+async def list_entries(
+    request: Request,
+    agent_id: int = Query(..., description="Agent ID"),
+    tier: MemoryTier = Query(..., description="Memory tier"),
+    limit: int = Query(50, ge=1, le=500, description="Max rows"),
+) -> dict:
+    """Browse recent memory entries for an agent/tier without semantic search.
+
+    Reads straight from the backing store (Redis for SHORT_TERM, MySQL for the
+    other tiers) ordered by most recent. Use /retrieve for semantic search.
+    """
+    span_id = new_span_id()
+    trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    start = time.time()
+
+    try:
+        results: list = []
+        if tier == MemoryTier.SHORT_TERM:
+            results = await _short_term.read_all(agent_id)
+            results = results[-limit:] if len(results) > limit else results
+        elif tier == MemoryTier.EPISODIC:
+            mysql = get_mysql_adapter()
+            rows = await mysql.select(
+                table="execution_episodes",
+                where="agent_id = %s",
+                params=(agent_id,),
+                order_by="created_at DESC",
+                limit=limit,
+            )
+            results = rows or []
+        else:
+            # LONG_TERM / REASONING → agent_memory_extended
+            mysql = get_mysql_adapter()
+            rows = await mysql.select(
+                table="agent_memory_extended",
+                where="agent_id = %s AND memory_tier = %s",
+                params=(agent_id, tier.value),
+                order_by="created_at DESC",
+                limit=limit,
+            )
+            results = rows or []
+
+        MEMORY_HITS.labels(tier=tier.value).inc()
+        logger.info(
+            "Memory entries list",
+            layer="router",
+            agent_id=agent_id,
+            tier=tier.value,
+            count=len(results),
+            duration_ms=round((time.time() - start) * 1000),
+            trace_id=trace_id,
+            span_id=span_id,
+        )
+        return {"results": results, "tier": tier.value, "count": len(results), "trace_id": trace_id}
+    except Exception as exc:
+        logger.error(
+            "Memory entries list failed",
+            layer="router",
+            agent_id=agent_id,
+            tier=tier.value,
             error=str(exc),
             trace_id=trace_id,
             span_id=span_id,

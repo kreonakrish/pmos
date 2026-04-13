@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import {
   Box,
   Typography,
@@ -36,12 +36,15 @@ function useStatusLegendColor() {
 
 const GraphPage: React.FC = () => {
   const [selectedTeamId, setSelectedTeamId] = useState('');
-  const [serverGraphFilter, setServerGraphFilter] = useState('');
+  // selectedGraphId drives BOTH client-side display filtering AND the
+  // server-side `graph_id` query param, so picking a graph in the dropdown
+  // tells the orchestrator to return only that subgraph (efficient on large
+  // datasets). When empty, the full graph is fetched.
+  const [selectedGraphId, setSelectedGraphId] = useState('');
 
-  // Pass team/graph filter to API (server-side filtering for teams)
   const { data: graphData, isLoading, isError, refetch } = useTaskGraph({
     teamId: selectedTeamId || undefined,
-    graphId: serverGraphFilter || undefined,
+    graphId: selectedGraphId || undefined,
   });
 
   const { graphDetailPanelOpen, setGraphDetailPanelOpen } = useUIStore();
@@ -49,50 +52,52 @@ const GraphPage: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<TaskNodeStatus[]>(ALL_STATUSES);
   const [maxDepth, setMaxDepth] = useState(10);
   const [selectedAgent, setSelectedAgent] = useState('');
-  const [selectedGraphId, setSelectedGraphId] = useState('');
   const canvasContainerRef = useRef<HTMLDivElement>(null);
   const legendColors = useStatusLegendColor();
 
-  // Derive unique agents and graph_ids from data
+  // Derive unique agents from currently-loaded data
   const uniqueAgents = React.useMemo(() => {
     if (!graphData?.nodes) return [];
     const set = new Set<string>();
     for (const n of graphData.nodes) {
-      const a = n.agent_name || (n as Record<string, unknown>).assigned_agent_name as string;
+      const a = n.agent_name || n.assigned_agent_name;
       if (a) set.add(a);
     }
     return Array.from(set).sort();
   }, [graphData]);
 
-  const uniqueGraphIds = React.useMemo(() => {
-    if (!graphData?.nodes) return [];
+  // Cache of all graph_ids ever seen on an UNFILTERED fetch, so the dropdown
+  // doesn't collapse to a single option after a server-side filter is applied.
+  const [knownGraphIds, setKnownGraphIds] = useState<string[]>([]);
+  useEffect(() => {
+    if (selectedGraphId) return; // skip refresh on filtered fetches
+    if (!graphData?.nodes) return;
     const set = new Set<string>();
     for (const n of graphData.nodes) {
-      const g = (n as Record<string, unknown>).graph_id as string;
-      if (g) set.add(g);
+      if (n.graph_id) set.add(n.graph_id);
     }
-    return Array.from(set);
-  }, [graphData]);
+    const next = Array.from(set).sort();
+    setKnownGraphIds((prev) =>
+      prev.length === next.length && prev.every((v, i) => v === next[i]) ? prev : next,
+    );
+  }, [graphData, selectedGraphId]);
 
-  // Apply agent and graph filters to nodes/edges
+  // Apply agent filter to nodes/edges (graph filter is now server-side)
   const filteredData = React.useMemo(() => {
     if (!graphData) return { nodes: [], edges: [] };
     let nodes = graphData.nodes;
     if (selectedAgent) {
       nodes = nodes.filter((n) => {
-        const a = n.agent_name || (n as Record<string, unknown>).assigned_agent_name as string;
+        const a = n.agent_name || n.assigned_agent_name;
         return a === selectedAgent;
       });
-    }
-    if (selectedGraphId) {
-      nodes = nodes.filter((n) => (n as Record<string, unknown>).graph_id === selectedGraphId);
     }
     const nodeIds = new Set(nodes.map((n) => n.task_id));
     const edges = (graphData.edges ?? []).filter(
       (e) => nodeIds.has(e.source as string) && nodeIds.has(e.target as string),
     );
     return { nodes, edges };
-  }, [graphData, selectedAgent, selectedGraphId]);
+  }, [graphData, selectedAgent]);
 
   const handleNodeClick = useCallback(
     (node: TaskNode) => {
@@ -151,13 +156,13 @@ const GraphPage: React.FC = () => {
         onZoomOut={handleZoomOut}
         onFitToScreen={handleFitToScreen}
         onRefresh={() => refetch()}
-        teams={(graphData as Record<string, unknown>)?.teams as Array<{team_id: string; name: string}> ?? []}
+        teams={graphData?.teams ?? []}
         selectedTeamId={selectedTeamId}
         onTeamChange={(tid) => { setSelectedTeamId(tid); refetch(); }}
         agents={uniqueAgents}
         selectedAgent={selectedAgent}
         onAgentChange={setSelectedAgent}
-        graphIds={uniqueGraphIds}
+        graphIds={knownGraphIds}
         selectedGraphId={selectedGraphId}
         onGraphIdChange={setSelectedGraphId}
         nodeCount={filteredData.nodes.length}

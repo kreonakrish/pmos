@@ -121,8 +121,8 @@ export default function AgentStudioPage() {
         llm_model: agent.foundation_model || 'gpt-4o',
         temperature: 0.7,
         max_tokens: 4096,
-        memory_seed: (agent as Record<string, unknown>).memory_seed as string ?? '',
-        reasoning_seed: (agent as Record<string, unknown>).reasoning_seed as string ?? '',
+        memory_seed: (agent as unknown as Record<string, string>).memory_seed ?? '',
+        reasoning_seed: (agent as unknown as Record<string, string>).reasoning_seed ?? '',
         scoring_weights: { ...DEFAULT_AGENT.scoring_weights },
       });
       setDirtyAgent(false);
@@ -189,14 +189,15 @@ export default function AgentStudioPage() {
         },
         {
           onSuccess: (created) => {
-            const newUuid = created.agent_id ?? (created as Record<string, unknown>).agent?.agent_id as string;
+            const createdAny = created as unknown as Record<string, Record<string, unknown>>;
+            const newUuid = created.agent_id ?? createdAny.agent?.agent_id as string;
             setDirtyAgent(false);
             setIsCreating(false);
-            setSelectedAgent(String(created.id ?? (created as Record<string, unknown>).agent?.id));
+            setSelectedAgent(String(created.id ?? createdAny.agent?.id));
             setCurrentAgentUuid(newUuid);
             setAgentData((prev) => prev ? {
               ...prev,
-              id: created.id ?? (created as Record<string, unknown>).agent?.id as number,
+              id: created.id ?? createdAny.agent?.id as number,
               agent_id: newUuid,
             } : prev);
             if (newUuid && agentData.tools.length > 0) {

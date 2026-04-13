@@ -156,7 +156,7 @@ const TeamSelectorModal: React.FC<TeamSelectorModalProps> = ({ open, onClose }) 
                         {orchestrator && (
                           <Chip
                             icon={<StarIcon sx={{ fontSize: 14 }} />}
-                            label={`Orch: ${(orchestrator as Record<string, unknown>).agent_name ?? '?'}`}
+                            label={`Orch: ${orchestrator.agent_name ?? '?'}`}
                             size="small"
                             variant="outlined"
                             color="warning"

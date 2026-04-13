@@ -43,13 +43,8 @@ export function useMemoryEntries(
   return useQuery<MemoryEntryResponse[]>({
     queryKey: ['memory-entries', agentId, tier],
     queryFn: async () => {
-      const params: Record<string, string | number> = { agent_id: agentId };
-      if (tier) {
-        params.tier = tier.toLowerCase();
-        if (params.tier !== 'short_term') {
-          params.query = '*';
-        }
-      }
+      const params: Record<string, string | number> = { agent_id: agentId, limit: 100 };
+      if (tier) params.tier = tier.toLowerCase();
       const { data } = await apiClient.get('/v1/memory/entries', { params });
       const raw = data.results ?? data.items ?? data;
       if (!Array.isArray(raw)) return [];
@@ -92,14 +87,13 @@ export function useMemoryStats(agentId: number | undefined) {
   return useQuery<MemoryStats>({
     queryKey: ['memory-stats', agentId],
     queryFn: async () => {
-      // Fetch counts from each tier in parallel
+      // Fetch counts from each tier in parallel via the browse endpoint
       const tiers = ['short_term', 'long_term', 'reasoning', 'episodic'] as const;
       const results = await Promise.allSettled(
         tiers.map(async (tier) => {
-          const params: Record<string, string | number> = { agent_id: agentId!, tier };
-          if (tier !== 'short_term') params.query = '*';
-          params.k = 50;
-          const { data } = await apiClient.get('/v1/memory/retrieve', { params });
+          const { data } = await apiClient.get('/v1/memory/entries', {
+            params: { agent_id: agentId!, tier, limit: 100 },
+          });
           return (data.results ?? []).length;
         }),
       );

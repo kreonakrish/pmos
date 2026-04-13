@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import ReactFlow, {
   Background,
   Controls,
@@ -152,10 +152,10 @@ export default function TeamCanvas({
             agentId: matched?.id ?? null, agentName: matched?.name ?? ta.agent_id,
             role: ta.role ?? 'specialist', agents, colorIndex: idx,
             rules: {
-              executionMode: (ta as Record<string, unknown>).execution_mode ?? 'sequential',
-              criticality: (ta as Record<string, unknown>).criticality ?? 'MEDIUM',
-              timeout: (ta as Record<string, unknown>).timeout_seconds ?? 30,
-              fallbackAgentId: (ta as Record<string, unknown>).fallback_agent_id ?? null,
+              executionMode: ta.execution_mode ?? 'sequential',
+              criticality: ta.criticality ?? 'MEDIUM',
+              timeout: ta.timeout_seconds ?? 30,
+              fallbackAgentId: ta.fallback_agent_id ?? null,
             },
             onAgentChange: stableCbs.onAgentChange, onRemove: stableCbs.onRemove,
             onAddChild: stableCbs.onAddChild, onSetFallback: stableCbs.onSetFallback,
@@ -163,7 +163,7 @@ export default function TeamCanvas({
           },
         });
 
-        const parentId = (ta as Record<string, unknown>).parent_agent_id as string | null;
+        const parentId = ta.parent_agent_id ?? null;
         let sourceNodeId = orchId;
         if (parentId) {
           const pn = initialNodes.find((n) => { const pm = matchAgent(parentId); return n.data?.agentId === pm?.id; });
@@ -355,7 +355,7 @@ export default function TeamCanvas({
     onAddChild: handleAddChild,
     onSetFallback: handleSetFallback,
     onPromoteToOrchestrator: handlePromoteToOrchestrator,
-  } as Record<string, (...args: never[]) => void>;
+  } as Record<string, (...args: unknown[]) => void>;
 
   const handlePaneClick = useCallback(() => {
     setSelectedNode(null);

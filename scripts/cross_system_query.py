@@ -37,7 +37,7 @@ def _load_env_file() -> None:
 
 _load_env_file()
 
-NEO4J_URI = os.environ.get("NEO4J_URI", "neo4j+s://8414810d.databases.neo4j.io")
+NEO4J_URI = os.environ.get("NEO4J_URI", "")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
 NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")

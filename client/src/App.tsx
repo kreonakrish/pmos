@@ -8,6 +8,11 @@ import { initSocket, disconnectSocket } from '@/ws/socket';
 import Sidebar from '@/components/Layout/Sidebar';
 import TopBar from '@/components/Layout/TopBar';
 import Login from '@/pages/Login';
+import { fetchMe, logoutClient } from '@/api/auth';
+import { useAuthStore } from '@/store/authStore';
+import PermissionGate from '@/components/Auth/PermissionGate';
+import AdminUsersPage from '@/pages/Admin/Users';
+import AdminRolesPage from '@/pages/Admin/Roles';
 
 import HomePage from '@/pages/Home';
 import ConversationsPage from '@/pages/Conversations';
@@ -33,6 +38,17 @@ export default function App() {
   const [authenticated, setAuthenticated] = useState<boolean>(
     () => !!localStorage.getItem('pmos_token'),
   );
+  const authLoaded = useAuthStore((s) => s.loaded);
+
+  // Hydrate /auth/me whenever we're authenticated but the store has no access yet
+  useEffect(() => {
+    if (!authenticated || authLoaded) return;
+    fetchMe().catch(() => {
+      // token invalid/stale → force logout
+      logoutClient();
+      setAuthenticated(false);
+    });
+  }, [authenticated, authLoaded]);
 
   const handleLoginSuccess = useCallback(() => {
     setAuthenticated(true);
@@ -40,7 +56,7 @@ export default function App() {
 
   /** Call this from anywhere (e.g. TopBar) to log out. */
   const handleLogout = useCallback(() => {
-    localStorage.removeItem('pmos_token');
+    logoutClient();
     setAuthenticated(false);
   }, []);
 
@@ -91,23 +107,61 @@ export default function App() {
           <Box sx={{ flex: 1, p: 3 }}>
             <Routes>
               <Route path="/" element={<HomePage />} />
-              <Route path="/conversations" element={<ConversationsPage />} />
-              <Route path="/conversations/:id/decomposition" element={<TaskDecompositionPage />} />
-              <Route path="/conversations/:id/interactions" element={<AgentInteractionPage />} />
-              <Route path="/task-decomposition" element={<TaskDecompositionPage />} />
-              <Route path="/agent-interaction" element={<AgentInteractionPage />} />
-              <Route path="/tool-studio" element={<ToolStudioPage />} />
-              <Route path="/agent-studio" element={<AgentStudioPage />} />
-              <Route path="/team-studio" element={<TeamStudioPage />} />
-              <Route path="/jobs" element={<JobsPage />} />
-              <Route path="/graph" element={<GraphPage />} />
-              <Route path="/scoring" element={<ScoringPage />} />
-              <Route path="/memory" element={<MemoryPage />} />
-              <Route path="/documents" element={<DocumentsPage />} />
-              <Route path="/model-governance" element={<ModelGovernancePage />} />
-              <Route path="/ml-insights" element={<MLInsightsPage />} />
-              <Route path="/data-catalog" element={<DataCatalogPage />} />
+              <Route path="/conversations" element={
+                <PermissionGate anyOf={['conversations.read']} redirect><ConversationsPage /></PermissionGate>
+              } />
+              <Route path="/conversations/:id/decomposition" element={
+                <PermissionGate anyOf={['conversations.read']} redirect><TaskDecompositionPage /></PermissionGate>
+              } />
+              <Route path="/conversations/:id/interactions" element={
+                <PermissionGate anyOf={['conversations.read']} redirect><AgentInteractionPage /></PermissionGate>
+              } />
+              <Route path="/task-decomposition" element={
+                <PermissionGate anyOf={['conversations.read']} redirect><TaskDecompositionPage /></PermissionGate>
+              } />
+              <Route path="/agent-interaction" element={
+                <PermissionGate anyOf={['conversations.read']} redirect><AgentInteractionPage /></PermissionGate>
+              } />
+              <Route path="/tool-studio" element={
+                <PermissionGate anyOf={['tools.read']} redirect><ToolStudioPage /></PermissionGate>
+              } />
+              <Route path="/agent-studio" element={
+                <PermissionGate anyOf={['agents.read']} redirect><AgentStudioPage /></PermissionGate>
+              } />
+              <Route path="/team-studio" element={
+                <PermissionGate anyOf={['teams.read']} redirect><TeamStudioPage /></PermissionGate>
+              } />
+              <Route path="/jobs" element={
+                <PermissionGate anyOf={['jobs.read']} redirect><JobsPage /></PermissionGate>
+              } />
+              <Route path="/graph" element={
+                <PermissionGate anyOf={['graph.read']} redirect><GraphPage /></PermissionGate>
+              } />
+              <Route path="/scoring" element={
+                <PermissionGate anyOf={['scoring.read']} redirect><ScoringPage /></PermissionGate>
+              } />
+              <Route path="/memory" element={
+                <PermissionGate anyOf={['memory.read']} redirect><MemoryPage /></PermissionGate>
+              } />
+              <Route path="/documents" element={
+                <PermissionGate anyOf={['documents.read']} redirect><DocumentsPage /></PermissionGate>
+              } />
+              <Route path="/model-governance" element={
+                <PermissionGate anyOf={['models.read']} redirect><ModelGovernancePage /></PermissionGate>
+              } />
+              <Route path="/ml-insights" element={
+                <PermissionGate anyOf={['ml_insights.read']} redirect><MLInsightsPage /></PermissionGate>
+              } />
+              <Route path="/data-catalog" element={
+                <PermissionGate anyOf={['catalog.read']} redirect><DataCatalogPage /></PermissionGate>
+              } />
               <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/admin/users" element={
+                <PermissionGate anyOf={['users.read']} redirect><AdminUsersPage /></PermissionGate>
+              } />
+              <Route path="/admin/roles" element={
+                <PermissionGate anyOf={['roles.read']} redirect><AdminRolesPage /></PermissionGate>
+              } />
               {/* Legacy redirects */}
               <Route path="/chat" element={<Navigate to="/conversations" replace />} />
               <Route path="/agents" element={<Navigate to="/agent-studio" replace />} />

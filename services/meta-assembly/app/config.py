@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     mysql_db: str = "pmos"
     mysql_user: str = "root"
     mysql_password: str = ""
-    neo4j_uri: str = "neo4j+s://8414810d.databases.neo4j.io"
+    neo4j_uri: str = ""
     neo4j_user: str = "neo4j"
     neo4j_password: str = ""
     redis_url: str = "redis://localhost:6379"

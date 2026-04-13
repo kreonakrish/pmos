@@ -8,7 +8,6 @@ import {
   Button,
   Paper,
   useTheme,
-  CircularProgress,
 } from '@mui/material';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Tooltip } from 'recharts';

@@ -106,6 +106,10 @@ export interface TaskNode {
   correction_history?: CorrectionEntry[];
   created_at: string;
   updated_at: string;
+  /** Backend may return these alternate field names */
+  node_id?: string;
+  assigned_agent_name?: string;
+  graph_id?: string;
 }
 
 export interface TaskEdge {
@@ -135,6 +139,8 @@ export type WSEventType =
   | 'score'
   | 'course_correct'
   | 'complete'
+  | 'stream_chunk'
+  | 'stream_complete'
   | 'error';
 
 export interface WSEvent {
@@ -232,6 +238,7 @@ export interface Team {
 
 export interface TeamAgent {
   agent_id: string;
+  agent_name?: string;
   priority: number;
   role?: string;
   parent_agent_id?: string | null;

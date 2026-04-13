@@ -136,7 +136,7 @@ const NodeDetailPanel: React.FC<Props> = ({ node, onClose }) => {
         </Typography>
         <Typography variant="body2" sx={{ mb: 1.5, fontFamily: 'monospace' }}>
           {(() => {
-            const id = node.task_id || (node as Record<string, unknown>).node_id as string || '';
+            const id = node.task_id || node.node_id || '';
             return id.length > 24 ? id.slice(0, 12) + '...' + id.slice(-8) : id;
           })()}
         </Typography>
@@ -166,13 +166,13 @@ const NodeDetailPanel: React.FC<Props> = ({ node, onClose }) => {
         </Box>
 
         {/* Agent */}
-        {(node.agent_name || (node as Record<string, unknown>).assigned_agent_name) && (
+        {(node.agent_name || node.assigned_agent_name) && (
           <>
             <Typography variant="caption" color="text.secondary">
               Assigned Agent
             </Typography>
             <Typography variant="body2" sx={{ mb: 1.5 }}>
-              {node.agent_name || (node as Record<string, unknown>).assigned_agent_name as string}
+              {node.agent_name || node.assigned_agent_name}
             </Typography>
           </>
         )}

@@ -30,8 +30,8 @@ export default function ScoringPage() {
   // Use first agent as default when agents load
   const effectiveAgentId = selectedAgentId ?? (agents.length > 0 ? agents[0].id : null);
 
-  const scoreHistoryQuery = useScoreHistory(effectiveAgentId, {
-    enabled: effectiveAgentId > 0,
+  const scoreHistoryQuery = useScoreHistory(effectiveAgentId ?? 0, {
+    enabled: effectiveAgentId != null && effectiveAgentId > 0,
   });
   const scoreHistory = scoreHistoryQuery.data ?? [];
 
@@ -167,7 +167,7 @@ export default function ScoringPage() {
           <Paper sx={{ p: 2 }}>
             <ScoreDistribution
               data={scoreHistory}
-              loading={scoreHistoryQuery.isLoading && effectiveAgentId > 0}
+              loading={scoreHistoryQuery.isLoading && (effectiveAgentId ?? 0) > 0}
             />
           </Paper>
         </Grid>
@@ -208,7 +208,7 @@ export default function ScoringPage() {
       <Paper sx={{ p: 2 }}>
         <ScoreFeed
           items={feedItems}
-          loading={scoreHistoryQuery.isLoading && effectiveAgentId > 0}
+          loading={scoreHistoryQuery.isLoading && (effectiveAgentId ?? 0) > 0}
         />
       </Paper>
     </Box>
