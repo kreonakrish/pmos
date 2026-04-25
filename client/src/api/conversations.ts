@@ -1,6 +1,22 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import apiClient from '@/api/axios';
 import type { Conversation, Message } from '@/types';
+import type { Visualization } from '@/api/visualization';
+
+/**
+ * Wire shape returned by POST /v1/conversations/:id/messages. The
+ * orchestrator surfaces the persisted assistant message under
+ * `agent_message`, but for deterministic Report (Ext2) hits the chart
+ * inferer also lifts the `visualizations` array to the top level so the
+ * client can render charts on the FIRST send without waiting for a
+ * conversation refresh.
+ */
+export interface ChatResponse {
+  agent_message?: Message;
+  visualizations?: Visualization[];
+  // Pass-through for any other top-level keys the backend may add.
+  [key: string]: unknown;
+}
 
 export function useConversations() {
   return useQuery<Conversation[]>({
@@ -55,9 +71,9 @@ export function useCreateConversation() {
 
 export function useSendMessage() {
   const qc = useQueryClient();
-  return useMutation({
-    mutationFn: async (params: { conversationId: string; content: string }) => {
-      const { data } = await apiClient.post(
+  return useMutation<ChatResponse, Error, { conversationId: string; content: string }>({
+    mutationFn: async (params) => {
+      const { data } = await apiClient.post<ChatResponse>(
         `/v1/conversations/${params.conversationId}/messages`,
         { content: params.content },
         { timeout: 120_000 },

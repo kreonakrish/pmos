@@ -31,6 +31,7 @@ from app.adapters.neo4j_adapter import Neo4jAdapter
 from app.adapters.rag_adapter import RAGAdapter
 from app.adapters.redis_adapter import RedisAdapter
 from app.adapters.scoring_adapter import ScoringAdapter
+from app.adapters.translator_adapter import TranslatorAdapter
 from app.config import settings
 from app.models.bid import BidRequest, BidResponse, NegotiationResult
 from app.models.task import Criticality, NodeType, TaskGraph
@@ -42,6 +43,7 @@ from app.services.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError
 from app.services.course_corrector import CourseAction, CourseCorrector
 from app.services.graph_manager import GraphManager
 from app.services.interaction_logger import InteractionLogger
+from app.utils.audit import audit
 from app.utils.logger import logger
 from app.utils.telemetry import REQUEST_TOTAL
 
@@ -59,6 +61,7 @@ class PipelineService:
         rag: RAGAdapter,
         meta: MetaAdapter,
         agent_mgmt: Optional[AgentMgmtAdapter] = None,
+        translator: Optional[TranslatorAdapter] = None,
     ) -> None:
         self._neo4j = neo4j
         self._redis = redis
@@ -68,6 +71,7 @@ class PipelineService:
         self._rag = rag
         self._meta = meta
         self._agent_mgmt = agent_mgmt or AgentMgmtAdapter()
+        self._translator = translator or TranslatorAdapter()
 
         self._graph_mgr = GraphManager(neo4j)
         self._agent_sel = AgentSelector(neo4j)
@@ -200,6 +204,24 @@ class PipelineService:
             trace_id=trace_id,
         )
 
+        # Audit: pipeline intake
+        try:
+            await audit.write(
+                trace_id=trace_id,
+                actor="orchestrator",
+                actor_type="SERVICE",
+                action="pipeline.intake",
+                resource_type="Conversation",
+                resource_id=conversation_id,
+                payload={
+                    "session_id": session_id,
+                    "team_id": team_id,
+                    "message_len": len(message or ""),
+                },
+            )
+        except Exception:
+            pass
+
         try:
             # Step 0: LOAD TEAM HIERARCHY into Neo4j + build team context
             team_context = ""
@@ -227,7 +249,134 @@ class PipelineService:
                 sop_context=sop_context,
                 trace_id=trace_id,
                 team_context=team_context,
+                conversation_id=conversation_id,
             )
+
+            # Read translator metadata once — both the deterministic-Report
+            # path and the clarification path consume it.
+            try:
+                meta_rows = await self._neo4j.run_query(
+                    """
+                    MATCH (g:TaskGraph {graph_id: $graph_id})
+                    RETURN g.translator_clarification_need AS need,
+                           g.translator_clarification      AS question,
+                           g.translator_auditor_issue_id   AS issue_id,
+                           g.translator_auditor_issue_kind AS issue_kind,
+                           g.translator_matched_reports    AS reports
+                    """,
+                    {"graph_id": graph_id},
+                    trace_id=trace_id,
+                )
+            except Exception:
+                meta_rows = []
+            meta = meta_rows[0] if meta_rows else {}
+
+            matched_reports: List[Dict[str, Any]] = []
+            try:
+                matched_reports = json.loads(meta.get("reports") or "[]")
+            except Exception:
+                matched_reports = []
+
+            # Ext2 — deterministic Report short-circuit. Runs BEFORE the
+            # clarification short-circuit because a high-confidence Report
+            # match means the user explicitly asked for a deterministic
+            # report; any incidental synonym ambiguity raised by the
+            # translator is irrelevant for THAT execution path.
+            DETERMINISTIC_SCORE_THRESHOLD = 5.0
+            top_match = matched_reports[0] if matched_reports else None
+            top_score = float(top_match.get("score") or 0.0) if top_match else 0.0
+            second_score = float(matched_reports[1].get("score") or 0.0) if len(matched_reports) > 1 else 0.0
+            if (
+                top_match
+                and top_score >= DETERMINISTIC_SCORE_THRESHOLD
+                and (top_score - second_score) >= 1.0
+            ):
+                logger.info(
+                    "Pipeline short-circuited for deterministic Report",
+                    layer="service",
+                    graph_id=graph_id,
+                    report_id=top_match.get("report_id"),
+                    score=top_score,
+                    trace_id=trace_id,
+                )
+                report_response, report_visualizations = await self._execute_matched_report(
+                    top_match, trace_id=trace_id,
+                )
+                await self._neo4j.update_graph_status(
+                    graph_id, "REPORT_EXECUTED", trace_id=trace_id,
+                )
+                try:
+                    await audit.write(
+                        trace_id=trace_id,
+                        actor="orchestrator",
+                        actor_type="SERVICE",
+                        action="report.executed",
+                        resource_type="Report",
+                        resource_id=top_match.get("report_id"),
+                        payload={
+                            "graph_id": graph_id,
+                            "score": top_score,
+                            "owner_team": top_match.get("owner_team"),
+                            "system": top_match.get("system"),
+                        },
+                    )
+                except Exception:
+                    pass
+                return {
+                    "session_id": session_id,
+                    "graph_id": graph_id,
+                    "response": report_response,
+                    "score": None,
+                    "trace_id": trace_id,
+                    "clarification_needed": False,
+                    "clarification_question": None,
+                    "auditor_issue_id": None,
+                    "auditor_issue_kind": None,
+                    "matched_report_id": top_match.get("report_id"),
+                    "visualizations": report_visualizations,
+                }
+
+            # F4 — clarification short-circuit (only fires when no
+            # deterministic Report match took precedence above).
+            if meta and meta.get("need") and meta.get("question"):
+                await self._neo4j.update_graph_status(
+                    graph_id, "AWAITING_CLARIFICATION", trace_id=trace_id,
+                )
+                logger.info(
+                    "Pipeline short-circuited for clarification",
+                    layer="service",
+                    graph_id=graph_id,
+                    auditor_issue_id=meta.get("issue_id"),
+                    trace_id=trace_id,
+                )
+                return {
+                    "session_id": session_id,
+                    "graph_id": graph_id,
+                    "response": meta.get("question"),
+                    "score": None,
+                    "trace_id": trace_id,
+                    "clarification_needed": True,
+                    "clarification_question": meta.get("question"),
+                    "auditor_issue_id": meta.get("issue_id"),
+                    "auditor_issue_kind": meta.get("issue_kind"),
+                }
+
+            # Audit: decomposition done
+            try:
+                await audit.write(
+                    trace_id=trace_id,
+                    actor="orchestrator",
+                    actor_type="SERVICE",
+                    action="pipeline.decomposed",
+                    resource_type="TaskGraph",
+                    resource_id=graph_id,
+                    payload={
+                        "subtask_count": len(node_descriptions or []),
+                        "ontology_used": bool(sop_context),
+                    },
+                )
+            except Exception:
+                pass
 
             # Step 3: PRE-EXECUTION VALIDATION + CAPABILITY NEGOTIATION
             primary, fallbacks = await self._step3_validation(
@@ -377,12 +526,61 @@ class PipelineService:
                 trace_id=trace_id,
             )
             REQUEST_TOTAL.labels(method="POST", path="/v1/orchestrator/chat", status="200").inc()
+
+            # Audit: final response sent
+            try:
+                _scores = [
+                    nr.get("score") for nr in (node_results or [])
+                    if nr.get("score") is not None
+                ]
+                _avg = (sum(_scores) / len(_scores)) if _scores else None
+                await audit.write(
+                    trace_id=trace_id,
+                    actor="orchestrator",
+                    actor_type="SERVICE",
+                    action="pipeline.responded",
+                    resource_type="TaskGraph",
+                    resource_id=graph_id,
+                    payload={
+                        "avg_score": _avg,
+                        "length": len(final_response or ""),
+                        "duration_ms": elapsed_ms,
+                        "n_nodes": len(node_results or []),
+                    },
+                )
+            except Exception:
+                pass
+
+            # Pull translator metadata once more so the chat response can
+            # surface SYNONYM_AMBIGUITY auditor_issue_ids even when we DIDN'T
+            # short-circuit (e.g. translator answered both sides but flagged
+            # them as synonyms for steward review).
+            issue_id = None
+            issue_kind = None
+            try:
+                meta_rows = await self._neo4j.run_query(
+                    """MATCH (g:TaskGraph {graph_id: $graph_id})
+                       RETURN g.translator_auditor_issue_id AS issue_id,
+                              g.translator_auditor_issue_kind AS issue_kind""",
+                    {"graph_id": graph_id},
+                    trace_id=trace_id,
+                )
+                if meta_rows:
+                    issue_id = meta_rows[0].get("issue_id")
+                    issue_kind = meta_rows[0].get("issue_kind")
+            except Exception:
+                pass
+
             return {
                 "session_id": session_id,
                 "graph_id": graph_id,
                 "response": final_response,
                 "score": node_results[-1].get("score") if node_results else None,
                 "trace_id": trace_id,
+                "clarification_needed": False,
+                "clarification_question": None,
+                "auditor_issue_id": issue_id,
+                "auditor_issue_kind": issue_kind,
             }
 
         except Exception as exc:
@@ -396,6 +594,26 @@ class PipelineService:
                 trace_id=trace_id,
             )
             REQUEST_TOTAL.labels(method="POST", path="/v1/orchestrator/chat", status="500").inc()
+
+            # Audit: pipeline error
+            try:
+                await audit.write(
+                    trace_id=trace_id,
+                    actor="orchestrator",
+                    actor_type="SERVICE",
+                    action="pipeline.error",
+                    severity="ERROR",
+                    resource_type="Conversation",
+                    resource_id=conversation_id,
+                    payload={
+                        "error": str(exc)[:500],
+                        "session_id": session_id,
+                        "duration_ms": elapsed_ms,
+                    },
+                )
+            except Exception:
+                pass
+
             raise
 
     # ------------------------------------------------------------------
@@ -560,8 +778,285 @@ class PipelineService:
         return assignments
 
     # ------------------------------------------------------------------
+    # F7: Multi-turn dialog — prior_turns lookup
+    # ------------------------------------------------------------------
+
+    async def _fetch_prior_turns_from_messages(
+        self,
+        conversation_id: str,
+        trace_id: str,
+        max_messages: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """Build the translator prior_turns list from MySQL message history.
+
+        Walks the most recent ``max_messages`` messages of ``conversation_id``
+        and stitches together alternating user → translator clarification
+        round-trips. Only assistant messages with
+        ``metadata.clarification = True`` are surfaced as translator turns.
+        Soft-fails to ``[]`` so the single-turn path is never broken.
+        """
+        if not conversation_id:
+            return []
+        try:
+            conn = mysql.connector.connect(
+                host=settings.mysql_host,
+                port=settings.mysql_port,
+                user=settings.mysql_user,
+                password=settings.mysql_password,
+                database=settings.mysql_db,
+                connection_timeout=3,
+            )
+        except Exception as exc:
+            logger.warning(
+                "prior_turns_lookup_db_connect_failed",
+                layer="service",
+                conversation_id=conversation_id,
+                trace_id=trace_id,
+                error=str(exc),
+            )
+            return []
+
+        rows: List[Tuple[Any, ...]] = []
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT role, content, metadata, created_at "
+                    "FROM messages WHERE conversation_id = %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (conversation_id, int(max_messages)),
+                )
+                rows = list(cur.fetchall() or [])
+            finally:
+                cur.close()
+        except Exception as exc:
+            logger.warning(
+                "prior_turns_lookup_query_failed",
+                layer="service",
+                conversation_id=conversation_id,
+                trace_id=trace_id,
+                error=str(exc),
+            )
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        # Reverse to chronological order (oldest first).
+        rows.reverse()
+
+        prior_turns: List[Dict[str, Any]] = []
+        for role, content, metadata_raw, _created_at in rows:
+            role_str = str(role or "").strip().lower()
+            content_str = str(content or "").strip()
+            if not content_str:
+                continue
+            if role_str == "user":
+                prior_turns.append({"role": "user", "content": content_str})
+                continue
+            if role_str == "assistant":
+                # Only include assistant messages that were clarifications
+                # — anything else is a final answer and shouldn't go back
+                # into the translator's dialog history.
+                meta_obj: Dict[str, Any] = {}
+                try:
+                    if isinstance(metadata_raw, str) and metadata_raw:
+                        meta_obj = json.loads(metadata_raw)
+                    elif isinstance(metadata_raw, (bytes, bytearray)):
+                        meta_obj = json.loads(metadata_raw.decode("utf-8"))
+                    elif isinstance(metadata_raw, dict):
+                        meta_obj = metadata_raw
+                except Exception:
+                    meta_obj = {}
+                if not bool(meta_obj.get("clarification")):
+                    continue
+                clar_q = (
+                    str(meta_obj.get("clarification_question") or "").strip()
+                    or content_str
+                )
+                prior_turns.append({"role": "translator", "content": clar_q})
+
+        # Drop trailing user turn if it equals the current incoming message —
+        # the executor passes the user's NEW message separately, so it
+        # shouldn't appear in prior_turns. Safe heuristic: don't include the
+        # MOST RECENT user message at all.
+        while prior_turns and prior_turns[-1].get("role") == "user":
+            prior_turns.pop()
+
+        # Cap at the last 1-2 round-trips (4 entries) — orchestrator-level
+        # safeguard before the translator's own MAX_PRIOR_TURNS_IN_PROMPT cap.
+        if len(prior_turns) > 4:
+            prior_turns = prior_turns[-4:]
+
+        if prior_turns:
+            logger.info(
+                "Loaded prior_turns for translator",
+                layer="service",
+                conversation_id=conversation_id,
+                trace_id=trace_id,
+                n_prior_turns=len(prior_turns),
+            )
+        return prior_turns
+
+    # ------------------------------------------------------------------
     # Step 1: REQUEST INTAKE
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Ext2 — Deterministic Report execution
+    # ------------------------------------------------------------------
+
+    async def _execute_matched_report(
+        self,
+        report: Dict[str, Any],
+        trace_id: str,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Run a Report's SQL command(s) directly against the bound DataSource.
+
+        The translator already located the Report and stamped the binding
+        target onto each dataset (``source_uri`` like
+        ``mysql://host:port/database``). We parse that, run the command via
+        ``mysql.connector``, format the result rows as a markdown table, AND
+        build a Visualization spec per dataset so the chat UI can render
+        bar/line/pie charts alongside the table.
+
+        Returns ``(markdown_response, visualizations)`` where visualizations
+        is a list of dicts matching ``shared.visualization.Visualization``.
+
+        Failure modes are non-fatal — we render an explanation in the chat
+        response so the user understands what went wrong without the
+        pipeline crashing.
+        """
+        from urllib.parse import urlparse
+        # Prefer the shared module (kept in sync via the translator image's
+        # build context); fall back to the orchestrator-local copy when the
+        # shared package isn't importable in this image.
+        try:
+            from shared.visualization import make_visualization  # type: ignore
+        except Exception:
+            try:
+                from app.utils.visualization import make_visualization  # type: ignore
+            except Exception:
+                make_visualization = None  # type: ignore[assignment]
+
+        visualizations: List[Dict[str, Any]] = []
+        datasets = report.get("datasets") or []
+        if not datasets:
+            return (
+                f"## {report.get('name')}\n\nThis report has no datasets registered.",
+                visualizations,
+            )
+
+        sections: List[str] = [
+            f"## {report.get('name')}",
+            f"_System: {report.get('system')} · Owner: {report.get('owner_team')}_",
+            "",
+            f"{report.get('description') or ''}",
+            "",
+        ]
+
+        for ds in datasets:
+            command = ds.get("command")
+            command_type = (ds.get("command_type") or "SQL").upper()
+            source_uri = ds.get("source_uri") or ""
+            ds_name = ds.get("name") or ds.get("dataset_id") or "(unnamed)"
+
+            sections.append(f"### Dataset: `{ds_name}`")
+            sections.append(f"```{command_type.lower()}\n{command}\n```")
+
+            if not command:
+                sections.append("_(no command stored)_\n")
+                continue
+            if command_type != "SQL":
+                sections.append(
+                    f"_(skipping execution: {command_type} is not yet supported)_\n"
+                )
+                continue
+            if not source_uri.startswith("mysql://"):
+                sections.append(
+                    f"_(skipping execution: source `{source_uri}` is not MySQL)_\n"
+                )
+                continue
+
+            # Parse mysql://host:port/database
+            try:
+                u = urlparse(source_uri)
+                host = u.hostname or "localhost"
+                port = u.port or 3306
+                database = (u.path or "").lstrip("/") or None
+            except Exception as exc:
+                sections.append(f"_(could not parse source_uri: {exc})_\n")
+                continue
+
+            # The crawled DataSource doesn't carry credentials — fall back
+            # to the orchestrator's own MySQL credentials. In production this
+            # would resolve to a per-source secret in a vault.
+            try:
+                import mysql.connector  # local import; we already use it elsewhere
+                conn = mysql.connector.connect(
+                    host=host, port=port, database=database,
+                    user=settings.mysql_user, password=settings.mysql_password,
+                    connection_timeout=10,
+                )
+                cur = conn.cursor(dictionary=True)
+                cur.execute(command)
+                rows = cur.fetchmany(50)
+                col_names = [c[0] for c in (cur.description or [])]
+                cur.close()
+                conn.close()
+            except Exception as exc:
+                logger.warning(
+                    "Report execution failed",
+                    layer="service",
+                    trace_id=trace_id,
+                    report_id=report.get("report_id"),
+                    error=str(exc),
+                )
+                sections.append(f"_(execution failed: {str(exc)[:300]})_\n")
+                continue
+
+            if not rows:
+                sections.append("_(no rows returned)_\n")
+                continue
+
+            # Render top 50 rows as a markdown table
+            sections.append(f"_Returned {len(rows)} row{'s' if len(rows) != 1 else ''}:_\n")
+            sections.append("| " + " | ".join(col_names) + " |")
+            sections.append("|" + "|".join("---" for _ in col_names) + "|")
+            for r in rows:
+                vals = []
+                for c in col_names:
+                    v = r.get(c)
+                    if v is None:
+                        vals.append("—")
+                    else:
+                        vals.append(str(v).replace("|", "\\|")[:80])
+                sections.append("| " + " | ".join(vals) + " |")
+            sections.append("")
+
+            # Build a chart spec for the chat UI to render alongside the
+            # markdown table. The heuristic picks bar/line/pie/area/table
+            # from the data shape; the user can flip via the toggle.
+            if make_visualization is not None:
+                try:
+                    viz = make_visualization(
+                        rows=rows,
+                        col_names=col_names,
+                        title=f"{report.get('name')} — {ds_name}",
+                        description=ds.get("name"),
+                    )
+                    visualizations.append(viz)
+                except Exception as exc:
+                    logger.warning(
+                        "make_visualization failed (non-fatal)",
+                        layer="service",
+                        trace_id=trace_id,
+                        error=str(exc),
+                    )
+
+        return "\n".join(sections), visualizations
 
     async def _step1_intake(
         self,
@@ -621,55 +1116,173 @@ class PipelineService:
         sop_context: Dict[str, Any],
         trace_id: str,
         team_context: str = "",
+        conversation_id: str = "",
     ) -> Tuple[str, List[str]]:
-        """Use LLM to decompose intent into sub-tasks; create TaskNodes."""
-        team_info = ""
-        if team_context:
-            team_info = (
-                f"\n\nTEAM CONTEXT (use this to understand what your team can do):\n"
-                f"{team_context}\n\n"
-                "IMPORTANT: When the user asks about the team, its agents, or their capabilities, "
-                "you should create a SINGLE sub-task that answers from the team context above. "
-                "Do NOT decompose self-referential team questions into multiple sub-tasks. "
-                "Only use agents and tools that are IN THIS TEAM — never reference agents or tools "
-                "that are not listed above.\n\n"
+        """Decompose intent into sub-tasks via Translator (ontology-aware) and
+        create TaskNodes. Falls back to the bare LLM decomposition when the
+        Translator returns no ontology matches."""
+
+        # 1. Ask the Translator service first. The adapter never raises — on
+        #    failure it returns an empty result with fallback_used=True.
+        # F7 — feed prior dialog turns from this conversation so multi-turn
+        # clarifications can narrow the translation. The helper soft-fails to
+        # an empty list so the single-turn path stays untouched.
+        prior_turns = await self._fetch_prior_turns_from_messages(
+            conversation_id=conversation_id, trace_id=trace_id,
+        )
+        translation = await self._translator.translate(
+            question=message,
+            team_id=team_id,
+            conversation_id=conversation_id,
+            trace_id=trace_id,
+            prior_turns=prior_turns,
+        )
+
+        # F4 — capture clarification & auditor-issue signals on the
+        # TaskGraph so the chat response layer can short-circuit and surface
+        # the clarification question / issue id to the user without running
+        # the full execution pipeline. Ext2 — also stamp matched_reports as
+        # a JSON blob so the deterministic short-circuit can read it back.
+        matched_reports_raw = translation.get("matched_reports") or []
+        try:
+            mr_json = json.dumps(matched_reports_raw)
+        except Exception:
+            mr_json = "[]"
+        try:
+            await self._neo4j.run_query(
+                """
+                MATCH (g:TaskGraph {graph_id: $graph_id})
+                SET g.translator_intent              = $intent,
+                    g.translator_domain              = $domain,
+                    g.translator_clarification_need  = $clar_needed,
+                    g.translator_clarification       = $clar_question,
+                    g.translator_auditor_issue_id    = $issue_id,
+                    g.translator_auditor_issue_kind  = $issue_kind,
+                    g.translator_canonical_count     = $cn_count,
+                    g.translator_binding_count       = $bn_count,
+                    g.translator_matched_reports     = $matched_reports,
+                    g.updated_at = datetime()
+                """,
+                {
+                    "graph_id": graph_id,
+                    "intent": translation.get("intent"),
+                    "domain": translation.get("domain"),
+                    "clar_needed": bool(translation.get("clarification_needed")),
+                    "clar_question": translation.get("clarification_question"),
+                    "issue_id": translation.get("auditor_issue_id"),
+                    "issue_kind": translation.get("auditor_issue_kind"),
+                    "cn_count": len(translation.get("canonical_entities") or []),
+                    "bn_count": len(translation.get("dataset_bindings") or []),
+                    "matched_reports": mr_json,
+                },
+                trace_id=trace_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to stamp translation metadata on TaskGraph",
+                layer="service", trace_id=trace_id, error=str(exc),
             )
 
-        decomposition_prompt = (
-            "You are a task decomposition engine. "
-            "Break the following user request into 1-5 concrete, executable sub-tasks. "
-            "Return ONLY a JSON array of strings, each being a sub-task description. "
-            "No additional text."
-            f"{team_info}"
-            f"\nUser request: {message}"
-        )
+        canonical_entities = translation.get("canonical_entities") or []
+        dataset_bindings_objs = translation.get("dataset_bindings") or []
+        domain_subtasks = [str(s) for s in (translation.get("domain_subtasks") or []) if s]
+        intent = translation.get("intent")
+        domain = translation.get("domain")
+        ontology_versions = [str(v) for v in (translation.get("ontology_versions") or [])]
 
-        raw = await self._llm.complete(
-            messages=[{"role": "user", "content": decomposition_prompt}],
-            trace_id=trace_id,
-        )
+        # Flatten typed objects to plain string lists for storage on TaskNode.
+        canonical_entity_names: List[str] = []
+        for c in canonical_entities:
+            if isinstance(c, dict):
+                name = c.get("fq_name") or c.get("name")
+                if name:
+                    canonical_entity_names.append(str(name))
+            elif c:
+                canonical_entity_names.append(str(c))
 
-        # Parse sub-tasks
+        dataset_binding_strings: List[str] = []
+        for b in dataset_bindings_objs:
+            if isinstance(b, dict):
+                fq = b.get("asset_fq_name")
+                if fq:
+                    dataset_binding_strings.append(str(fq))
+            elif b:
+                dataset_binding_strings.append(str(b))
+
+        used_ontology = bool(canonical_entity_names) and bool(domain_subtasks)
+
+        # 2. Fallback to bare LLM decomposition when the ontology gave us
+        #    nothing usable.
         sub_tasks: List[str] = []
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                sub_tasks = [str(t) for t in parsed if t]
-        except (json.JSONDecodeError, ValueError):
-            # Fall back to heuristic extraction
-            sub_tasks = self._graph_mgr._extract_sub_tasks(raw)
+        if used_ontology:
+            sub_tasks = domain_subtasks
+            logger.info(
+                "Translator decomposition used",
+                layer="service",
+                graph_id=graph_id,
+                trace_id=trace_id,
+                intent=intent,
+                domain=domain,
+                canonical_entities=len(canonical_entity_names),
+                dataset_bindings=len(dataset_binding_strings),
+                subtasks=len(sub_tasks),
+            )
+        else:
+            team_info = ""
+            if team_context:
+                team_info = (
+                    f"\n\nTEAM CONTEXT (use this to understand what your team can do):\n"
+                    f"{team_context}\n\n"
+                    "IMPORTANT: When the user asks about the team, its agents, or their capabilities, "
+                    "you should create a SINGLE sub-task that answers from the team context above. "
+                    "Do NOT decompose self-referential team questions into multiple sub-tasks. "
+                    "Only use agents and tools that are IN THIS TEAM — never reference agents or tools "
+                    "that are not listed above.\n\n"
+                )
 
-        if not sub_tasks:
-            sub_tasks = [message]  # single root task
+            decomposition_prompt = (
+                "You are a task decomposition engine. "
+                "Break the following user request into 1-5 concrete, executable sub-tasks. "
+                "Return ONLY a JSON array of strings, each being a sub-task description. "
+                "No additional text."
+                f"{team_info}"
+                f"\nUser request: {message}"
+            )
 
-        # Create root node
+            raw = await self._llm.complete(
+                messages=[{"role": "user", "content": decomposition_prompt}],
+                trace_id=trace_id,
+            )
+
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    sub_tasks = [str(t) for t in parsed if t]
+            except (json.JSONDecodeError, ValueError):
+                sub_tasks = self._graph_mgr._extract_sub_tasks(raw)
+
+            if not sub_tasks:
+                sub_tasks = [message]
+
+            logger.info(
+                "Translator returned no ontology matches; bare LLM decomposition used",
+                layer="service",
+                graph_id=graph_id,
+                trace_id=trace_id,
+                subtasks=len(sub_tasks),
+            )
+
+        # 3. Create root node (carries intent/domain even on fallback so the
+        #    Live Graph UI can show "decomposed without ontology" markers).
         root_node_id = await self._graph_mgr.add_root_node(
             graph_id=graph_id,
             description=message,
             trace_id=trace_id,
         )
 
-        # Create sub-task nodes
+        # 4. Create sub-task nodes — stamp ontology bindings only when the
+        #    translator actually found matches; never invent bindings on
+        #    fallback paths.
         for task_desc in sub_tasks:
             await self._graph_mgr.add_node(
                 graph_id=graph_id,
@@ -679,17 +1292,45 @@ class PipelineService:
                 depth=1,
                 iteration=0,
                 trace_id=trace_id,
+                canonical_entities=canonical_entity_names if used_ontology else [],
+                dataset_bindings=dataset_binding_strings if used_ontology else [],
+                intent=intent if used_ontology else None,
+                domain=domain if used_ontology else None,
+                ontology_versions=ontology_versions if used_ontology else [],
             )
 
         await self._neo4j.update_graph_status(
             graph_id, "EXECUTING", iteration=0, trace_id=trace_id
         )
 
+        # 5. Audit (best-effort).
+        try:
+            await audit.write(
+                trace_id=trace_id,
+                actor="orchestrator",
+                actor_type="SERVICE",
+                action="pipeline.decomposed",
+                resource_type="TaskGraph",
+                resource_id=graph_id,
+                payload={
+                    "subtask_count": len(sub_tasks),
+                    "ontology_used": used_ontology,
+                    "intent": intent,
+                    "domain": domain,
+                    "canonical_entities": canonical_entity_names,
+                    "dataset_bindings": dataset_binding_strings,
+                    "ontology_versions": ontology_versions,
+                },
+            )
+        except Exception:
+            pass
+
         logger.info(
             "Graph construction complete",
             layer="service",
             graph_id=graph_id,
             sub_tasks=len(sub_tasks),
+            ontology_used=used_ontology,
             trace_id=trace_id,
         )
         return root_node_id, sub_tasks
@@ -745,10 +1386,15 @@ class PipelineService:
         subtask_nodes = [n for n in graph_nodes if n.get("node_type") == "SUBTASK"]
 
         for i, desc in enumerate(node_descriptions):
-            # Find corresponding node_id
+            # Find corresponding node_id and pull its ontology bindings so the
+            # negotiation can filter agents by physical-asset reachability.
             node_id = ""
+            dataset_bindings: List[str] = []
             if i < len(subtask_nodes):
-                node_id = subtask_nodes[i].get("node_id", "")
+                sn = subtask_nodes[i]
+                node_id = sn.get("node_id", "")
+                raw_bindings = sn.get("dataset_bindings") or []
+                dataset_bindings = [str(b) for b in raw_bindings if b]
 
             bid_request = BidRequest(
                 task_id=node_id,
@@ -756,6 +1402,7 @@ class PipelineService:
                 task_type="general",
                 graph_id=graph_id,
                 trace_id=trace_id,
+                dataset_bindings=dataset_bindings,
             )
 
             try:
@@ -811,6 +1458,24 @@ class PipelineService:
                         bid_confidence=neg_result.winner.confidence,
                         trace_id=trace_id,
                     )
+
+                    # Audit: bid won per node
+                    try:
+                        await audit.write(
+                            trace_id=trace_id,
+                            actor=neg_result.winner.agent_id or "unknown",
+                            actor_type="AGENT",
+                            action="pipeline.bid_won",
+                            resource_type="TaskNode",
+                            resource_id=node_id,
+                            payload={
+                                "agent_id": neg_result.winner.agent_id,
+                                "agent_name": neg_result.winner.agent_name,
+                                "confidence": neg_result.winner.confidence,
+                            },
+                        )
+                    except Exception:
+                        pass
             except Exception as exc:
                 logger.warning(
                     "Negotiation failed for subtask; using fallback assignment",
@@ -1287,6 +1952,26 @@ class PipelineService:
         agent_id = self._resolve_agent_db_id(agent) or 0
         fallback_index = 0
 
+        # Audit: node execution start
+        try:
+            await audit.write(
+                trace_id=trace_id,
+                actor=(agent_uuid or (agent.name if agent else "orchestrator")),
+                actor_type="AGENT" if agent else "SERVICE",
+                action="pipeline.node_started",
+                resource_type="TaskNode",
+                resource_id=node_id,
+                payload={
+                    "graph_id": graph_id,
+                    "agent_id": agent_uuid,
+                    "agent_name": agent.name if agent else None,
+                    "criticality": str(criticality),
+                    "description": (description or "")[:240],
+                },
+            )
+        except Exception:
+            pass
+
         while True:
             try:
                 # Step 4a: Memory pull
@@ -1426,6 +2111,27 @@ class PipelineService:
                         tools_used=tool_calls_made,
                         trace_id=trace_id,
                     )
+
+                    # Audit: node execution complete
+                    try:
+                        await audit.write(
+                            trace_id=trace_id,
+                            actor=(agent_uuid or (agent.name if agent else "orchestrator")),
+                            actor_type="AGENT" if agent else "SERVICE",
+                            action="pipeline.node_completed",
+                            resource_type="TaskNode",
+                            resource_id=node_id,
+                            payload={
+                                "score": score,
+                                "latency_ms": latency_ms,
+                                "status": "SUCCESS",
+                                "agent_name": agent.name if agent else None,
+                                "tool_calls": len(tool_calls_made or []),
+                            },
+                        )
+                    except Exception:
+                        pass
+
                     return {
                         "node_id": node_id,
                         "description": description,
@@ -1451,6 +2157,26 @@ class PipelineService:
 
                 if correction.action == CourseAction.AUTO_CORRECT_LOCAL:
                     await self._graph_mgr.mark_node_success(node_id, score, latency_ms, trace_id=trace_id)
+
+                    # Audit: node execution complete (auto-corrected)
+                    try:
+                        await audit.write(
+                            trace_id=trace_id,
+                            actor=(agent_uuid or (agent.name if agent else "orchestrator")),
+                            actor_type="AGENT" if agent else "SERVICE",
+                            action="pipeline.node_completed",
+                            resource_type="TaskNode",
+                            resource_id=node_id,
+                            payload={
+                                "score": score,
+                                "latency_ms": latency_ms,
+                                "status": "AUTO_CORRECTED",
+                                "agent_name": agent.name if agent else None,
+                            },
+                        )
+                    except Exception:
+                        pass
+
                     return {
                         "node_id": node_id,
                         "description": description,
@@ -1523,6 +2249,27 @@ class PipelineService:
                     )
 
                 await self._graph_mgr.mark_node_failed(node_id, score=score, trace_id=trace_id)
+
+                # Audit: node execution complete (failed)
+                try:
+                    await audit.write(
+                        trace_id=trace_id,
+                        actor=(agent_uuid or (agent.name if agent else "orchestrator")),
+                        actor_type="AGENT" if agent else "SERVICE",
+                        action="pipeline.node_completed",
+                        resource_type="TaskNode",
+                        resource_id=node_id,
+                        severity="WARN",
+                        payload={
+                            "score": score,
+                            "latency_ms": int((time.monotonic() - start) * 1000),
+                            "status": "FAILED",
+                            "agent_name": agent.name if agent else None,
+                        },
+                    )
+                except Exception:
+                    pass
+
                 return {
                     "node_id": node_id,
                     "description": description,

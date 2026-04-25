@@ -21,6 +21,7 @@ from app.services.crawler.semantic_mapper import (
 )
 from app.services.crawler.catalog_writer import CatalogWriter
 from app.services.crawler.runner import run_crawler_async
+from app.services.crawler.synonym_consolidator import SynonymConsolidator
 
 __all__ = [
     "BaseCrawler",
@@ -31,5 +32,6 @@ __all__ = [
     "ProposedMapping",
     "SemanticMapper",
     "CatalogWriter",
+    "SynonymConsolidator",
     "run_crawler_async",
 ]

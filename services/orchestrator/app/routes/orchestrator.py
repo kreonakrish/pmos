@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 
 from typing import Literal
 from pydantic import BaseModel
+from app.middleware.rbac import require_permission
 from app.models.pipeline import ChatRequest, ChatResponse, SessionResponse, StreamChunk
 from app.utils.logger import logger
 from app.utils.telemetry import REQUEST_DURATION, REQUEST_TOTAL
@@ -31,7 +32,11 @@ def _get_neo4j(request: Request):
     return request.app.state.neo4j
 
 
-@router.post("/chat", response_model=None)
+@router.post(
+    "/chat",
+    response_model=None,
+    dependencies=[Depends(require_permission("conversations.write"))],
+)
 async def chat(
     body: ChatRequest,
     request: Request,
@@ -73,6 +78,11 @@ async def chat(
             graph_id=result["graph_id"],
             score=result.get("score"),
             trace_id=trace_id,
+            clarification_needed=bool(result.get("clarification_needed")),
+            clarification_question=result.get("clarification_question"),
+            auditor_issue_id=result.get("auditor_issue_id"),
+            auditor_issue_kind=result.get("auditor_issue_kind"),
+            visualizations=result.get("visualizations") or [],
         )
 
     except Exception as exc:
@@ -667,7 +677,10 @@ async def get_job(
         )
 
 
-@router.post("/jobs/{graph_id}/resume")
+@router.post(
+    "/jobs/{graph_id}/resume",
+    dependencies=[Depends(require_permission("jobs.write"))],
+)
 async def resume_job(
     graph_id: str,
     request: Request,
@@ -893,7 +906,10 @@ class ConversationFeedbackRequest(BaseModel):
     team_id: Optional[str] = None
 
 
-@router.post("/conversations/{conversation_id}/feedback")
+@router.post(
+    "/conversations/{conversation_id}/feedback",
+    dependencies=[Depends(require_permission("conversations.write"))],
+)
 async def conversation_feedback(
     conversation_id: str,
     body: ConversationFeedbackRequest,
@@ -903,20 +919,32 @@ async def conversation_feedback(
     trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     pipeline = _get_pipeline(request)
 
-    # Resolve team_id: use provided value or look it up from the conversation
+    # Resolve team_id: use provided value or look it up from the conversation.
+    # The orchestrator doesn't carry a pooled async MySQL handle on
+    # app.state — it uses short-lived sync mysql.connector connections in
+    # the same pattern as routes/conversations.py / catalog.py. Match that
+    # here so the feedback endpoint actually works.
     team_id = body.team_id
     if not team_id:
         try:
-            pool = request.app.state.mysql_pool
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT team_id FROM conversations WHERE conversation_id = %s",
-                        (conversation_id,),
-                    )
-                    row = await cur.fetchone()
-                    if row:
-                        team_id = str(row[0]) if row[0] else None
+            import mysql.connector
+            from app.config import settings as _settings
+            conn = mysql.connector.connect(
+                host=_settings.mysql_host, port=_settings.mysql_port,
+                user=_settings.mysql_user, password=_settings.mysql_password,
+                database=_settings.mysql_db, connection_timeout=10,
+            )
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT team_id FROM conversations WHERE conversation_id = %s",
+                    (conversation_id,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    team_id = str(row[0])
+            finally:
+                conn.close()
         except Exception as exc:
             logger.warning(
                 "Failed to look up team_id from conversation",

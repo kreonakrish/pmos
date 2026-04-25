@@ -28,6 +28,7 @@ import PythonConfig from './configs/PythonConfig';
 import GitHubConfig from './configs/GitHubConfig';
 import TestPanel from './TestPanel';
 import HistoryPanel from './HistoryPanel';
+import CoveragePanel from './CoveragePanel';
 
 const TOOL_TYPES: ToolType[] = ['API', 'Database', 'Python', 'GitHub', 'WebService'];
 
@@ -217,7 +218,7 @@ export default function ToolEditor({
             <IconButton
               size="small"
               color="info"
-              onClick={() => setActiveTab(2)}
+              onClick={() => setActiveTab(3)}
             >
               <PlayArrowIcon />
             </IconButton>
@@ -252,6 +253,7 @@ export default function ToolEditor({
         >
           <Tab label="General" />
           <Tab label="Configuration" />
+          <Tab label="Coverage" />
           <Tab label="Test Panel" />
           <Tab label="History" />
         </Tabs>
@@ -317,10 +319,14 @@ export default function ToolEditor({
       </TabPanel>
 
       <TabPanel value={activeTab} index={2}>
-        <TestPanel key={`${toolData.tool_id ?? 'new'}-${toolData.tool_type}`} toolData={toolData} />
+        <CoveragePanel toolId={toolData.tool_id} />
       </TabPanel>
 
       <TabPanel value={activeTab} index={3}>
+        <TestPanel key={`${toolData.tool_id ?? 'new'}-${toolData.tool_type}`} toolData={toolData} />
+      </TabPanel>
+
+      <TabPanel value={activeTab} index={4}>
         <HistoryPanel toolId={toolData.tool_id} />
       </TabPanel>
     </Box>

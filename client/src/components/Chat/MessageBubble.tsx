@@ -4,6 +4,7 @@ import {
   Typography,
   Chip,
   Paper,
+  Stack,
   useTheme,
   IconButton,
   Collapse,
@@ -22,6 +23,7 @@ import apiClient from '@/api/axios';
 import ToolCallCard from './ToolCallCard';
 import StepTimeline from './StepTimeline';
 import CourseCorrectionBanner from './CourseCorrectionBanner';
+import VisualizationBlock from './VisualizationBlock';
 
 interface Props {
   message: Message;
@@ -161,6 +163,17 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
 
           {/* Message content */}
           <MarkdownContent content={message.content} isUser={isUser} />
+
+          {/* Visualizations — only on assistant messages with metadata.visualizations */}
+          {!isUser &&
+            message.metadata?.visualizations &&
+            message.metadata.visualizations.length > 0 && (
+              <Stack spacing={1.5} sx={{ mt: 1.5 }}>
+                {message.metadata.visualizations.map((viz, i) => (
+                  <VisualizationBlock key={i} viz={viz} />
+                ))}
+              </Stack>
+            )}
 
           {/* Tool calls */}
           {message.tool_calls && message.tool_calls.length > 0 && (

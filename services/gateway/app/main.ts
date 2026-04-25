@@ -5,6 +5,7 @@ import { config } from './config';
 import { logger } from './utils/logger';
 import { requestId } from './middleware/requestId';
 import { authMiddleware } from './middleware/auth';
+import { enforceRegistry } from './middleware/rbac';
 import { rateLimiter } from './middleware/rateLimiter';
 import { errorHandler } from './middleware/errorHandler';
 import healthRouter from './routes/health';
@@ -13,6 +14,7 @@ import agentMgmtRouter from './routes/agentMgmt';
 import ragRouter from './routes/rag';
 import scoringRouter from './routes/scoring';
 import memoryRouter from './routes/memory';
+import translatorRouter from './routes/translator';
 import authRouter from './routes/auth';
 import usersRouter from './routes/users';
 import logsRouter from './routes/logs';
@@ -81,6 +83,11 @@ app.use('/v1', authRouter);
 app.use('/v1', authMiddleware);
 app.use('/v1', rateLimiter);
 
+// 5b. Server-side RBAC enforcement against MySQL (DB-backed; the JWT's
+//     embedded permissions are advisory only). Mounted AFTER authMiddleware
+//     so req.user is populated. Skips /v1/auth/* internally.
+app.use('/v1', enforceRegistry);
+
 // 6. Versioned API routes
 app.use('/v1', usersRouter);
 app.use('/v1', orchestratorRouter);
@@ -88,6 +95,7 @@ app.use('/v1', agentMgmtRouter);
 app.use('/v1', ragRouter);
 app.use('/v1', scoringRouter);
 app.use('/v1', memoryRouter);
+app.use('/v1', translatorRouter);
 app.use('/v1', logsRouter);
 
 // 7. Global error handler (must be last)

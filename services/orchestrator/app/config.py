@@ -5,11 +5,19 @@ class Settings(BaseSettings):
     service_name: str = "orchestrator"
     orchestrator_port: int = 8000
 
-    # Neo4j (set NEO4J_URI in .env; no hardcoded default)
+    # Neo4j (execution graph — set NEO4J_URI in .env; no hardcoded default)
     neo4j_uri: str = ""
     neo4j_user: str = "neo4j"
     neo4j_password: str = ""
     neo4j_database: str = "neo4j"
+
+    # Ontology Neo4j (Business Ontology / Semantic Spine).
+    # In production this typically points to a separate graph DB; for dev each
+    # falls back to the execution-graph value when unset.
+    ontology_neo4j_uri: str = ""
+    ontology_neo4j_user: str = ""
+    ontology_neo4j_password: str = ""
+    ontology_neo4j_database: str = ""
 
     # Redis
     redis_url: str = "redis://localhost:6379"
@@ -20,6 +28,8 @@ class Settings(BaseSettings):
     rag_service_url: str = "http://localhost:8002"
     meta_assembly_url: str = "http://localhost:8004"
     agent_mgmt_url: str = "http://localhost:4001"
+    translator_service_url: str = "http://localhost:8005"
+    translator_timeout_sec: float = 30.0
 
     # LLM
     llm_provider: str = "openai"

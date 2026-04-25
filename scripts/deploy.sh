@@ -71,12 +71,13 @@ MEMORY_PORT="${MEMORY_PORT:-8001}"
 RAG_PORT="${RAG_PORT:-8002}"
 SCORING_PORT="${SCORING_PORT:-8003}"
 META_ASSEMBLY_PORT="${META_ASSEMBLY_PORT:-8004}"
+TRANSLATOR_PORT="${TRANSLATOR_PORT:-8005}"
 CLIENT_PORT="${CLIENT_PORT:-3000}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 QDRANT_PORT="${QDRANT_PORT:-6333}"
 QDRANT_GRPC_PORT="${QDRANT_GRPC_PORT:-6334}"
 
-BACKEND_SERVICES=(gateway agent-mgmt orchestrator memory rag scoring meta-assembly client)
+BACKEND_SERVICES=(gateway agent-mgmt orchestrator memory rag scoring meta-assembly translator client)
 
 # ---------------------------------------------------------------------------
 # Prereq checks
@@ -268,6 +269,7 @@ health() {
         "RAG:http://localhost:${RAG_PORT}/health"
         "Scoring:http://localhost:${SCORING_PORT}/health"
         "Meta-Assembly:http://localhost:${META_ASSEMBLY_PORT}/health"
+        "Translator:http://localhost:${TRANSLATOR_PORT}/health"
         "Client:http://localhost:${CLIENT_PORT}"
     )
     for svc in "${services[@]}"; do

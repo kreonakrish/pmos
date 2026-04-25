@@ -374,6 +374,8 @@ router.get('/catalog/assets', catalogProxy('/v1/catalog/assets'));
 router.get('/catalog/ontology', catalogProxy('/v1/catalog/ontology'));
 router.get('/catalog/mapping-decisions', catalogProxy('/v1/catalog/mapping-decisions'));
 router.get('/catalog/mapping-decisions/summary', catalogProxy('/v1/catalog/mapping-decisions/summary'));
+// Ext2 — deterministic Report nodes (Reports tab).
+router.get('/catalog/reports', catalogProxy('/v1/catalog/reports'));
 
 router.get('/catalog/crawlers/:id/runs', async (req: Request, res: Response): Promise<void> => {
   const traceId = (req as Request & { id?: string }).id;
@@ -409,6 +411,70 @@ router.post('/catalog/mapping-decisions/:id/review', async (req: Request, res: R
   logger.info('proxy_catalog_review', { layer: 'router', trace_id: traceId, decision_id: id });
   await proxyRequest(req, res, {
     targetUrl: `${config.ORCHESTRATOR_URL}/v1/catalog/mapping-decisions/${id}/review`,
+  });
+});
+
+// ─── Phase A5 / B / E4 / F5 / F3 — additional catalog endpoints ─────────────
+
+// Asset ↔ Ontology ↔ Source ↔ CrawlRun ↔ Tool lineage view (Lineage & Runs tab).
+router.get('/catalog/lineage', catalogProxy('/v1/catalog/lineage'));
+
+// Per-tool coverage (Tool Studio Coverage tab).
+router.get('/catalog/tools/:tool_id/coverage', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const tool_id = String((req.params as Record<string, string>).tool_id || '');
+  const qs = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+  logger.info('proxy_catalog_tool_coverage', { layer: 'router', trace_id: traceId, tool_id });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/catalog/tools/${encodeURIComponent(tool_id)}/coverage${qs}`,
+  });
+});
+
+// Live Neo4j schema visualization (Schema Graph page).
+router.get('/catalog/schema-graph', catalogProxy('/v1/catalog/schema-graph'));
+
+// Phase E4 — mapping version history.
+router.get('/catalog/mapping-history', catalogProxy('/v1/catalog/mapping-history'));
+
+// Phase F5 — Synonym proposals (Synonym Review tab).
+router.get('/catalog/synonym-proposals', catalogProxy('/v1/catalog/synonym-proposals'));
+router.get('/catalog/synonym-proposals/:proposal_id', async (req: Request, res: Response): Promise<void> => {
+  const proposal_id = String((req.params as Record<string, string>).proposal_id || '');
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/catalog/synonym-proposals/${encodeURIComponent(proposal_id)}`,
+  });
+});
+router.post('/catalog/synonym-proposals/:proposal_id/review', async (req: Request, res: Response): Promise<void> => {
+  const proposal_id = String((req.params as Record<string, string>).proposal_id || '');
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/catalog/synonym-proposals/${encodeURIComponent(proposal_id)}/review`,
+  });
+});
+router.post('/catalog/consolidate', catalogProxy('/v1/catalog/consolidate'));
+
+// ─── Phase F3 — Auditor Issues (Govern → Auditor Issues page) ──────────────
+function governanceProxy(pathname: string) {
+  return async (req: Request, res: Response): Promise<void> => {
+    const traceId = (req as Request & { id?: string }).id;
+    const qs = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+    logger.info('proxy_governance', { layer: 'router', trace_id: traceId, path: pathname });
+    await proxyRequest(req, res, {
+      targetUrl: `${config.ORCHESTRATOR_URL}${pathname}${qs}`,
+    });
+  };
+}
+router.get('/governance/auditor-issues', governanceProxy('/v1/governance/auditor-issues'));
+router.get('/governance/auditor-issues/summary', governanceProxy('/v1/governance/auditor-issues/summary'));
+router.get('/governance/auditor-issues/:issue_id', async (req: Request, res: Response): Promise<void> => {
+  const issue_id = String((req.params as Record<string, string>).issue_id || '');
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/governance/auditor-issues/${encodeURIComponent(issue_id)}`,
+  });
+});
+router.post('/governance/auditor-issues/:issue_id/resolve', async (req: Request, res: Response): Promise<void> => {
+  const issue_id = String((req.params as Record<string, string>).issue_id || '');
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/governance/auditor-issues/${encodeURIComponent(issue_id)}/resolve`,
   });
 });
 

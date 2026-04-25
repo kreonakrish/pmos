@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Box,
   Typography,
@@ -36,6 +37,8 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import TableChartIcon from '@mui/icons-material/TableChart';
 import AccountTreeIcon from '@mui/icons-material/AccountTree';
 import GavelIcon from '@mui/icons-material/Gavel';
+import MergeTypeIcon from '@mui/icons-material/MergeType';
+import AssessmentIcon from '@mui/icons-material/Assessment';
 import CheckIcon from '@mui/icons-material/Check';
 import EditIcon from '@mui/icons-material/Edit';
 import CloseIcon from '@mui/icons-material/Close';
@@ -44,6 +47,10 @@ import KeyIcon from '@mui/icons-material/Key';
 import LinkIcon from '@mui/icons-material/Link';
 import AddIcon from '@mui/icons-material/Add';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
+import HistoryIcon from '@mui/icons-material/History';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
+import SynonymReviewTab from './SynonymReviewTab';
+import ReportsTab from './ReportsTab';
 import {
   useCrawlers,
   useCrawlRuns,
@@ -55,9 +62,11 @@ import {
   useMappingDecisionsSummary,
   useReviewMapping,
   useCreateCrawler,
+  useMappingHistory,
   CreateCrawlerInput,
   Crawler,
   MappingDecision,
+  MappingHistoryEntry,
 } from '@/api/catalog';
 
 function fmt(n: number | null | undefined, digits = 2): string {
@@ -314,8 +323,37 @@ function coerceFields(fields: FieldDef[], values: Record<string, any>): Record<s
   return out;
 }
 
+// Tab name <-> index mapping for deep-linking via ?tab=...
+const TAB_KEYS = [
+  'crawlers',
+  'assets',
+  'ontology',
+  'mapping-review',
+  'synonym-review',
+  'reports',
+] as const;
+type TabKey = (typeof TAB_KEYS)[number];
+
 export default function DataCatalogPage() {
-  const [tab, setTab] = useState(0);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialKey = (searchParams.get('tab') as TabKey | null) ?? null;
+  const [tab, setTab] = useState<number>(() => {
+    if (initialKey && TAB_KEYS.includes(initialKey)) {
+      return TAB_KEYS.indexOf(initialKey);
+    }
+    return 0;
+  });
+
+  // Keep the URL in sync with the active tab (preserves other params like
+  // ?cluster=... that the SynonymReviewTab consumes).
+  useEffect(() => {
+    const desired = TAB_KEYS[tab];
+    if (searchParams.get('tab') === desired) return;
+    const next = new URLSearchParams(searchParams);
+    next.set('tab', desired);
+    setSearchParams(next, { replace: true });
+  }, [tab, searchParams, setSearchParams]);
+
   return (
     <Box>
       <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 2 }}>
@@ -331,11 +369,13 @@ export default function DataCatalogPage() {
       </Typography>
 
       <Paper sx={{ mb: 2 }}>
-        <Tabs value={tab} onChange={(_, v) => setTab(v)}>
+        <Tabs value={tab} onChange={(_, v: number) => setTab(v)}>
           <Tab icon={<PlayArrowIcon />} iconPosition="start" label="Crawlers" />
           <Tab icon={<TableChartIcon />} iconPosition="start" label="Assets" />
           <Tab icon={<AccountTreeIcon />} iconPosition="start" label="Business Ontology" />
           <Tab icon={<GavelIcon />} iconPosition="start" label="Mapping Review" />
+          <Tab icon={<MergeTypeIcon />} iconPosition="start" label="Synonym Review" />
+          <Tab icon={<AssessmentIcon />} iconPosition="start" label="Reports" />
         </Tabs>
       </Paper>
 
@@ -343,6 +383,8 @@ export default function DataCatalogPage() {
       {tab === 1 && <AssetsTab />}
       {tab === 2 && <OntologyTab />}
       {tab === 3 && <MappingReviewTab />}
+      {tab === 4 && <SynonymReviewTab />}
+      {tab === 5 && <ReportsTab />}
     </Box>
   );
 }
@@ -975,6 +1017,10 @@ function AssetDetail({ asset, columns }: { asset: any; columns: any[] }) {
 function OntologyTab() {
   const q = useOntology();
   const domains = q.data?.domains ?? [];
+  // Click an entity row to drill in. Key = `${domain}::${entity}` so the
+  // same entity name in two domains stays distinct. null = nothing expanded.
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+
   return (
     <Box>
       {q.isLoading ? (
@@ -1000,20 +1046,124 @@ function OntologyTab() {
                   />
                 </Stack>
                 <Box sx={{ pl: 1 }}>
-                  {d.entities.map((e) => (
-                    <Stack
-                      key={e.entity}
-                      direction="row"
-                      alignItems="center"
-                      spacing={1}
-                      sx={{ py: 0.5, borderBottom: '1px dashed', borderColor: 'divider' }}
-                    >
-                      <Typography variant="body2" sx={{ flex: 1 }}>{e.entity}</Typography>
-                      <Typography variant="caption" color="text.secondary">
-                        {e.attributes} attrs
-                      </Typography>
-                    </Stack>
-                  ))}
+                  {d.entities.map((e) => {
+                    const key = `${d.domain || ''}::${e.entity}`;
+                    const isOpen = expandedKey === key;
+                    return (
+                      <Box key={e.entity}>
+                        <Stack
+                          direction="row"
+                          alignItems="center"
+                          spacing={1}
+                          onClick={() => setExpandedKey(isOpen ? null : key)}
+                          sx={{
+                            py: 0.5,
+                            cursor: 'pointer',
+                            borderBottom: isOpen ? 'none' : '1px dashed',
+                            borderColor: 'divider',
+                            borderRadius: 0.5,
+                            px: 0.5,
+                            '&:hover': { bgcolor: 'action.hover' },
+                          }}
+                        >
+                          <ExpandMoreIcon
+                            fontSize="small"
+                            sx={{
+                              transform: isOpen ? 'rotate(0deg)' : 'rotate(-90deg)',
+                              transition: 'transform 120ms',
+                              color: 'text.secondary',
+                            }}
+                          />
+                          <Typography variant="body2" sx={{ flex: 1, fontWeight: isOpen ? 600 : 400 }}>
+                            {e.entity}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {e.attributes} attrs
+                          </Typography>
+                        </Stack>
+                        {isOpen && (
+                          <Box
+                            sx={{
+                              pl: 3.5,
+                              pr: 0.5,
+                              py: 1,
+                              borderBottom: '1px dashed',
+                              borderColor: 'divider',
+                              bgcolor: 'action.hover',
+                            }}
+                          >
+                            {(!e.attribute_list || e.attribute_list.length === 0) ? (
+                              <Typography variant="caption" color="text.secondary">
+                                No attributes mapped yet.
+                              </Typography>
+                            ) : (
+                              <Stack spacing={0.75}>
+                                {e.attribute_list.map((a) => {
+                                  const cols = a.mapped_columns || [];
+                                  return (
+                                    <Box key={a.fq_name}>
+                                      <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: 'wrap' }}>
+                                        <Typography
+                                          variant="body2"
+                                          sx={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 500 }}
+                                        >
+                                          {a.name}
+                                        </Typography>
+                                        <Chip
+                                          label={`${cols.length} ${cols.length === 1 ? 'col' : 'cols'}`}
+                                          size="small"
+                                          variant="outlined"
+                                          sx={{ height: 18, fontSize: 10 }}
+                                        />
+                                        {cols.length > 1 && (
+                                          <Chip
+                                            label={`${new Set(cols.map((c) => c.source_name).filter(Boolean)).size} sources`}
+                                            size="small"
+                                            color="warning"
+                                            variant="outlined"
+                                            sx={{ height: 18, fontSize: 10 }}
+                                          />
+                                        )}
+                                      </Stack>
+                                      {cols.length > 0 && (
+                                        <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap sx={{ pl: 1.5, mt: 0.25 }}>
+                                          {cols.map((c, i) => (
+                                            <Tooltip
+                                              key={`${a.fq_name}-${i}`}
+                                              title={
+                                                <Box sx={{ fontFamily: 'monospace', fontSize: 11, whiteSpace: 'pre' }}>
+                                                  {`${c.column_fq_name}\nasset: ${c.asset_fq_name || '?'}\nsource: ${c.source_uri || c.source_name || '?'}\nconfidence: ${c.confidence ?? '?'}\nstatus: ${c.status ?? '?'}`}
+                                                </Box>
+                                              }
+                                              arrow
+                                            >
+                                              <Chip
+                                                label={`${c.source_name?.split('_').slice(-2).join('_') || 'src'}.${c.column_name || '?'}`}
+                                                size="small"
+                                                variant={c.is_canonical ? 'filled' : 'outlined'}
+                                                color={
+                                                  (c.confidence ?? 0) >= 0.8
+                                                    ? 'success'
+                                                    : (c.confidence ?? 0) >= 0.5
+                                                    ? 'warning'
+                                                    : 'default'
+                                                }
+                                                sx={{ height: 18, fontSize: 10, fontFamily: 'monospace' }}
+                                              />
+                                            </Tooltip>
+                                          ))}
+                                        </Stack>
+                                      )}
+                                    </Box>
+                                  );
+                                })}
+                              </Stack>
+                            )}
+                          </Box>
+                        )}
+                      </Box>
+                    );
+                  })}
                 </Box>
               </Paper>
             </Grid>
@@ -1038,6 +1188,9 @@ function MappingReviewTab() {
   const [formEntity, setFormEntity] = useState('');
   const [formAttribute, setFormAttribute] = useState('');
   const [formNote, setFormNote] = useState('');
+  // Phase E4 — version history dialog state. Holds the BusinessAttribute
+  // fq_name to load history for; the dialog mounts when non-null.
+  const [historyFor, setHistoryFor] = useState<string | null>(null);
 
   const decisions = decisionsQ.data?.decisions ?? [];
   const summary = summaryQ.data;
@@ -1137,6 +1290,14 @@ function MappingReviewTab() {
                   onConfirm={() => review.mutate({ decisionId: d.decision_id, action: 'CONFIRM' })}
                   onReject={() => review.mutate({ decisionId: d.decision_id, action: 'REJECT' })}
                   onCorrect={() => openEdit(d)}
+                  onHistory={() => {
+                    // Resolve auditor-confirmed attribute fq if present,
+                    // otherwise fall back to the proposed mapping.
+                    const dom = d.auditor_domain || d.proposed_domain;
+                    const ent = d.auditor_entity || d.proposed_entity;
+                    const attr = d.auditor_attribute || d.proposed_attribute;
+                    if (dom && ent && attr) setHistoryFor(`${dom}.${ent}.${attr}`);
+                  }}
                   disabled={review.isPending}
                 />
               ))}
@@ -1180,18 +1341,105 @@ function MappingReviewTab() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      <MappingHistoryDialog
+        attributeFqName={historyFor}
+        onClose={() => setHistoryFor(null)}
+      />
     </Box>
   );
 }
 
+// ---------------------------------------------------------------------------
+// Phase E4 — Mapping version history dialog (auditor "explain why" surface).
+// ---------------------------------------------------------------------------
+function MappingHistoryDialog({
+  attributeFqName, onClose,
+}: {
+  attributeFqName: string | null;
+  onClose: () => void;
+}) {
+  const historyQ = useMappingHistory(attributeFqName);
+  const rows: MappingHistoryEntry[] = historyQ.data?.history ?? [];
+  return (
+    <Dialog open={!!attributeFqName} onClose={onClose} maxWidth="md" fullWidth>
+      <DialogTitle>
+        Mapping history
+        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+          {attributeFqName || ''}
+        </Typography>
+      </DialogTitle>
+      <DialogContent>
+        {historyQ.isLoading ? (
+          <Skeleton height={120} />
+        ) : rows.length === 0 ? (
+          <Alert severity="info">No version history for this attribute.</Alert>
+        ) : (
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell align="right">v</TableCell>
+                <TableCell>Status</TableCell>
+                <TableCell align="right">Conf</TableCell>
+                <TableCell>Column</TableCell>
+                <TableCell>Reviewed by</TableCell>
+                <TableCell>Effective from</TableCell>
+                <TableCell>Effective until</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {rows.map((h) => (
+                <TableRow key={`${h.version}-${h.effective_from || ''}`}>
+                  <TableCell align="right">
+                    <Chip label={`v${h.version}`} size="small"
+                          color={h.effective_until ? 'default' : 'primary'}
+                          sx={{ height: 18, fontSize: 10 }} />
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="caption">{h.status || '—'}</Typography>
+                  </TableCell>
+                  <TableCell align="right">
+                    <Typography variant="caption">{fmt(h.confidence)}</Typography>
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="caption" sx={{ fontFamily: 'monospace' }}>
+                      {h.column_fq_name || '—'}
+                    </Typography>
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="caption">{h.reviewed_by || '—'}</Typography>
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="caption">{fmtTs(h.effective_from)}</Typography>
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="caption">
+                      {h.effective_until ? fmtTs(h.effective_until) : <em>current</em>}
+                    </Typography>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>Close</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
 function DecisionRow({
-  d, onConfirm, onReject, onCorrect, disabled,
+  d, onConfirm, onReject, onCorrect, onHistory, disabled,
 }: {
   d: MappingDecision;
-  onConfirm: () => void; onReject: () => void; onCorrect: () => void; disabled: boolean;
+  onConfirm: () => void; onReject: () => void; onCorrect: () => void;
+  onHistory: () => void; disabled: boolean;
 }) {
   const conf = d.confidence ?? 0;
   const isReviewed = d.status !== 'AUTO_ACCEPTED' && d.status !== 'PENDING';
+  const version = d.version ?? null;
   return (
     <TableRow>
       <TableCell sx={{ maxWidth: 260 }}>
@@ -1235,12 +1483,24 @@ function DecisionRow({
         )}
       </TableCell>
       <TableCell align="right">
-        <Chip
-          label={fmt(conf)}
-          size="small"
-          color={conf >= 0.8 ? 'success' : conf >= 0.5 ? 'warning' : 'error'}
-          sx={{ height: 18, fontSize: 10 }}
-        />
+        <Stack direction="row" spacing={0.5} justifyContent="flex-end">
+          <Chip
+            label={fmt(conf)}
+            size="small"
+            color={conf >= 0.8 ? 'success' : conf >= 0.5 ? 'warning' : 'error'}
+            sx={{ height: 18, fontSize: 10 }}
+          />
+          {version !== null && version !== undefined && (
+            <Tooltip title={`Ontology mapping version v${version}`} placement="top">
+              <Chip
+                label={`v${version}`}
+                size="small"
+                variant="outlined"
+                sx={{ height: 18, fontSize: 10 }}
+              />
+            </Tooltip>
+          )}
+        </Stack>
       </TableCell>
       <TableCell>
         <Chip
@@ -1255,35 +1515,44 @@ function DecisionRow({
         />
       </TableCell>
       <TableCell align="right">
-        {!isReviewed ? (
-          <Stack direction="row" spacing={0.5} justifyContent="flex-end">
-            <Tooltip title="Confirm (RL reward +1.0)">
-              <span>
-                <IconButton size="small" color="success" onClick={onConfirm} disabled={disabled}>
-                  <CheckIcon fontSize="small" />
-                </IconButton>
-              </span>
-            </Tooltip>
-            <Tooltip title="Correct (RL reward -0.5)">
-              <span>
-                <IconButton size="small" color="warning" onClick={onCorrect} disabled={disabled}>
-                  <EditIcon fontSize="small" />
-                </IconButton>
-              </span>
-            </Tooltip>
-            <Tooltip title="Reject (RL reward -1.0)">
-              <span>
-                <IconButton size="small" color="error" onClick={onReject} disabled={disabled}>
-                  <CloseIcon fontSize="small" />
-                </IconButton>
-              </span>
-            </Tooltip>
-          </Stack>
-        ) : (
-          <Typography variant="caption" color="text.secondary">
-            by {d.reviewed_by || 'auditor'}
-          </Typography>
-        )}
+        <Stack direction="row" spacing={0.5} justifyContent="flex-end" alignItems="center">
+          {!isReviewed ? (
+            <>
+              <Tooltip title="Confirm (RL reward +1.0)">
+                <span>
+                  <IconButton size="small" color="success" onClick={onConfirm} disabled={disabled}>
+                    <CheckIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <Tooltip title="Correct (RL reward -0.5)">
+                <span>
+                  <IconButton size="small" color="warning" onClick={onCorrect} disabled={disabled}>
+                    <EditIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <Tooltip title="Reject (RL reward -1.0)">
+                <span>
+                  <IconButton size="small" color="error" onClick={onReject} disabled={disabled}>
+                    <CloseIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            </>
+          ) : (
+            <Typography variant="caption" color="text.secondary">
+              by {d.reviewed_by || 'auditor'}
+            </Typography>
+          )}
+          <Tooltip title="View ontology version history">
+            <span>
+              <IconButton size="small" onClick={onHistory}>
+                <HistoryIcon fontSize="small" />
+              </IconButton>
+            </span>
+          </Tooltip>
+        </Stack>
       </TableCell>
     </TableRow>
   );

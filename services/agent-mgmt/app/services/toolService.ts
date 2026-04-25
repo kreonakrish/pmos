@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { RowDataPacket } from 'mysql2';
 import { mysqlAdapter } from '../adapters/mysqlAdapter';
+import { neo4jAdapter } from '../adapters/neo4jAdapter';
 import { Tool, CreateToolRequest, UpdateToolRequest } from '../models/tool';
 import { logger } from '../utils/logger';
 
@@ -47,8 +48,77 @@ export class ToolService {
     const tool = await this.getTool(toolId);
     if (!tool) throw new Error('Failed to retrieve tool after creation');
 
+    await this.linkToolToDataSource(tool);
+
     logger.info('Tool created', 'service', { tool_id: toolId, name: req.name });
     return tool;
+  }
+
+  /**
+   * Mirror the tool into Neo4j and (best-effort) link it to a matching
+   * DataSource node. Match key is `hostname` first, then the host extracted
+   * from `endpoint`. Failures are logged and swallowed so MySQL CRUD never
+   * blocks on Neo4j availability.
+   */
+  private async linkToolToDataSource(tool: Tool): Promise<void> {
+    if (!neo4jAdapter.isReady()) return;
+
+    try {
+      await neo4jAdapter.run(
+        `
+        MERGE (t:Tool {tool_id: $tool_id})
+        SET t.name = $name,
+            t.tool_type = $tool_type,
+            t.hostname = $hostname,
+            t.endpoint = $endpoint,
+            t.updated_at = datetime()
+        `,
+        {
+          tool_id: tool.tool_id,
+          name: tool.name,
+          tool_type: tool.tool_type,
+          hostname: tool.hostname ?? null,
+          endpoint: tool.endpoint ?? null,
+        },
+      );
+
+      const matchKey = tool.hostname || this.extractHost(tool.endpoint);
+      if (!matchKey) return;
+
+      await neo4jAdapter.run(
+        `
+        MATCH (t:Tool {tool_id: $tool_id})
+        MATCH (ds:DataSource)
+        WHERE ds.source_uri CONTAINS $key
+           OR ds.source_name = $key
+        MERGE (t)-[r:ACCESSES]->(ds)
+        SET r.bound_at = coalesce(r.bound_at, datetime()),
+            r.refreshed_at = datetime()
+        `,
+        { tool_id: tool.tool_id, key: matchKey },
+      );
+
+      logger.info('Tool linked to DataSource (best-effort)', 'service', {
+        tool_id: tool.tool_id,
+        match_key: matchKey,
+      });
+    } catch (err: unknown) {
+      const error = err as Error;
+      logger.warn('Failed to link Tool→DataSource in Neo4j (non-fatal)', 'service', {
+        tool_id: tool.tool_id,
+        error: error.message,
+      });
+    }
+  }
+
+  private extractHost(endpoint: string | null | undefined): string | null {
+    if (!endpoint) return null;
+    try {
+      const url = new URL(endpoint);
+      return url.hostname || null;
+    } catch {
+      return null;
+    }
   }
 
   async updateTool(toolId: string, req: UpdateToolRequest): Promise<Tool | null> {
@@ -86,7 +156,11 @@ export class ToolService {
     );
 
     logger.info('Tool updated', 'service', { tool_id: toolId });
-    return this.getTool(toolId);
+    const refreshed = await this.getTool(toolId);
+    if (refreshed) {
+      await this.linkToolToDataSource(refreshed);
+    }
+    return refreshed;
   }
 
   async deleteTool(toolId: string): Promise<boolean> {

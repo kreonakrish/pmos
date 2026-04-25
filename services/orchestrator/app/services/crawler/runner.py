@@ -31,6 +31,7 @@ from app.services.crawler.base import BaseCrawler, CrawlResult
 from app.services.crawler.catalog_writer import CatalogWriter
 from app.services.crawler.mysql_crawler import MySQLCrawler
 from app.services.crawler.semantic_mapper import AssetProposal, SemanticMapper
+from app.services.crawler.synonym_consolidator import SynonymConsolidator
 
 logger = logging.getLogger("pmos.crawler.runner")
 
@@ -228,6 +229,39 @@ async def run_crawler_async(
             crawler_id=crawler_id,
             trace_id=trace_id,
         )
+
+        # 4. Phase F5 — post-crawl synonym consolidation pass.
+        # Cluster all BusinessAttribute names produced (per-domain) so a
+        # Data Steward can pick canonical names + canonical columns. Failure
+        # here MUST NOT fail the crawl — it's an offline-style pass.
+        if proposals:
+            # Determine the dominant domain from the proposals (most-frequent),
+            # so we cluster only BAs the crawl just touched. If the crawl
+            # spanned multiple domains we pass None and let the consolidator
+            # walk every domain.
+            domain_counts: Dict[str, int] = {}
+            for p in proposals:
+                d = (p.domain or "").strip()
+                if d:
+                    domain_counts[d] = domain_counts.get(d, 0) + 1
+            detected_domain: Optional[str] = None
+            if len(domain_counts) == 1:
+                detected_domain = next(iter(domain_counts.keys()))
+
+            try:
+                consolidator = SynonymConsolidator()
+                await consolidator.run(
+                    neo4j=neo4j,
+                    llm=llm,
+                    domain=detected_domain,
+                    trace_id=trace_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "SynonymConsolidator failed (non-fatal): %s",
+                    exc,
+                    extra={"run_id": run_id, "trace_id": trace_id},
+                )
 
         duration_ms = int((time.monotonic() - t0) * 1000)
         _finalize_run(

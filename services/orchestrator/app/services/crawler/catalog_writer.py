@@ -10,7 +10,9 @@ Ontology (in Neo4j):
     (:BusinessDomain {name})
       -[:HAS_ENTITY]-> (:BusinessEntity {name, domain})
         -[:HAS_ATTRIBUTE]-> (:BusinessAttribute {name, entity, fq_name})
-          -[:MAPS_TO {confidence, status, model_version, created_at}]-> (:DataColumn)
+          -[:MAPS_TO {confidence, status, model_version, version,
+                      effective_from, effective_until, reviewed_by,
+                      reviewed_at, created_at}]-> (:DataColumn)
 
 FK relationships from the source are also copied into the graph as:
 
@@ -261,6 +263,16 @@ class CatalogWriter:
         for m in proposal.columns:
             col_fq = f"{asset_fq}.{m.column_name}"
             attr_fq = f"{proposal.domain}.{proposal.entity}.{m.attribute}"
+            # Phase E4 — versioned MAPS_TO. We MERGE the *current* edge (the
+            # one with effective_until IS NULL). On first creation we stamp
+            # version=1 and effective_from=now. On subsequent touches of the
+            # same edge we COALESCE so existing version + effective_from are
+            # preserved (best-effort backfill for pre-Phase-E4 edges as well).
+            # Corrective overrides (auditor changed the mapping → different
+            # ba) are handled in routes/catalog.py with the supersede pattern.
+            # Cypher MERGE rejects null property values in patterns, so we
+            # look up the live edge with OPTIONAL MATCH first and either SET
+            # on it or CREATE a fresh one. Two FOREACHes simulate if/else.
             await self._neo4j.run_query(
                 """
                 MATCH (e:BusinessEntity {name: $entity, domain: $domain})
@@ -270,12 +282,29 @@ class CatalogWriter:
                     ba.entity = $entity,
                     ba.domain = $domain
                 MERGE (e)-[:HAS_ATTRIBUTE]->(ba)
-                MERGE (ba)-[m:MAPS_TO]->(c)
-                SET m.confidence    = $confidence,
-                    m.status        = 'AUTO_ACCEPTED',
-                    m.model_version = $model_version,
-                    m.reasoning     = $reasoning,
-                    m.updated_at    = datetime()
+                WITH ba, c
+                OPTIONAL MATCH (ba)-[live:MAPS_TO]->(c)
+                  WHERE live.effective_until IS NULL
+                FOREACH (_ IN CASE WHEN live IS NULL THEN [1] ELSE [] END |
+                  CREATE (ba)-[m:MAPS_TO]->(c)
+                  SET m.confidence      = $confidence,
+                      m.status          = 'AUTO_ACCEPTED',
+                      m.model_version   = $model_version,
+                      m.reasoning       = $reasoning,
+                      m.updated_at      = datetime(),
+                      m.version         = 1,
+                      m.effective_from  = datetime(),
+                      m.effective_until = null
+                )
+                FOREACH (m IN CASE WHEN live IS NOT NULL THEN [live] ELSE [] END |
+                  SET m.confidence     = $confidence,
+                      m.status         = 'AUTO_ACCEPTED',
+                      m.model_version  = $model_version,
+                      m.reasoning      = $reasoning,
+                      m.updated_at     = datetime(),
+                      m.version        = coalesce(m.version, 1),
+                      m.effective_from = coalesce(m.effective_from, datetime())
+                )
                 """,
                 {
                     "entity": proposal.entity,
@@ -333,3 +362,29 @@ class CatalogWriter:
                 conn.commit()
             finally:
                 conn.close()
+
+        # F1: prune any orphan BusinessEntity nodes left behind by failed
+        # mapping attempts or stale auditor edits. Cheap and idempotent —
+        # only deletes entities with zero HAS_ATTRIBUTE outgoing edges.
+        try:
+            res = await self._neo4j.run_query(
+                """
+                MATCH (e:BusinessEntity)
+                WHERE NOT (e)-[:HAS_ATTRIBUTE]->()
+                WITH collect(e) AS orphans
+                FOREACH (o IN orphans | DETACH DELETE o)
+                RETURN size(orphans) AS deleted
+                """,
+                trace_id=trace_id,
+            )
+            deleted = (res or [{}])[0].get("deleted", 0)
+            if deleted:
+                logger.info(
+                    "Pruned orphan BusinessEntity nodes",
+                    extra={"deleted": deleted, "trace_id": trace_id},
+                )
+        except Exception as exc:
+            logger.warning(
+                "Orphan prune failed (non-fatal): %s", exc,
+                extra={"trace_id": trace_id},
+            )

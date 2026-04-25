@@ -17,6 +17,13 @@ class BidRequest(BaseModel):
     context: Dict[str, Any] = Field(default_factory=dict)
     trace_id: str = ""
 
+    # Dataset bindings stamped on the TaskNode by the Translator (Phase C3).
+    # When non-empty, capability negotiation requires each candidate agent to
+    # have at least one tool that ACCESSES a DataSource owning at least one
+    # of these DataAssets — agents that can't reach the data are dropped
+    # before ranking.
+    dataset_bindings: List[str] = Field(default_factory=list)
+
 
 class BidResponse(BaseModel):
     """An individual agent's bid for a task."""
@@ -32,6 +39,14 @@ class BidResponse(BaseModel):
     foundation_model: str = ""
     provider: str = ""
     error: Optional[str] = None      # Set if the bid request itself failed
+
+    # Phase 21 — set by the dataset-binding filter when ``BidRequest`` carries
+    # bindings. ``dataset_access_verified`` is False when the agent's tools
+    # can't reach any of the required assets; such bids are excluded from
+    # ranking. ``accessible_assets`` is the subset of ``BidRequest.dataset_bindings``
+    # this agent's tools can actually reach.
+    dataset_access_verified: bool = True
+    accessible_assets: List[str] = Field(default_factory=list)
 
 
 class NegotiationResult(BaseModel):

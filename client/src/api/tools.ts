@@ -143,3 +143,47 @@ export function useDeleteTool() {
     },
   });
 }
+
+// ---------------------------------------------------------------------------
+// Tool Coverage (Phase B2 — feeds the Tool Studio "Coverage" tab)
+// ---------------------------------------------------------------------------
+
+export interface ToolCoverageColumn {
+  name: string;
+  data_type: string | null;
+  sample_values: Array<string | number | boolean | null> | null;
+  business_attribute: string | null;
+  business_entity: string | null;
+  business_domain: string | null;
+  map_confidence: number | null;
+}
+
+export interface ToolCoverageAsset {
+  source_name: string | null;
+  source_uri: string | null;
+  asset_fq_name: string;
+  asset_type: string | null;
+  row_count: number | null;
+  columns: ToolCoverageColumn[];
+}
+
+export interface ToolCoverageResponse {
+  trace_id: string;
+  tool_id: string;
+  tool_name: string;
+  tool_type: string;
+  assets: ToolCoverageAsset[];
+  business_entities_covered: string[];
+}
+
+export function useToolCoverage(toolId: string | undefined) {
+  return useQuery<ToolCoverageResponse>({
+    queryKey: ['tool-coverage', toolId],
+    queryFn: async () => {
+      const { data } = await apiClient.get(`/v1/catalog/tools/${toolId}/coverage`);
+      return data;
+    },
+    enabled: !!toolId,
+    staleTime: 30_000,
+  });
+}

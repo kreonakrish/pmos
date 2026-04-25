@@ -13,34 +13,57 @@ from app.utils.logger import logger
 
 
 class Neo4jAdapter:
-    """Wraps the neo4j AsyncDriver with structured logging and health check."""
+    """Wraps the neo4j AsyncDriver with structured logging and health check.
 
-    def __init__(self) -> None:
+    Accepts an optional ``name`` plus per-instance connection overrides so
+    callers can spin up a second adapter bound to a different Neo4j (e.g. the
+    Business Ontology graph) without duplicating the class.
+    """
+
+    def __init__(
+        self,
+        name: str = "execution",
+        uri: Optional[str] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        database: Optional[str] = None,
+    ) -> None:
         self._driver: Optional[AsyncDriver] = None
+        self.name = name
+        self._uri = uri if uri is not None else settings.neo4j_uri
+        self._user = user if user is not None else settings.neo4j_user
+        self._password = password if password is not None else settings.neo4j_password
+        self._database = database if database is not None else settings.neo4j_database
 
     async def connect(self) -> None:
         self._driver = AsyncGraphDatabase.driver(
-            settings.neo4j_uri,
-            auth=(settings.neo4j_user, settings.neo4j_password),
+            self._uri,
+            auth=(self._user, self._password),
         )
         logger.info(
             "Neo4j driver initialised",
             layer="adapter",
-            target=settings.neo4j_uri,
+            name=self.name,
+            target=self._uri,
         )
 
     async def close(self) -> None:
         if self._driver:
             await self._driver.close()
-            logger.info("Neo4j driver closed", layer="adapter")
+            logger.info("Neo4j driver closed", layer="adapter", name=self.name)
 
     async def health_check(self) -> bool:
         try:
-            async with self._driver.session(database=settings.neo4j_database) as session:
+            async with self._driver.session(database=self._database) as session:
                 await session.run("RETURN 1")
             return True
         except Exception as exc:
-            logger.error("Neo4j health check failed", layer="adapter", error=str(exc))
+            logger.error(
+                "Neo4j health check failed",
+                layer="adapter",
+                name=self.name,
+                error=str(exc),
+            )
             return False
 
     async def run_query(
@@ -51,12 +74,13 @@ class Neo4jAdapter:
     ) -> List[Dict[str, Any]]:
         """Execute a Cypher query and return list of record dicts."""
         params = parameters or {}
-        async with self._driver.session(database=settings.neo4j_database) as session:
+        async with self._driver.session(database=self._database) as session:
             result = await session.run(cypher, **params)
             records = await result.data()
         logger.debug(
             "Neo4j query executed",
             layer="adapter",
+            name=self.name,
             cypher=cypher[:120],
             rows=len(records),
             trace_id=trace_id,
@@ -109,6 +133,11 @@ class Neo4jAdapter:
         iteration: int,
         max_retries: int = 3,
         trace_id: str = "",
+        canonical_entities: Optional[List[str]] = None,
+        dataset_bindings: Optional[List[str]] = None,
+        intent: Optional[str] = None,
+        domain: Optional[str] = None,
+        ontology_versions: Optional[List[str]] = None,
     ) -> None:
         cypher = """
         CREATE (n:TaskNode {
@@ -123,6 +152,11 @@ class Neo4jAdapter:
           criticality: $criticality,
           max_retries: $max_retries,
           retry_count: 0,
+          canonical_entities: $canonical_entities,
+          dataset_bindings: $dataset_bindings,
+          intent: $intent,
+          domain: $domain,
+          ontology_versions: $ontology_versions,
           created_at: datetime()
         })
         """
@@ -138,6 +172,11 @@ class Neo4jAdapter:
                 "iteration": iteration,
                 "criticality": criticality,
                 "max_retries": max_retries,
+                "canonical_entities": canonical_entities or [],
+                "dataset_bindings": dataset_bindings or [],
+                "intent": intent,
+                "domain": domain,
+                "ontology_versions": ontology_versions or [],
             },
             trace_id=trace_id,
         )

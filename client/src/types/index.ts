@@ -3,6 +3,8 @@
  * All domain models used across pages, components, stores & hooks
  * --------------------------------------------------------------- */
 
+import type { Visualization } from '@/api/visualization';
+
 /* ---- Conversations & Messages ---- */
 
 export interface Conversation {
@@ -13,6 +15,19 @@ export interface Conversation {
   updated_at: string;
   status: 'active' | 'archived' | 'deleted';
   message_count: number;
+}
+
+/**
+ * Free-form metadata bag carried on assistant messages. Backend writes
+ * this as a JSON column; we narrow the well-known keys here. Anything
+ * else can still be read via the index signature.
+ */
+export interface MessageMetadata {
+  visualizations?: Visualization[];
+  clarification?: boolean;
+  auditor_issue_id?: string;
+  auditor_issue_kind?: string;
+  [key: string]: unknown;
 }
 
 export interface Message {
@@ -29,6 +44,7 @@ export interface Message {
   tool_calls?: ToolCall[];
   steps?: PipelineStep[];
   course_correction?: CourseCorrection;
+  metadata?: MessageMetadata;
   timestamp: string;
 }
 

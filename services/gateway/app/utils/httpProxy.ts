@@ -35,6 +35,18 @@ export async function proxyRequest(
     headers['x-api-key'] = req.headers['x-api-key'] as string;
   }
 
+  // Propagate the resolved user identity so downstream FastAPI services
+  // can do their own RBAC lookup without re-decoding the JWT. The gateway
+  // is the trust boundary: by the time we get here, authMiddleware has
+  // already verified the signature.
+  const reqUser = (req as Request & { user?: { uid?: number; sub?: string } }).user;
+  if (reqUser?.uid !== undefined) {
+    headers['x-user-id'] = String(reqUser.uid);
+  }
+  if (reqUser?.sub) {
+    headers['x-user-sub'] = reqUser.sub;
+  }
+
   const body = options.transformRequest ? options.transformRequest(req.body) : req.body;
 
   const axiosConfig: AxiosRequestConfig = {

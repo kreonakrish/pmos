@@ -64,9 +64,32 @@ export interface CatalogColumn {
   mapping_status: string | null;
 }
 
+export interface OntologyMappedColumn {
+  column_fq_name: string;
+  column_name: string | null;
+  asset_fq_name: string | null;
+  source_name: string | null;
+  source_uri: string | null;
+  confidence: number | null;
+  status: string | null;
+  is_canonical: boolean;
+}
+
+export interface OntologyAttribute {
+  name: string;
+  fq_name: string;
+  mapped_columns: OntologyMappedColumn[];
+}
+
+export interface OntologyEntity {
+  entity: string;
+  attributes: number;                       // count (legacy)
+  attribute_list?: OntologyAttribute[];     // full details (drill-down)
+}
+
 export interface OntologyDomain {
   domain: string;
-  entities: Array<{ entity: string; attributes: number }>;
+  entities: OntologyEntity[];
 }
 
 export interface MappingDecision {
@@ -95,6 +118,25 @@ export interface MappingDecision {
   reviewed_at: string | null;
   reward_signal: number | null;
   created_at: string;
+  // Phase E4 — current ontology version for the mapping (when known).
+  version?: number | null;
+}
+
+export interface MappingHistoryEntry {
+  version: number;
+  status: string | null;
+  confidence: number | null;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  effective_from: string | null;
+  effective_until: string | null;
+  column_fq_name: string | null;
+}
+
+export interface MappingHistoryResponse {
+  attribute_fq_name: string;
+  history: MappingHistoryEntry[];
+  count: number;
 }
 
 export interface MappingDecisionSummary {
@@ -219,6 +261,20 @@ export interface ReviewAction {
   auditor_entity?: string;
   auditor_attribute?: string;
   auditor_note?: string;
+}
+
+export function useMappingHistory(attributeFqName: string | null) {
+  return useQuery<MappingHistoryResponse>({
+    queryKey: ['catalog', 'mapping-history', attributeFqName ?? ''],
+    queryFn: async () =>
+      (
+        await apiClient.get('/v1/catalog/mapping-history', {
+          params: { attribute_fq_name: attributeFqName },
+        })
+      ).data,
+    enabled: !!attributeFqName,
+    staleTime: 15_000,
+  });
 }
 
 export function useReviewMapping() {

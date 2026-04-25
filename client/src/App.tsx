@@ -27,8 +27,11 @@ import ScoringPage from '@/pages/Scoring';
 import MemoryPage from '@/pages/Memory';
 import DocumentsPage from '@/pages/Documents';
 import ModelGovernancePage from '@/pages/ModelGovernance';
+import AuditorIssuesPage from '@/pages/AuditorIssues';
 import MLInsightsPage from '@/pages/MLInsights';
 import DataCatalogPage from '@/pages/DataCatalog';
+import SchemaGraphPage from '@/pages/SchemaGraph';
+import TranslatorPage from '@/pages/Translator';
 import SettingsPage from '@/pages/Settings';
 import LogsPage from '@/pages/Logs';
 
@@ -150,11 +153,20 @@ export default function App() {
               <Route path="/model-governance" element={
                 <PermissionGate anyOf={['models.read']} redirect><ModelGovernancePage /></PermissionGate>
               } />
+              <Route path="/auditor-issues" element={
+                <PermissionGate anyOf={['models.read']} redirect><AuditorIssuesPage /></PermissionGate>
+              } />
               <Route path="/ml-insights" element={
                 <PermissionGate anyOf={['ml_insights.read']} redirect><MLInsightsPage /></PermissionGate>
               } />
               <Route path="/data-catalog" element={
                 <PermissionGate anyOf={['catalog.read']} redirect><DataCatalogPage /></PermissionGate>
+              } />
+              <Route path="/schema-graph" element={
+                <PermissionGate anyOf={['catalog.read']} redirect><SchemaGraphPage /></PermissionGate>
+              } />
+              <Route path="/translator" element={
+                <PermissionGate anyOf={['catalog.read']} redirect><TranslatorPage /></PermissionGate>
               } />
               <Route path="/logs" element={
                 <PermissionGate anyOf={['logs.read']} redirect><LogsPage /></PermissionGate>

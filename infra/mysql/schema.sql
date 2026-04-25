@@ -345,6 +345,60 @@ CREATE TABLE IF NOT EXISTS messages (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- =============================================================================
+-- AUDIT EVENTS — system-wide audit log (Phase E2)
+-- One row per meaningful hop in any pipeline (orchestrator, translator, ...)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    event_id      CHAR(36) PRIMARY KEY,
+    trace_id      CHAR(36) NOT NULL,
+    actor         VARCHAR(255) NOT NULL,            -- 'system', user_id, agent_id, or service name
+    actor_type    ENUM('USER','AGENT','SERVICE','SYSTEM') NOT NULL DEFAULT 'SYSTEM',
+    action        VARCHAR(100) NOT NULL,            -- e.g. 'pipeline.intake', 'translator.translate', 'agent.bid_won'
+    resource_type VARCHAR(80),                      -- 'TaskGraph','TaskNode','Tool','Crawler','Conversation'
+    resource_id   VARCHAR(255),
+    severity      ENUM('INFO','WARN','ERROR') NOT NULL DEFAULT 'INFO',
+    payload       JSON,
+    ts            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    INDEX idx_trace (trace_id),
+    INDEX idx_actor (actor, ts),
+    INDEX idx_action (action, ts),
+    INDEX idx_resource (resource_type, resource_id),
+    INDEX idx_ts (ts)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- =============================================================================
+-- SYNONYM PROPOSALS — Phase F5
+-- Post-crawl LLM-clustered BusinessAttribute synonyms / duplications / grain
+-- variants. Data Stewards review and pick a canonical attribute + canonical
+-- physical column; on CONFIRM, non-canonical BAs are merged into the canonical
+-- one, their MAPS_TO edges are superseded, and the canonical BA gains a new
+-- CANONICAL MAPS_TO to the chosen physical column.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS synonym_proposals (
+    proposal_id      CHAR(36) PRIMARY KEY,
+    kind             ENUM('SYNONYM','DUPLICATION','GRAIN','NAMING','OTHER') NOT NULL,
+    domain           VARCHAR(120),
+    members_json     JSON NOT NULL,          -- list of BusinessAttribute fq_names in this cluster
+    member_columns_json JSON,                -- list of {ba_fq_name, column_fq_name, source_uri, sample_values}
+    suggested_canonical_attr  VARCHAR(255),  -- LLM's best guess, auditor can override
+    suggested_canonical_column VARCHAR(512), -- LLM's best guess, auditor can override
+    rationale        TEXT,
+    confidence       FLOAT,
+    status           ENUM('PROPOSED','IN_REVIEW','CONFIRMED','REJECTED','APPLIED','SUPERSEDED')
+                          NOT NULL DEFAULT 'PROPOSED',
+    chosen_canonical_attr   VARCHAR(255),    -- auditor's pick
+    chosen_canonical_column VARCHAR(512),    -- auditor's pick
+    reviewed_by      VARCHAR(255),
+    reviewed_at      DATETIME(3),
+    applied_at       DATETIME(3),
+    created_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    INDEX idx_status (status, kind),
+    INDEX idx_domain (domain, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- =============================================================================
 -- SEED DATA — Default global scoring weights
 -- w1=relevance, w2=accuracy, w3=tool_success, w4=latency, w5=memory_util, w6=validation
 -- =============================================================================

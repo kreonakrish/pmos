@@ -91,6 +91,11 @@ class GraphManager:
         iteration: int = 0,
         max_retries: int = 3,
         trace_id: str = "",
+        canonical_entities: Optional[List[str]] = None,
+        dataset_bindings: Optional[List[str]] = None,
+        intent: Optional[str] = None,
+        domain: Optional[str] = None,
+        ontology_versions: Optional[List[str]] = None,
     ) -> str:
         node_id = str(uuid.uuid4())
         await self._neo4j.create_task_node(
@@ -104,6 +109,11 @@ class GraphManager:
             iteration=iteration,
             max_retries=max_retries,
             trace_id=trace_id,
+            canonical_entities=canonical_entities,
+            dataset_bindings=dataset_bindings,
+            intent=intent,
+            domain=domain,
+            ontology_versions=ontology_versions,
         )
         return node_id
 

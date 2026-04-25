@@ -72,6 +72,17 @@ class CapabilityNegotiationService:
             trace_id=trace_id,
         )
 
+        # 1a. Dataset-binding filter (Phase 21).
+        # When the TaskNode carries dataset_bindings (Translator stamped them
+        # in pipeline._step2), demote bids whose tools cannot reach those
+        # physical assets. Bids stay in `all_bids` for audit, but lose
+        # eligibility and are excluded from ranking.
+        await self._apply_dataset_binding_filter(
+            bid_request=bid_request,
+            bids=all_bids,
+            trace_id=trace_id,
+        )
+
         # 2. Rank eligible bids
         ranked = self.rank_bids(all_bids)
 
@@ -224,11 +235,99 @@ class CapabilityNegotiationService:
 
         tool_names = [t.get("name", "") for t in tools]
         tool_ids = [str(t.get("id", t.get("tool_id", ""))) for t in tools]
+        # Also collect tool_uuid (the ``tool_id`` UUID written into Neo4j by
+        # toolService.linkToolToDataSource) — agents need this to resolve
+        # their physical reach in the catalog graph.
+        tool_uuids = [str(t.get("tool_id") or t.get("uuid") or "") for t in tools]
+        tool_uuids = [u for u in tool_uuids if u]
         tool_descriptions = []
         for t in tools:
             desc = f"- {t.get('name', 'unknown')} ({t.get('tool_type', 'unknown')}): {t.get('description', '')}"
             tool_descriptions.append(desc)
         tools_text = "\n".join(tool_descriptions) if tool_descriptions else "No tools available."
+
+        # 1b. Bid-time grounding: for any task that carries dataset_bindings,
+        # walk Neo4j (Tool→ACCESSES→DataSource→HAS_ASSET→DataAsset→HAS_COLUMN
+        # →DataColumn ←MAPS_TO← BusinessAttribute) to find which assets THIS
+        # agent's tools can actually read, plus the columns + sample values
+        # for each. The data is injected into the bid prompt so the LLM bids
+        # with grounded knowledge of the physical schema, not just keyword
+        # match. The bid carries ``accessible_assets`` and
+        # ``dataset_access_verified`` so downstream ranking can prefer
+        # agents whose tools demonstrably reach the required data.
+        accessible_metadata: Dict[str, List[Dict[str, Any]]] = {}
+        accessible_assets: List[str] = []
+        if bid_request.dataset_bindings and tool_uuids:
+            try:
+                rows = await self._neo4j.run_query(
+                    """
+                    UNWIND $bindings AS binding
+                    MATCH (a:DataAsset {fq_name: binding})
+                    OPTIONAL MATCH (ds:DataSource)-[:HAS_ASSET]->(a)
+                    OPTIONAL MATCH (t:Tool)-[:ACCESSES]->(ds)
+                      WHERE t.tool_id IN $tool_uuids
+                    WITH binding, a, collect(DISTINCT t.tool_id) AS reaching_tools
+                    WHERE size(reaching_tools) > 0
+                    OPTIONAL MATCH (a)-[:HAS_COLUMN]->(col:DataColumn)
+                    OPTIONAL MATCH (ba:BusinessAttribute)-[map:MAPS_TO]->(col)
+                      WHERE map.effective_until IS NULL
+                    RETURN binding AS asset_fq_name,
+                           collect(DISTINCT {
+                             column: col.name,
+                             data_type: col.data_type,
+                             sample_values: col.sample_values,
+                             business_attribute: ba.name,
+                             business_entity: ba.entity,
+                             business_domain: ba.domain,
+                             map_confidence: map.confidence
+                           }) AS columns,
+                           reaching_tools[0] AS bound_tool_id
+                    """,
+                    {
+                        "bindings": list(bid_request.dataset_bindings),
+                        "tool_uuids": tool_uuids,
+                    },
+                    trace_id=trace_id,
+                )
+                for row in rows or []:
+                    asset = row.get("asset_fq_name")
+                    cols = [c for c in (row.get("columns") or []) if c and c.get("column")]
+                    if asset and cols:
+                        accessible_metadata[asset] = cols
+                        accessible_assets.append(asset)
+            except Exception as exc:
+                logger.warning(
+                    "Bid-time metadata lookup failed (non-fatal)",
+                    layer="service",
+                    agent_id=agent.agent_id,
+                    error=str(exc),
+                    trace_id=trace_id,
+                )
+
+        # Render the accessible-data summary for the bid prompt. We cap at a
+        # handful of columns per asset and at most 3 sample values per column
+        # so prompt size stays bounded — the LLM doesn't need every row, just
+        # enough to recognize the schema.
+        data_text_lines: List[str] = []
+        if accessible_metadata:
+            for asset, cols in list(accessible_metadata.items())[:6]:
+                data_text_lines.append(f"\nASSET {asset}:")
+                for c in cols[:12]:
+                    name = c.get("column")
+                    dtype = c.get("data_type") or "?"
+                    ba = c.get("business_attribute")
+                    samples = c.get("sample_values") or []
+                    if isinstance(samples, list):
+                        samples = [str(s)[:40] for s in samples[:3]]
+                        samples_text = f"  samples: {samples}" if samples else ""
+                    else:
+                        samples_text = ""
+                    line = f"  - {name} ({dtype})"
+                    if ba:
+                        line += f"  ↔ {c.get('business_domain') or '?'}.{c.get('business_entity') or '?'}.{ba}"
+                    line += samples_text
+                    data_text_lines.append(line)
+        data_text = "\n".join(data_text_lines)
 
         # 2. Assemble memory context (best-effort)
         memory_relevance = 0.0
@@ -266,6 +365,24 @@ class CapabilityNegotiationService:
             f"YOUR NAME: {agent.name}\n"
             f"YOUR TOOLS:\n{tools_text}\n\n"
         )
+
+        if bid_request.dataset_bindings:
+            if data_text:
+                bid_prompt += (
+                    "REQUIRED PHYSICAL ASSETS (the orchestrator's translator already "
+                    "matched the question to these — use this concrete schema and "
+                    "sample-value evidence to ground your bid):\n"
+                    f"{data_text}\n\n"
+                )
+            else:
+                bid_prompt += (
+                    "REQUIRED PHYSICAL ASSETS:\n"
+                    f"  {bid_request.dataset_bindings}\n"
+                    "WARNING: none of your tools demonstrably reach these assets in "
+                    "the catalog graph. Bid LOW confidence (<= 0.3) unless you "
+                    "have a strong reason to believe you can answer without them.\n\n"
+                )
+
         if memory_context:
             bid_prompt += f"YOUR RELEVANT MEMORY/CONTEXT:\n{memory_context[:500]}\n\n"
 
@@ -273,12 +390,15 @@ class CapabilityNegotiationService:
             "Respond with ONLY a JSON object (no other text):\n"
             "{\n"
             '  "confidence": <float 0.0-1.0, how confident you are you can handle this task>,\n'
-            '  "reasoning": "<brief explanation of why you can or cannot handle this task>",\n'
+            '  "reasoning": "<brief explanation grounded in the schema/samples above>",\n'
             '  "eligible": <true if you can attempt the task, false if completely unqualified>\n'
             "}\n\n"
-            "IMPORTANT: If you have database tools and the task involves data/SQL/database queries, "
-            "bid HIGH confidence. If you have API tools and the task involves web/API calls, bid HIGH. "
-            "If you have no relevant tools for the task type, bid lower but still eligible if you have general knowledge."
+            "IMPORTANT: When REQUIRED PHYSICAL ASSETS is present and your tools "
+            "DEMONSTRABLY reach them with matching columns (per the schema "
+            "summary), bid HIGH (≥0.8). When the assets are required but your "
+            "tools cannot reach them, bid LOW (≤0.3) — keyword/tool-type match "
+            "without dataset access is not sufficient. For non-data tasks, "
+            "score on tool-task fit as before."
         )
 
         try:
@@ -315,6 +435,35 @@ class CapabilityNegotiationService:
             reasoning = f"Heuristic bid (LLM failed): success={agent.success_rate}, accuracy={agent.accuracy_rate}"
             eligible = True
 
+        # If the task carried dataset_bindings, stamp the bid with the
+        # outcome of the bid-time grounding check. This is what the post-
+        # filter ``_apply_dataset_binding_filter`` would have computed
+        # afterwards, but doing it here makes the bid both grounded and
+        # self-verified — the LLM saw the schema/samples; downstream ranking
+        # already knows whether the agent can reach the data.
+        if bid_request.dataset_bindings:
+            verified = bool(accessible_assets)
+            bid_response = BidResponse(
+                agent_id=agent.agent_id,
+                agent_name=agent.name,
+                confidence=confidence,
+                memory_relevance=memory_relevance,
+                estimated_latency_ms=0,
+                tools_available=tool_names,
+                tool_ids=tool_ids,
+                reasoning=reasoning,
+                eligible=eligible and (verified or not bid_request.dataset_bindings),
+                foundation_model=model,
+                provider=provider,
+                dataset_access_verified=verified,
+                accessible_assets=accessible_assets,
+            )
+            if not verified and bid_request.dataset_bindings:
+                bid_response.error = (
+                    "dataset_access_unverified: no bound tool reaches required assets"
+                )
+            return bid_response
+
         return BidResponse(
             agent_id=agent.agent_id,
             agent_name=agent.name,
@@ -327,6 +476,125 @@ class CapabilityNegotiationService:
             eligible=eligible,
             foundation_model=model,
             provider=provider,
+        )
+
+    # ------------------------------------------------------------------
+    # Dataset-binding filter
+    # ------------------------------------------------------------------
+
+    async def _apply_dataset_binding_filter(
+        self,
+        bid_request: BidRequest,
+        bids: List[BidResponse],
+        trace_id: str = "",
+    ) -> None:
+        """Demote bids whose tools cannot reach the required DataAssets.
+
+        When ``bid_request.dataset_bindings`` is empty the filter is a no-op —
+        non-data tasks (chat, summaries, system queries) bid as before.
+
+        For each binding, we ask Neo4j which tools ``ACCESSES`` a DataSource
+        that ``HAS_ASSET`` that DataAsset. A bid is **dataset-access verified**
+        iff its ``tool_ids`` intersect the union of those tool sets.
+
+        Failure mode: if the Neo4j lookup fails we log and leave bids
+        untouched (fail-open) — better to over-allow than to drop everyone
+        when the catalog is briefly unreachable.
+        """
+        bindings = [b for b in (bid_request.dataset_bindings or []) if b]
+        if not bindings:
+            return
+
+        # Per-asset tool reachability map.
+        try:
+            rows = await self._neo4j.run_query(
+                """
+                UNWIND $bindings AS binding
+                MATCH (a:DataAsset {fq_name: binding})
+                OPTIONAL MATCH (ds:DataSource)-[:HAS_ASSET]->(a)
+                OPTIONAL MATCH (t:Tool)-[:ACCESSES]->(ds)
+                RETURN binding AS asset_fq_name,
+                       collect(DISTINCT t.tool_id) AS tool_ids
+                """,
+                {"bindings": bindings},
+                trace_id=trace_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Dataset-binding filter Neo4j lookup failed — fail-open",
+                layer="service",
+                trace_id=trace_id,
+                error=str(exc),
+            )
+            return
+
+        asset_to_tools: Dict[str, set] = {}
+        for row in rows or []:
+            asset = row.get("asset_fq_name")
+            tids = {str(t) for t in (row.get("tool_ids") or []) if t}
+            if asset:
+                asset_to_tools[asset] = tids
+
+        all_eligible_tools: set = set()
+        for tids in asset_to_tools.values():
+            all_eligible_tools |= tids
+
+        if not all_eligible_tools:
+            # No tool in the catalog can reach any of the required assets.
+            # Mark every bid as unverified, but DO NOT zero eligibility —
+            # ranking will still pick a winner so the pipeline can run with
+            # the fallback default agent.
+            logger.warning(
+                "No tools reach the required assets — keeping bids but flagging unverified",
+                layer="service",
+                trace_id=trace_id,
+                bindings=bindings,
+            )
+            for bid in bids:
+                bid.dataset_access_verified = False
+                bid.accessible_assets = []
+            return
+
+        verified_count = 0
+        demoted: List[Dict[str, Any]] = []
+
+        for bid in bids:
+            bid_tool_ids = {str(t) for t in (bid.tool_ids or []) if t}
+
+            # Compute which of the required assets this bid can reach.
+            reachable: List[str] = [
+                asset for asset, tids in asset_to_tools.items()
+                if bid_tool_ids & tids
+            ]
+            bid.accessible_assets = reachable
+            bid.dataset_access_verified = bool(reachable)
+
+            if not reachable:
+                # The agent claimed capability but has no tool reaching the
+                # data — drop it from ranking. Audit-visible: the bid stays
+                # in ``all_bids`` with eligible=False and a reason in
+                # ``error`` so governance traces can show why.
+                bid.eligible = False
+                bid.error = (
+                    bid.error
+                    or "dataset_access_unverified: no bound tool reaches required assets"
+                )
+                demoted.append({
+                    "agent_id": bid.agent_id,
+                    "agent_name": bid.agent_name,
+                    "tool_ids": list(bid_tool_ids),
+                })
+            else:
+                verified_count += 1
+
+        logger.info(
+            "Dataset-binding filter applied",
+            layer="service",
+            trace_id=trace_id,
+            bindings=bindings,
+            total_bids=len(bids),
+            verified=verified_count,
+            demoted=len(demoted),
         )
 
     # ------------------------------------------------------------------

@@ -18,6 +18,10 @@ const schema = z.object({
   TOOL_HEALTH_INTERVAL_SEC: z.coerce.number().default(60),
   LOG_LEVEL: z.enum(['DEBUG', 'INFO', 'WARN', 'ERROR']).default('INFO'),
   NODE_ENV: z.string().default('development'),
+  NEO4J_URI: z.string().default(''),
+  NEO4J_USER: z.string().default('neo4j'),
+  NEO4J_PASSWORD: z.string().default(''),
+  NEO4J_DATABASE: z.string().default('neo4j'),
 });
 
 function parseConfig() {

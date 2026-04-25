@@ -62,6 +62,15 @@ class TaskNode(BaseModel):
     completed_at: Optional[datetime] = None
     result: Optional[str] = None
 
+    # Ontology bindings — written by the Translator service. Empty when the
+    # translator returned no ontology matches and decomposition fell back to
+    # the bare LLM prompt.
+    canonical_entities: List[str] = Field(default_factory=list)
+    dataset_bindings: List[str] = Field(default_factory=list)
+    intent: Optional[str] = None
+    domain: Optional[str] = None
+    ontology_versions: List[str] = Field(default_factory=list)
+
 
 class TaskGraph(BaseModel):
     graph_id: str

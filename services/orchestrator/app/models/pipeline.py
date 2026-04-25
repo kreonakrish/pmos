@@ -25,6 +25,21 @@ class ChatResponse(BaseModel):
     trace_id: str
     steps: List[Dict[str, Any]] = Field(default_factory=list)
 
+    # Phase F4 — clarification surface. When the translator flagged
+    # ambiguity or zero-resolution, the chat response carries the follow-up
+    # question and/or the auditor issue id for stewardship.
+    clarification_needed: bool = False
+    clarification_question: Optional[str] = None
+    auditor_issue_id: Optional[str] = None
+    auditor_issue_kind: Optional[str] = None
+
+    # Charts (Ext2 + viz add-on) — populated when a deterministic Report
+    # short-circuit fires. Each entry matches ``shared.visualization``'s
+    # Visualization shape: {type, title, description, x_field, y_fields,
+    # data, inferred_from, truncated_from}. Frontend renders these as
+    # bar/line/pie/area/table cards under the markdown body.
+    visualizations: List[Dict[str, Any]] = Field(default_factory=list)
+
 
 class StreamChunk(BaseModel):
     type: str  # step | tool_call | score | course_correct | complete | error

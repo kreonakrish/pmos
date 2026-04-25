@@ -16,9 +16,11 @@ from app.adapters.llm_adapter import LLMAdapter
 from app.adapters.memory_adapter import MemoryAdapter
 from app.adapters.meta_adapter import MetaAdapter
 from app.adapters.neo4j_adapter import Neo4jAdapter
+from app.adapters.ontology_neo4j import build_ontology_adapter
 from app.adapters.rag_adapter import RAGAdapter
 from app.adapters.redis_adapter import RedisAdapter
 from app.adapters.scoring_adapter import ScoringAdapter
+from app.adapters.translator_adapter import TranslatorAdapter
 from app.config import settings
 from app.routes import catalog as catalog_router
 from app.routes import conversations as conv_router
@@ -43,8 +45,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Adapters
     neo4j = Neo4jAdapter()
+    ontology_neo4j = build_ontology_adapter()
     redis = RedisAdapter()
     await neo4j.connect()
+    await ontology_neo4j.connect()
     await redis.connect()
 
     llm = LLMAdapter()
@@ -52,6 +56,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scoring = ScoringAdapter()
     rag = RAGAdapter()
     meta = MetaAdapter()
+
+    translator = TranslatorAdapter()
 
     pipeline = PipelineService(
         neo4j=neo4j,
@@ -61,12 +67,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         scoring=scoring,
         rag=rag,
         meta=meta,
+        translator=translator,
     )
 
     agent_mgmt = AgentMgmtAdapter()
 
     # Attach to app state
     app.state.neo4j = neo4j
+    app.state.ontology_neo4j = ontology_neo4j
     app.state.redis = redis
     app.state.pipeline = pipeline
     app.state.agent_mgmt = agent_mgmt
@@ -96,6 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except asyncio.CancelledError:
         pass
     await neo4j.close()
+    await ontology_neo4j.close()
     await redis.close()
 
 

@@ -20,10 +20,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import mysql.connector
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from app.config import settings
+from app.middleware.rbac import require_permission
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/v1/orchestrator/conversations", tags=["conversations"])
@@ -188,7 +189,7 @@ async def list_conversations(
             conn.close()
 
 
-@router.post("")
+@router.post("", dependencies=[Depends(require_permission("conversations.write"))])
 async def create_conversation(
     body: CreateConversationRequest,
     request: Request,
@@ -305,7 +306,10 @@ async def get_conversation(
             conn.close()
 
 
-@router.patch("/{conversation_id}")
+@router.patch(
+    "/{conversation_id}",
+    dependencies=[Depends(require_permission("conversations.write"))],
+)
 async def update_conversation(
     conversation_id: str,
     body: UpdateConversationRequest,
@@ -401,7 +405,10 @@ async def update_conversation(
             conn.close()
 
 
-@router.delete("/{conversation_id}")
+@router.delete(
+    "/{conversation_id}",
+    dependencies=[Depends(require_permission("conversations.write"))],
+)
 async def delete_conversation(
     conversation_id: str,
     request: Request,
@@ -528,7 +535,10 @@ async def list_messages(
             conn.close()
 
 
-@router.post("/{conversation_id}/messages")
+@router.post(
+    "/{conversation_id}/messages",
+    dependencies=[Depends(require_permission("conversations.write"))],
+)
 async def create_message(
     conversation_id: str,
     body: CreateMessageRequest,
@@ -635,6 +645,29 @@ async def create_message(
                         "model": result.get("model"),
                         "latency_ms": result.get("latency_ms"),
                     }
+                    # F7 — when this assistant turn is a translator
+                    # clarification ("can you tell me which subdomain..."),
+                    # persist the markers so the next user reply can be
+                    # stitched back into the translator's prior_turns.
+                    if result.get("clarification_needed"):
+                        metadata["clarification"] = True
+                        metadata["clarification_question"] = result.get(
+                            "clarification_question"
+                        )
+                    if result.get("auditor_issue_id"):
+                        metadata["auditor_issue_id"] = result.get("auditor_issue_id")
+                        metadata["auditor_issue_kind"] = result.get(
+                            "auditor_issue_kind"
+                        )
+                    # Charts — when a deterministic Report fired, the
+                    # pipeline returns a ``visualizations`` list. Persist
+                    # it on the assistant message so the chat UI can
+                    # render bar/line/pie cards under the markdown body.
+                    viz = result.get("visualizations") or []
+                    if viz:
+                        metadata["visualizations"] = viz
+                    if result.get("matched_report_id"):
+                        metadata["matched_report_id"] = result.get("matched_report_id")
 
                     conn2 = get_db()
                     cursor2 = conn2.cursor()

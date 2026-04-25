@@ -22,8 +22,11 @@ import MemoryIcon from '@mui/icons-material/Memory';
 import DescriptionIcon from '@mui/icons-material/Description';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import PolicyIcon from '@mui/icons-material/Policy';
+import ReportProblemIcon from '@mui/icons-material/ReportProblem';
 import ScienceIcon from '@mui/icons-material/Science';
 import StorageIcon from '@mui/icons-material/Storage';
+import SchemaIcon from '@mui/icons-material/Schema';
+import TranslateIcon from '@mui/icons-material/Translate';
 import TerminalIcon from '@mui/icons-material/Terminal';
 import SettingsIcon from '@mui/icons-material/Settings';
 import PeopleIcon from '@mui/icons-material/People';
@@ -78,14 +81,17 @@ const NAV_SECTIONS: NavSection[] = [
   {
     title: 'Data Sources',
     items: [
-      { label: 'Data Catalog', path: '/data-catalog', icon: <StorageIcon />, anyOf: ['catalog.read'] },
+      { label: 'Data Catalog', path: '/data-catalog', icon: <StorageIcon />,   anyOf: ['catalog.read'] },
+      { label: 'Schema Graph', path: '/schema-graph', icon: <SchemaIcon />,    anyOf: ['catalog.read'] },
+      { label: 'Translator',   path: '/translator',   icon: <TranslateIcon />, anyOf: ['catalog.read'] },
     ],
   },
   {
     title: 'Govern',
     items: [
-      { label: 'Model Governance', path: '/model-governance', icon: <PolicyIcon />,  anyOf: ['models.read'] },
-      { label: 'ML Insights',      path: '/ml-insights',      icon: <ScienceIcon />, anyOf: ['ml_insights.read'] },
+      { label: 'Model Governance', path: '/model-governance', icon: <PolicyIcon />,         anyOf: ['models.read'] },
+      { label: 'Auditor Issues',   path: '/auditor-issues',   icon: <ReportProblemIcon />,  anyOf: ['models.read'] },
+      { label: 'ML Insights',      path: '/ml-insights',      icon: <ScienceIcon />,        anyOf: ['ml_insights.read'] },
     ],
   },
   {

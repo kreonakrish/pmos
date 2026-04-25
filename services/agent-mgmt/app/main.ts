@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { config } from './config';
 import { mysqlAdapter } from './adapters/mysqlAdapter';
 import { redisAdapter } from './adapters/redisAdapter';
+import { neo4jAdapter } from './adapters/neo4jAdapter';
 import { toolHealthScheduler } from './services/toolHealthScheduler';
 import { logger } from './utils/logger';
 import { requestTotal, requestDurationSeconds } from './utils/metrics';
@@ -99,6 +100,7 @@ async function bootstrap(): Promise<void> {
 
     await mysqlAdapter.connect();
     redisAdapter.connect();
+    neo4jAdapter.connect();
 
     toolHealthScheduler.start();
 
@@ -115,7 +117,7 @@ async function bootstrap(): Promise<void> {
       toolHealthScheduler.stop();
 
       server.close(async () => {
-        await Promise.all([mysqlAdapter.close(), redisAdapter.close()]);
+        await Promise.all([mysqlAdapter.close(), redisAdapter.close(), neo4jAdapter.close()]);
         logger.info('agent-mgmt service stopped', 'main');
         process.exit(0);
       });

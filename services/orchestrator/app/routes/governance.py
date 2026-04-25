@@ -10,11 +10,15 @@ across:
   - Episodic memory (pmos.execution_episodes)
   - Neo4j TaskGraph + TaskNodes
   - Agent and tool metadata (pmos.agents, pmos.tools)
+  - Dedicated audit log (pmos.audit_events, Phase E2)
 
 Endpoints (all under /v1/governance):
-  GET /traces                         — list recent traces
-  GET /traces/{trace_id}              — full reasoning chain for a trace
-  GET /traces/by-conversation/{id}    — traces for a conversation
+  GET /traces                                  — list recent traces
+  GET /traces/{trace_id}                       — full reasoning chain for a trace
+  GET /traces/by-conversation/{id}             — traces for a conversation
+  GET /audit-events                            — filterable list (Phase E2)
+  GET /audit-events/by-trace/{trace_id}        — chronological events for a trace
+  GET /audit-events/summary                    — counts by action and severity
 """
 
 from __future__ import annotations
@@ -525,3 +529,320 @@ async def traces_by_conversation(
         (conversation_id,),
     )
     return {"trace_id": trace_id, "conversation_id": conversation_id, "traces": rows}
+
+
+# ── Audit events (Phase E2) ──────────────────────────────────────────────────
+_AUDIT_EVENT_COLUMNS = (
+    "event_id, trace_id, actor, actor_type, action, "
+    "resource_type, resource_id, severity, payload, ts"
+)
+
+
+@router.get("/audit-events")
+async def list_audit_events(
+    request: Request,
+    trace_id: Optional[str] = Query(None, description="Filter by trace_id"),
+    action: Optional[str] = Query(None, description="Filter by action prefix or exact match"),
+    actor: Optional[str] = Query(None, description="Filter by actor"),
+    severity: Optional[str] = Query(None, description="Filter by severity (INFO|WARN|ERROR)"),
+    resource_type: Optional[str] = Query(None, description="Filter by resource_type"),
+    resource_id: Optional[str] = Query(None, description="Filter by resource_id"),
+    from_: Optional[str] = Query(None, alias="from", description="ISO datetime lower bound"),
+    to: Optional[str] = Query(None, description="ISO datetime upper bound"),
+    limit: int = Query(200, ge=1, le=1000),
+) -> Dict[str, Any]:
+    """List audit events with optional filters.
+
+    Each filter is AND-combined. ``action`` matches via prefix when it ends with
+    a dot (``pipeline.``) so callers can pull "all pipeline events" easily.
+    """
+    req_trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if trace_id:
+        clauses.append("trace_id = %s")
+        params.append(trace_id)
+    if action:
+        if action.endswith("."):
+            clauses.append("action LIKE %s")
+            params.append(action + "%")
+        else:
+            clauses.append("action = %s")
+            params.append(action)
+    if actor:
+        clauses.append("actor = %s")
+        params.append(actor)
+    if severity:
+        clauses.append("severity = %s")
+        params.append(severity.upper())
+    if resource_type:
+        clauses.append("resource_type = %s")
+        params.append(resource_type)
+    if resource_id:
+        clauses.append("resource_id = %s")
+        params.append(resource_id)
+    if from_:
+        clauses.append("ts >= %s")
+        params.append(from_)
+    if to:
+        clauses.append("ts <= %s")
+        params.append(to)
+
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    sql = (
+        f"SELECT {_AUDIT_EVENT_COLUMNS} FROM audit_events {where} "
+        f"ORDER BY ts DESC LIMIT {int(limit)}"
+    )
+    try:
+        events = _fetch_all(sql, tuple(params))
+    except Exception as exc:
+        logger.error(
+            "audit_events list query failed",
+            layer="router",
+            error=str(exc),
+            trace_id=req_trace_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"error": str(exc), "trace_id": req_trace_id},
+        )
+
+    return {
+        "trace_id": req_trace_id,
+        "events": events,
+        "count": len(events),
+    }
+
+
+@router.get("/audit-events/by-trace/{target_trace_id}")
+async def audit_events_by_trace(
+    target_trace_id: str,
+    request: Request,
+) -> Dict[str, Any]:
+    """Return the full chronological audit-event list for a single trace_id."""
+    req_trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    try:
+        events = _fetch_all(
+            f"SELECT {_AUDIT_EVENT_COLUMNS} FROM audit_events "
+            f"WHERE trace_id = %s ORDER BY ts ASC",
+            (target_trace_id,),
+        )
+    except Exception as exc:
+        logger.error(
+            "audit_events by_trace query failed",
+            layer="router",
+            error=str(exc),
+            trace_id=req_trace_id,
+            target_trace_id=target_trace_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"error": str(exc), "trace_id": req_trace_id},
+        )
+    return {
+        "trace_id": req_trace_id,
+        "target_trace_id": target_trace_id,
+        "events": events,
+        "count": len(events),
+    }
+
+
+@router.get("/audit-events/summary")
+async def audit_events_summary(
+    request: Request,
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Return counts of audit events grouped by action and severity."""
+    req_trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if from_:
+        clauses.append("ts >= %s")
+        params.append(from_)
+    if to:
+        clauses.append("ts <= %s")
+        params.append(to)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+
+    try:
+        by_action = _fetch_all(
+            f"SELECT action, COUNT(*) AS n FROM audit_events {where} "
+            f"GROUP BY action ORDER BY n DESC",
+            tuple(params),
+        )
+        by_severity = _fetch_all(
+            f"SELECT severity, COUNT(*) AS n FROM audit_events {where} "
+            f"GROUP BY severity ORDER BY n DESC",
+            tuple(params),
+        )
+        total_rows = _fetch_all(
+            f"SELECT COUNT(*) AS n FROM audit_events {where}",
+            tuple(params),
+        )
+    except Exception as exc:
+        logger.error(
+            "audit_events summary query failed",
+            layer="router",
+            error=str(exc),
+            trace_id=req_trace_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"error": str(exc), "trace_id": req_trace_id},
+        )
+
+    total = int((total_rows[0].get("n") if total_rows else 0) or 0)
+    return {
+        "trace_id": req_trace_id,
+        "total": total,
+        "by_action": by_action,
+        "by_severity": by_severity,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase F3 — Auditor Issues
+# Open issues raised at runtime when the system can't resolve a question
+# (synonym ambiguity, column ambiguity, zero resolution, low-confidence
+# mappings). Auditors / Data Stewards review these.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/auditor-issues")
+async def list_auditor_issues(
+    request: Request,
+    status: Optional[str] = Query(None, description="OPEN | IN_REVIEW | RESOLVED | REJECTED | SUPERSEDED"),
+    kind: Optional[str] = Query(None, description="SYNONYM_AMBIGUITY | COLUMN_AMBIGUITY | NO_RESOLUTION | ORPHAN_ENTITY | MAPPING_LOW_CONFIDENCE | OTHER"),
+    severity: Optional[str] = Query(None),
+    resource_type: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+) -> Dict[str, Any]:
+    req_trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    clauses: List[str] = []
+    params: List[Any] = []
+    if status:
+        clauses.append("status = %s"); params.append(status.upper())
+    if kind:
+        clauses.append("kind = %s"); params.append(kind.upper())
+    if severity:
+        clauses.append("severity = %s"); params.append(severity.upper())
+    if resource_type:
+        clauses.append("resource_type = %s"); params.append(resource_type)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = _fetch_all(
+        f"""
+        SELECT issue_id, kind, severity, status, title, description,
+               resource_type, resource_id, payload, raised_by, raised_trace,
+               assigned_to, resolved_by, resolution,
+               raised_at, updated_at, resolved_at
+        FROM auditor_issues
+        {where}
+        ORDER BY (status='OPEN') DESC,
+                 (severity='ERROR') DESC,
+                 raised_at DESC
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+    return {"trace_id": req_trace_id, "issues": rows, "count": len(rows)}
+
+
+@router.get("/auditor-issues/summary")
+async def auditor_issues_summary(request: Request) -> Dict[str, Any]:
+    req_trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    rows = _fetch_all(
+        """
+        SELECT kind, status, severity, COUNT(*) AS n
+        FROM auditor_issues
+        GROUP BY kind, status, severity
+        """,
+    )
+    open_total = _fetch_all(
+        "SELECT COUNT(*) AS n FROM auditor_issues WHERE status='OPEN'"
+    )
+    return {
+        "trace_id": req_trace_id,
+        "open_total": int((open_total[0].get("n") if open_total else 0) or 0),
+        "buckets": rows,
+    }
+
+
+@router.get("/auditor-issues/{issue_id}")
+async def get_auditor_issue(issue_id: str, request: Request) -> Dict[str, Any]:
+    req_trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    rows = _fetch_all(
+        """
+        SELECT issue_id, kind, severity, status, title, description,
+               resource_type, resource_id, payload, raised_by, raised_trace,
+               assigned_to, resolved_by, resolution,
+               raised_at, updated_at, resolved_at
+        FROM auditor_issues
+        WHERE issue_id = %s
+        """,
+        (issue_id,),
+    )
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "auditor_issue not found", "issue_id": issue_id, "trace_id": req_trace_id},
+        )
+    return {"trace_id": req_trace_id, "issue": rows[0]}
+
+
+from pydantic import BaseModel
+
+
+class ResolveAuditorIssueRequest(BaseModel):
+    status: str  # IN_REVIEW | RESOLVED | REJECTED | SUPERSEDED
+    resolution: Optional[str] = None
+    resolved_by: Optional[str] = None
+    assigned_to: Optional[str] = None
+
+
+@router.post("/auditor-issues/{issue_id}/resolve")
+async def resolve_auditor_issue(
+    issue_id: str,
+    request: Request,
+    body: ResolveAuditorIssueRequest,
+) -> Dict[str, Any]:
+    req_trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    new_status = body.status.upper()
+    if new_status not in ("IN_REVIEW", "RESOLVED", "REJECTED", "SUPERSEDED", "OPEN"):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"invalid status {new_status}", "trace_id": req_trace_id},
+        )
+
+    sets = ["status = %s", "updated_at = CURRENT_TIMESTAMP(3)"]
+    params: List[Any] = [new_status]
+    if body.resolution is not None:
+        sets.append("resolution = %s"); params.append(body.resolution[:8000])
+    if body.resolved_by is not None:
+        sets.append("resolved_by = %s"); params.append(body.resolved_by[:255])
+    if body.assigned_to is not None:
+        sets.append("assigned_to = %s"); params.append(body.assigned_to[:255])
+    if new_status in ("RESOLVED", "REJECTED", "SUPERSEDED"):
+        sets.append("resolved_at = CURRENT_TIMESTAMP(3)")
+
+    params.append(issue_id)
+    conn = _mysql_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE auditor_issues SET {', '.join(sets)} WHERE issue_id = %s",
+            tuple(params),
+        )
+        affected = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+
+    if affected == 0:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "auditor_issue not found", "issue_id": issue_id, "trace_id": req_trace_id},
+        )
+    return {"trace_id": req_trace_id, "issue_id": issue_id, "status": new_status}

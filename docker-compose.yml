@@ -36,6 +36,7 @@ services:
       - SCORING_SERVICE_URL=http://host.docker.internal:8003
       - MEMORY_SERVICE_URL=http://host.docker.internal:8001
       - META_ASSEMBLY_URL=http://host.docker.internal:8004
+      - TRANSLATOR_URL=http://host.docker.internal:8005
       - MYSQL_HOST=host.docker.internal
       - LOG_SOURCE=${LOG_SOURCE:-docker}
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}
@@ -82,6 +83,7 @@ services:
       - RAG_SERVICE_URL=http://host.docker.internal:8002
       - META_ASSEMBLY_URL=http://host.docker.internal:8004
       - AGENT_MGMT_URL=http://host.docker.internal:4001
+      - TRANSLATOR_SERVICE_URL=http://host.docker.internal:8005
       - PMOS_MODEL_DIR=/app/models
     volumes:
       - ./infra/ml_models:/app/models:ro
@@ -145,6 +147,35 @@ services:
       - META_ASSEMBLY_PORT=8004
       - MYSQL_HOST=host.docker.internal
       - REDIS_URL=redis://host.docker.internal:6379
+
+  translator:
+    <<: *python-service
+    # Build context = repo root so the image can copy `shared/` alongside the
+    # service. All other Python services use service-local context; only this
+    # one needs the shared package at build time.
+    build:
+      context: .
+      dockerfile: services/translator/Dockerfile
+    container_name: pmos-translator
+    ports:
+      - "8005:8005"
+    environment:
+      - TRANSLATOR_PORT=8005
+      - MYSQL_HOST=host.docker.internal
+      - QDRANT_HOST=host.docker.internal
+      - NEO4J_URI=${NEO4J_URI}
+      - NEO4J_USER=${NEO4J_USER:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - NEO4J_DATABASE=${NEO4J_DATABASE:-neo4j}
+      - ONTOLOGY_NEO4J_URI=${ONTOLOGY_NEO4J_URI:-}
+      - ONTOLOGY_NEO4J_USER=${ONTOLOGY_NEO4J_USER:-}
+      - ONTOLOGY_NEO4J_PASSWORD=${ONTOLOGY_NEO4J_PASSWORD:-}
+      - ONTOLOGY_NEO4J_DATABASE=${ONTOLOGY_NEO4J_DATABASE:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o}
 
   client:
     restart: unless-stopped

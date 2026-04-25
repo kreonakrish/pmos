@@ -14,6 +14,7 @@ const configSchema = z.object({
   SCORING_SERVICE_URL: z.string().url().optional().default('http://localhost:8003'),
   MEMORY_SERVICE_URL: z.string().url().optional().default('http://localhost:8001'),
   META_ASSEMBLY_URL: z.string().url().optional().default('http://localhost:8004'),
+  TRANSLATOR_URL: z.string().url().optional().default('http://localhost:8005'),
   REDIS_URL: z.string().default('redis://localhost:6379'),
   // AUTH_PASSWORD retained only for transitional compatibility; real auth is per-user.
   AUTH_PASSWORD: z.string().optional(),
