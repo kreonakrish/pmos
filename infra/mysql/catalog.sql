@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS crawlers (
   description     TEXT,
   source_type     ENUM(
                     'MYSQL','POSTGRES','SQLSERVER','ORACLE','TERADATA',
-                    'SNOWFLAKE','GLUE','S3','EXCEL','CSV','SSRS_RDL'
+                    'SNOWFLAKE','GLUE','S3','EXCEL','CSV','SSRS_RDL',
+                    'NEO4J'
                   ) NOT NULL,
   connection      JSON NOT NULL,        -- host, port, database, schemas[], auth ref
   options         JSON,                 -- crawler-specific options (sample_rows, skip_views, ...)

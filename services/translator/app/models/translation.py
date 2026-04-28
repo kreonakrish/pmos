@@ -39,6 +39,8 @@ class DatasetBinding(BaseModel):
     asset_fq_name: str
     columns: List[str] = Field(default_factory=list)
     source_uri: Optional[str] = None
+    source_type: Optional[str] = None  # MYSQL, NEO4J, ... lets the orchestrator pick the right query language
+    asset_type: Optional[str] = None   # TABLE / VIEW / NODE_LABEL / RELATIONSHIP
 
 
 class OntologySubgraph(BaseModel):

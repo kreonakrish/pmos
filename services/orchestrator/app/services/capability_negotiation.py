@@ -10,7 +10,7 @@ import asyncio
 import json
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.adapters.agent_mgmt_adapter import AgentMgmtAdapter
 from app.adapters.llm_adapter import LLMAdapter
@@ -255,7 +255,7 @@ class CapabilityNegotiationService:
         # match. The bid carries ``accessible_assets`` and
         # ``dataset_access_verified`` so downstream ranking can prefer
         # agents whose tools demonstrably reach the required data.
-        accessible_metadata: Dict[str, List[Dict[str, Any]]] = {}
+        accessible_metadata: Dict[str, Dict[str, Any]] = {}
         accessible_assets: List[str] = []
         if bid_request.dataset_bindings and tool_uuids:
             try:
@@ -266,12 +266,15 @@ class CapabilityNegotiationService:
                     OPTIONAL MATCH (ds:DataSource)-[:HAS_ASSET]->(a)
                     OPTIONAL MATCH (t:Tool)-[:ACCESSES]->(ds)
                       WHERE t.tool_id IN $tool_uuids
-                    WITH binding, a, collect(DISTINCT t.tool_id) AS reaching_tools
+                    WITH binding, a, ds, collect(DISTINCT t.tool_id) AS reaching_tools
                     WHERE size(reaching_tools) > 0
                     OPTIONAL MATCH (a)-[:HAS_COLUMN]->(col:DataColumn)
                     OPTIONAL MATCH (ba:BusinessAttribute)-[map:MAPS_TO]->(col)
                       WHERE map.effective_until IS NULL
                     RETURN binding AS asset_fq_name,
+                           a.asset_type AS asset_type,
+                           a.comment    AS asset_comment,
+                           ds.source_type AS source_type,
                            collect(DISTINCT {
                              column: col.name,
                              data_type: col.data_type,
@@ -293,7 +296,12 @@ class CapabilityNegotiationService:
                     asset = row.get("asset_fq_name")
                     cols = [c for c in (row.get("columns") or []) if c and c.get("column")]
                     if asset and cols:
-                        accessible_metadata[asset] = cols
+                        accessible_metadata[asset] = {
+                            "columns": cols,
+                            "asset_type": row.get("asset_type") or "TABLE",
+                            "asset_comment": row.get("asset_comment") or "",
+                            "source_type": row.get("source_type") or "",
+                        }
                         accessible_assets.append(asset)
             except Exception as exc:
                 logger.warning(
@@ -307,11 +315,30 @@ class CapabilityNegotiationService:
         # Render the accessible-data summary for the bid prompt. We cap at a
         # handful of columns per asset and at most 3 sample values per column
         # so prompt size stays bounded — the LLM doesn't need every row, just
-        # enough to recognize the schema.
+        # enough to recognize the schema. The header and column-line shape
+        # branch on asset_type so Neo4j sources render as
+        # `(:Customer {customer_id, segment})` instead of SQL syntax.
         data_text_lines: List[str] = []
+        source_types_seen: Set[str] = set()
         if accessible_metadata:
-            for asset, cols in list(accessible_metadata.items())[:6]:
-                data_text_lines.append(f"\nASSET {asset}:")
+            for asset, meta in list(accessible_metadata.items())[:6]:
+                cols = meta.get("columns") or []
+                asset_type = meta.get("asset_type") or "TABLE"
+                source_type = (meta.get("source_type") or "").upper()
+                comment = meta.get("asset_comment") or ""
+                if source_type:
+                    source_types_seen.add(source_type)
+
+                if asset_type == "NODE_LABEL":
+                    bare = asset.split(".")[-1]
+                    data_text_lines.append(f"\nNODE LABEL (:{bare}):")
+                elif asset_type == "RELATIONSHIP":
+                    data_text_lines.append(
+                        f"\nRELATIONSHIP {comment or asset}:"
+                    )
+                else:
+                    data_text_lines.append(f"\nASSET {asset}:")
+
                 for c in cols[:12]:
                     name = c.get("column")
                     dtype = c.get("data_type") or "?"
@@ -328,6 +355,17 @@ class CapabilityNegotiationService:
                     line += samples_text
                     data_text_lines.append(line)
         data_text = "\n".join(data_text_lines)
+        # If any required asset is graph-shaped, hint to the agent which query
+        # language to use. Mixed (SQL + Cypher) tasks are rare but possible —
+        # we surface the set so the agent picks per-asset.
+        query_lang_hint = ""
+        if "NEO4J" in source_types_seen and len(source_types_seen) == 1:
+            query_lang_hint = "Use Cypher to query the graph assets shown."
+        elif "NEO4J" in source_types_seen:
+            query_lang_hint = (
+                "Required assets span multiple source types — use Cypher for "
+                "NODE LABEL / RELATIONSHIP assets and SQL for TABLE assets."
+            )
 
         # 2. Assemble memory context (best-effort)
         memory_relevance = 0.0
@@ -372,8 +410,11 @@ class CapabilityNegotiationService:
                     "REQUIRED PHYSICAL ASSETS (the orchestrator's translator already "
                     "matched the question to these — use this concrete schema and "
                     "sample-value evidence to ground your bid):\n"
-                    f"{data_text}\n\n"
+                    f"{data_text}\n"
                 )
+                if query_lang_hint:
+                    bid_prompt += f"{query_lang_hint}\n"
+                bid_prompt += "\n"
             else:
                 bid_prompt += (
                     "REQUIRED PHYSICAL ASSETS:\n"

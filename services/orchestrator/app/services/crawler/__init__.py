@@ -15,6 +15,7 @@ from app.services.crawler.base import (
     CrawlResult,
 )
 from app.services.crawler.mysql_crawler import MySQLCrawler
+from app.services.crawler.neo4j_crawler import Neo4jCrawler
 from app.services.crawler.semantic_mapper import (
     ProposedMapping,
     SemanticMapper,
@@ -29,6 +30,7 @@ __all__ = [
     "CrawledColumn",
     "CrawlResult",
     "MySQLCrawler",
+    "Neo4jCrawler",
     "ProposedMapping",
     "SemanticMapper",
     "CatalogWriter",

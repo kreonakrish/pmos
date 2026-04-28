@@ -287,6 +287,24 @@ const SOURCE_SCHEMAS: Record<string, SourceSchema> = {
       { name: 'recurse_folders', label: 'Recurse subfolders', type: 'boolean', default: true },
     ],
   },
+  NEO4J: {
+    label: 'Neo4j (graph database)',
+    description: 'Introspects node labels, relationship types, and property keys via the Bolt driver. Each label becomes a NODE_LABEL DataAsset and each property becomes a DataColumn — so the existing MAPS_TO and bid-time grounding machinery works as-is. Sample property values are pulled with MATCH ... RETURN DISTINCT n.prop LIMIT N. PMOS ontology labels (BusinessEntity, DataAsset, Tool, ...) are excluded by default.',
+    implemented: true,
+    connection: [
+      { name: 'uri', label: 'Bolt URI', type: 'text', required: true, helper: 'e.g. neo4j+s://xxxx.databases.neo4j.io — falls back to NEO4J_URI env in the orchestrator container' },
+      { name: 'user', label: 'User', type: 'text', default: 'neo4j', helper: 'Falls back to NEO4J_USER env' },
+      { name: 'password', label: 'Password', type: 'password', helper: 'Falls back to NEO4J_PASSWORD env' },
+      { name: 'database', label: 'Database', type: 'text', default: 'neo4j', helper: 'Falls back to NEO4J_DATABASE env' },
+    ],
+    options: [
+      { name: 'sample_rows', label: 'Sample values per property', type: 'number', default: 5 },
+      { name: 'skip_sensitive', label: 'Skip sensitive properties (PII regex)', type: 'boolean', default: true },
+      { name: 'include_relationships', label: 'Include relationships as RELATIONSHIP assets', type: 'boolean', default: true },
+      { name: 'excluded_labels', label: 'Extra labels to exclude (comma-separated)', type: 'csv', helper: 'PMOS ontology labels are already excluded' },
+      { name: 'excluded_rel_types', label: 'Extra rel types to exclude (comma-separated)', type: 'csv' },
+    ],
+  },
 };
 
 function defaultValuesFor(fields: FieldDef[]): Record<string, any> {

@@ -149,7 +149,8 @@ async def create_crawler(
     crawler_id = str(uuid.uuid4())
 
     allowed = {"MYSQL", "POSTGRES", "SQLSERVER", "ORACLE", "TERADATA",
-               "SNOWFLAKE", "GLUE", "S3", "EXCEL", "CSV", "SSRS_RDL"}
+               "SNOWFLAKE", "GLUE", "S3", "EXCEL", "CSV", "SSRS_RDL",
+               "NEO4J"}
     st = body.source_type.upper()
     if st not in allowed:
         raise HTTPException(

@@ -1471,6 +1471,7 @@ class TranslatorPipeline:
             "       a.asset_type AS asset_type, "
             "       col.name AS column_name, "
             "       ds.source_uri AS source_uri, "
+            "       ds.source_type AS source_type, "
             "       map.version AS map_version, "
             "       map.confidence AS map_confidence"
         )
@@ -1509,12 +1510,18 @@ class TranslatorPipeline:
                     "asset_fq_name": asset,
                     "columns": [],
                     "source_uri": row.get("source_uri"),
+                    "source_type": row.get("source_type"),
+                    "asset_type": row.get("asset_type"),
                 },
             )
             if col and col not in entry["columns"]:
                 entry["columns"].append(col)
             if not entry.get("source_uri") and row.get("source_uri"):
                 entry["source_uri"] = row.get("source_uri")
+            if not entry.get("source_type") and row.get("source_type"):
+                entry["source_type"] = row.get("source_type")
+            if not entry.get("asset_type") and row.get("asset_type"):
+                entry["asset_type"] = row.get("asset_type")
 
             ver = row.get("map_version")
             if ver is not None:

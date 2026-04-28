@@ -84,6 +84,8 @@ class DatasetBinding(TypedDict, total=False):
     asset_fq_name: str
     columns: List[str]
     source_uri: Optional[str]
+    source_type: Optional[str]   # MYSQL, NEO4J, ...
+    asset_type: Optional[str]    # TABLE / VIEW / NODE_LABEL / RELATIONSHIP
 
 
 class ReportDataset(TypedDict, total=False):
