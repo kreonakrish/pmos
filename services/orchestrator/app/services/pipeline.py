@@ -18,6 +18,7 @@ import asyncio
 import json
 import time
 import uuid
+from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
@@ -222,6 +223,106 @@ class PipelineService:
         except Exception:
             pass
 
+        # ── Pending-report-confirm short-circuit ─────────────────────────
+        # If the previous turn asked the user to confirm a Report match, the
+        # current turn's reply ("yes" / "data" / refinement) determines the
+        # action here. Always clear the pending state so we do not loop.
+        pending = self._get_pending_report_confirm(conversation_id)
+        if pending and pending.get("report_id"):
+            self._clear_pending_report_confirm(conversation_id)
+            reply_kind = self._classify_confirm_reply(message)
+            logger.info(
+                "Pending report-confirm reply",
+                layer="service",
+                conversation_id=conversation_id,
+                report_id=pending.get("report_id"),
+                reply_kind=reply_kind,
+                trace_id=trace_id,
+            )
+            if reply_kind == "yes":
+                # Re-fetch the matched-report record from Neo4j so we have
+                # the full datasets / commands needed by _execute_matched_report.
+                try:
+                    rows = await self._neo4j.run_query(
+                        """
+                        MATCH (r:Report {report_id: $report_id})
+                        OPTIONAL MATCH (r)-[:HAS_DATASET]->(rd:ReportDataset)
+                        OPTIONAL MATCH (rd)-[:RUNS_ON]->(ds:DataSource)
+                        RETURN r.report_id   AS report_id,
+                               r.name        AS name,
+                               r.description AS description,
+                               r.system      AS system,
+                               r.owner_team  AS owner_team,
+                               collect(DISTINCT {
+                                 dataset_id: rd.dataset_id,
+                                 name: rd.name,
+                                 command: rd.command,
+                                 command_type: rd.command_type,
+                                 source_uri: ds.source_uri,
+                                 source_name: ds.source_name
+                               }) AS datasets
+                        """,
+                        {"report_id": pending["report_id"]},
+                        trace_id=trace_id,
+                    )
+                except Exception as exc:
+                    rows = []
+                    logger.warning(
+                        "Failed to load confirmed report",
+                        layer="service", error=str(exc), trace_id=trace_id,
+                    )
+                if rows:
+                    report = rows[0]
+                    report["datasets"] = [
+                        d for d in (report.get("datasets") or [])
+                        if d and d.get("dataset_id")
+                    ]
+                    report_response, report_visualizations = (
+                        await self._execute_matched_report(report, trace_id=trace_id)
+                    )
+                    try:
+                        await audit.write(
+                            trace_id=trace_id,
+                            actor="orchestrator",
+                            actor_type="SERVICE",
+                            action="report.executed",
+                            resource_type="Report",
+                            resource_id=pending["report_id"],
+                            payload={
+                                "session_id": session_id,
+                                "via": "user_confirm",
+                                "score": pending.get("score"),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    return {
+                        "session_id": session_id,
+                        "graph_id": "",
+                        "response": report_response,
+                        "score": None,
+                        "trace_id": trace_id,
+                        "clarification_needed": False,
+                        "clarification_question": None,
+                        "auditor_issue_id": None,
+                        "auditor_issue_kind": None,
+                        "matched_report_id": pending["report_id"],
+                        "visualizations": report_visualizations,
+                    }
+                # If we somehow lost the report row, fall through to the
+                # agent loop on the user's reply text rather than failing.
+            elif reply_kind == "no":
+                # Replay the user's ORIGINAL question through the agent loop.
+                original = pending.get("original_question") or message
+                logger.info(
+                    "User declined report; running agent path on original question",
+                    layer="service", conversation_id=conversation_id,
+                    trace_id=trace_id,
+                )
+                message = original
+            # reply_kind == "other" → treat as a refinement; fall through
+            # with the new message text. Pending is already cleared above.
+
         try:
             # Step 0: LOAD TEAM HIERARCHY into Neo4j + build team context
             team_context = ""
@@ -277,18 +378,22 @@ class PipelineService:
             except Exception:
                 matched_reports = []
 
-            # Ext2 — deterministic Report short-circuit. Runs BEFORE the
-            # clarification short-circuit because a high-confidence Report
-            # match means the user explicitly asked for a deterministic
-            # report; any incidental synonym ambiguity raised by the
-            # translator is irrelevant for THAT execution path.
-            DETERMINISTIC_SCORE_THRESHOLD = 5.0
+            # Ext2 — deterministic Report path. Two thresholds instead of one:
+            #   AUTO_FIRE: high-confidence match -> execute report silently.
+            #   CONFIRM:   middle-band match    -> ask the user before firing.
+            #   below:     ignore reports, run the agent loop normally.
+            # The confirm gate prevents the scorer-misfire failure mode where
+            # a question about graph data accidentally matches a SQL report by
+            # ambient token overlap (e.g. "and"/"payment").
+            AUTO_FIRE_THRESHOLD = 12.0
+            CONFIRM_THRESHOLD = 5.0
             top_match = matched_reports[0] if matched_reports else None
             top_score = float(top_match.get("score") or 0.0) if top_match else 0.0
             second_score = float(matched_reports[1].get("score") or 0.0) if len(matched_reports) > 1 else 0.0
+
             if (
                 top_match
-                and top_score >= DETERMINISTIC_SCORE_THRESHOLD
+                and top_score >= AUTO_FIRE_THRESHOLD
                 and (top_score - second_score) >= 1.0
             ):
                 logger.info(
@@ -334,6 +439,68 @@ class PipelineService:
                     "auditor_issue_kind": None,
                     "matched_report_id": top_match.get("report_id"),
                     "visualizations": report_visualizations,
+                }
+
+            if (
+                top_match
+                and top_score >= CONFIRM_THRESHOLD
+            ):
+                # Confirm-band match — ask the user before firing the report.
+                # Persist pending state on the conversation so the next turn
+                # can act on the user's reply (yes / no / refined question).
+                report_name = top_match.get("name") or "(unnamed report)"
+                confirm_msg = (
+                    f"I found a saved report **'{report_name}'** that may answer your question. "
+                    f"Reply **yes** to use the report, or **data** to have me look up the data directly. "
+                    f"You can also restate or refine your question."
+                )
+                self._set_pending_report_confirm(
+                    conversation_id=conversation_id,
+                    report_id=top_match.get("report_id"),
+                    report_name=report_name,
+                    score=top_score,
+                    original_question=message,
+                )
+                await self._neo4j.update_graph_status(
+                    graph_id, "AWAITING_REPORT_CONFIRM", trace_id=trace_id,
+                )
+                logger.info(
+                    "Pipeline asking user to confirm Report match",
+                    layer="service",
+                    graph_id=graph_id,
+                    report_id=top_match.get("report_id"),
+                    score=top_score,
+                    trace_id=trace_id,
+                )
+                try:
+                    await audit.write(
+                        trace_id=trace_id,
+                        actor="orchestrator",
+                        actor_type="SERVICE",
+                        action="report.confirm_requested",
+                        resource_type="Report",
+                        resource_id=top_match.get("report_id"),
+                        payload={
+                            "graph_id": graph_id,
+                            "score": top_score,
+                            "owner_team": top_match.get("owner_team"),
+                            "system": top_match.get("system"),
+                        },
+                    )
+                except Exception:
+                    pass
+                return {
+                    "session_id": session_id,
+                    "graph_id": graph_id,
+                    "response": confirm_msg,
+                    "score": None,
+                    "trace_id": trace_id,
+                    "clarification_needed": True,
+                    "clarification_question": confirm_msg,
+                    "clarification_kind": "report_confirm",
+                    "pending_report_id": top_match.get("report_id"),
+                    "auditor_issue_id": None,
+                    "auditor_issue_kind": None,
                 }
 
             # F4 — clarification short-circuit (only fires when no
@@ -907,6 +1074,147 @@ class PipelineService:
     # ------------------------------------------------------------------
     # Ext2 — Deterministic Report execution
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Pending-report-confirm state — read/write conversations.metadata.
+    # Used by the confirm-band Report match flow: turn N stamps the
+    # candidate report on the conversation; turn N+1 reads it and acts on
+    # the user's reply (yes / data / refinement).
+    # ------------------------------------------------------------------
+
+    _CONFIRM_YES_TOKENS = {
+        "yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay",
+        "use it", "use the report", "show it", "show the report", "run it",
+        "go ahead", "do it", "please", "fire it",
+    }
+    _CONFIRM_NO_TOKENS = {
+        "no", "n", "nope", "nah", "skip", "data", "just data",
+        "look up the data", "look up data", "different", "agent",
+        "go to data", "use data", "do not", "dont", "don't",
+    }
+
+    @staticmethod
+    def _classify_confirm_reply(message: str) -> str:
+        """Returns 'yes', 'no', or 'other'."""
+        m = (message or "").strip().lower().strip(".!?")
+        if not m:
+            return "other"
+        if m in PipelineService._CONFIRM_YES_TOKENS:
+            return "yes"
+        if m in PipelineService._CONFIRM_NO_TOKENS:
+            return "no"
+        # Short multi-word fuzzy match.
+        if any(t in m for t in ("yes,", "yes ", "use the rep", "fire the rep")):
+            return "yes"
+        if any(t in m for t in ("no,", "no ", "skip ", "look up the data", "use data instead")):
+            return "no"
+        return "other"
+
+    def _get_pending_report_confirm(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+        """Read pending_report_confirm from conversations.metadata (MySQL)."""
+        if not conversation_id:
+            return None
+        try:
+            import mysql.connector
+            conn = mysql.connector.connect(
+                host=settings.mysql_host, port=settings.mysql_port,
+                user=settings.mysql_user, password=settings.mysql_password,
+                database=settings.mysql_db,
+            )
+            try:
+                cur = conn.cursor(dictionary=True)
+                cur.execute(
+                    "SELECT metadata FROM conversations WHERE conversation_id=%s",
+                    (conversation_id,),
+                )
+                row = cur.fetchone()
+            finally:
+                conn.close()
+            if not row or not row.get("metadata"):
+                return None
+            md_raw = row["metadata"]
+            md = json.loads(md_raw) if isinstance(md_raw, (str, bytes)) else md_raw
+            if not isinstance(md, dict):
+                return None
+            return md.get("pending_report_confirm") or None
+        except Exception as exc:
+            logger.warning(
+                "Failed to read pending_report_confirm",
+                layer="service", conversation_id=conversation_id, error=str(exc),
+            )
+            return None
+
+    def _set_pending_report_confirm(
+        self,
+        conversation_id: str,
+        report_id: str,
+        report_name: str,
+        score: float,
+        original_question: str,
+    ) -> None:
+        self._merge_conversation_metadata(
+            conversation_id,
+            {
+                "pending_report_confirm": {
+                    "report_id": report_id,
+                    "report_name": report_name,
+                    "score": float(score),
+                    "original_question": original_question,
+                    "asked_at": datetime.utcnow().isoformat() + "Z",
+                }
+            },
+        )
+
+    def _clear_pending_report_confirm(self, conversation_id: str) -> None:
+        self._merge_conversation_metadata(
+            conversation_id, {"pending_report_confirm": None}
+        )
+
+    def _merge_conversation_metadata(self, conversation_id: str, patch: Dict[str, Any]) -> None:
+        """Merge a JSON patch into conversations.metadata. Setting a key to
+        None removes it. Best-effort — failures are logged, never raised."""
+        if not conversation_id:
+            return
+        try:
+            import mysql.connector
+            conn = mysql.connector.connect(
+                host=settings.mysql_host, port=settings.mysql_port,
+                user=settings.mysql_user, password=settings.mysql_password,
+                database=settings.mysql_db,
+            )
+            try:
+                cur = conn.cursor(dictionary=True)
+                cur.execute(
+                    "SELECT metadata FROM conversations WHERE conversation_id=%s",
+                    (conversation_id,),
+                )
+                row = cur.fetchone()
+                md = {}
+                if row and row.get("metadata"):
+                    raw = row["metadata"]
+                    try:
+                        md = json.loads(raw) if isinstance(raw, (str, bytes)) else (raw or {})
+                    except Exception:
+                        md = {}
+                if not isinstance(md, dict):
+                    md = {}
+                for k, v in patch.items():
+                    if v is None:
+                        md.pop(k, None)
+                    else:
+                        md[k] = v
+                cur.execute(
+                    "UPDATE conversations SET metadata=%s WHERE conversation_id=%s",
+                    (json.dumps(md), conversation_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning(
+                "Failed to merge conversation metadata",
+                layer="service", conversation_id=conversation_id, error=str(exc),
+            )
 
     async def _execute_matched_report(
         self,

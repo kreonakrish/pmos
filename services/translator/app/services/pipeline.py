@@ -1671,32 +1671,69 @@ class TranslatorPipeline:
             )
             return []
 
+        # Stop-words that contribute noise rather than signal — appear in
+        # almost any English sentence, give false matches against descriptions
+        # and report names.
+        REPORT_STOP_WORDS = {
+            "and", "are", "the", "for", "our", "with", "from", "into", "over",
+            "that", "this", "what", "any", "all", "not", "but", "use", "used",
+            "show", "list", "find", "get", "give", "tell", "want", "need",
+            "have", "has", "had", "you", "your", "new", "old", "via",
+        }
+        # Score weights — name-only matching, higher per-match weight than the
+        # old surface-area approach. Description/owner_team/system are dropped
+        # entirely from text scoring (they were noise channels — long English
+        # filler that produced accidental matches).
+        NAME_TOKEN_WEIGHT = 4.0
+        ATTR_MATCH_WEIGHT = 2.0
+        # Require name-token overlap to clear this minimum before counting —
+        # single-token matches like "payment" against "Monthly Payment Trends"
+        # are not enough on their own.
+        MIN_NAME_OVERLAP = 2
+        # Attribute-overlap is gated by precision: matched / |question_attrs|.
+        # If the resolver over-pulled (e.g. 168 candidates from "balloon_payment")
+        # and only 2 hit the report's USES_ATTRIBUTE, that is 1.2% — noise, not
+        # signal. Below this fraction, attr_score is zeroed.
+        MIN_ATTR_PRECISION = 0.10
+
+        question_tokens_clean = question_tokens - REPORT_STOP_WORDS
+        question_lower = text  # already lower-cased above
+
         scored: List[Dict[str, Any]] = []
         for row in rows or []:
-            name_text = " ".join(
-                str(x or "")
-                for x in (
-                    row.get("name"),
-                    row.get("description"),
-                    row.get("owner_team"),
-                    row.get("system"),
-                )
-            ).lower()
-            name_tokens = {t for t in re.split(r"[\s,.\?\!\-\_]+", name_text) if t and len(t) >= 3}
+            name_only = (row.get("name") or "").lower()
+            name_tokens = {
+                t for t in re.split(r"[\s,.\?\!\-\_]+", name_only)
+                if t and len(t) >= 3 and t not in REPORT_STOP_WORDS
+            }
+            text_overlap = question_tokens_clean & name_tokens
 
-            text_overlap = question_tokens & name_tokens
-            text_score = len(text_overlap) * 3.0
+            # Phrase-substring escape hatch: if the report's full name appears
+            # verbatim in the question, count it as a strong match even when
+            # multi-token gate would otherwise reject (e.g., a single-word
+            # report name like "Forecast" mentioned by the user).
+            phrase_hit = bool(name_only) and name_only in question_lower
+
+            if not phrase_hit and len(text_overlap) < MIN_NAME_OVERLAP:
+                # Below the multi-token gate — name signal is too weak.
+                text_score = 0.0
+            else:
+                text_score = len(text_overlap) * NAME_TOKEN_WEIGHT
+                if phrase_hit:
+                    # Bonus for full-name substring match.
+                    text_score += NAME_TOKEN_WEIGHT
 
             ba_list = [a for a in (row.get("uses_attributes") or []) if a]
             attr_overlap = set(ce_fqs) & set(ba_list)
-            attr_score = len(attr_overlap) * 2.0
+            attr_match_count = len(attr_overlap)
+            denom = max(1, len(ce_fqs))
+            attr_precision = attr_match_count / denom
+            if attr_precision < MIN_ATTR_PRECISION:
+                attr_score = 0.0
+            else:
+                attr_score = attr_match_count * ATTR_MATCH_WEIGHT
 
-            team = (row.get("owner_team") or "").lower()
-            team_score = 0.0
-            if team and (team in text or team.replace("_", " ") in text):
-                team_score = 1.0
-
-            score = text_score + attr_score + team_score
+            score = text_score + attr_score
             if score <= 0:
                 continue
 
@@ -1706,13 +1743,16 @@ class TranslatorPipeline:
             ]
 
             why_bits = []
+            if phrase_hit:
+                why_bits.append(f"name phrase matched")
             if text_overlap:
-                why_bits.append(f"name/desc tokens: {sorted(text_overlap)[:5]}")
-            if attr_overlap:
-                why_bits.append(f"uses {len(attr_overlap)} of {len(ce_fqs)} canonical attrs")
-            if team_score:
-                why_bits.append(f"owner_team={team}")
-            why = "; ".join(why_bits)
+                why_bits.append(f"name tokens: {sorted(text_overlap)[:5]}")
+            if attr_overlap and attr_score > 0:
+                why_bits.append(
+                    f"uses {attr_match_count} of {len(ce_fqs)} canonical attrs "
+                    f"(precision {attr_precision:.2f})"
+                )
+            why = "; ".join(why_bits) or "weak signal"
 
             scored.append({
                 "report_id": row.get("report_id"),
