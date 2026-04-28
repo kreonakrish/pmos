@@ -227,6 +227,9 @@ class PipelineService:
         # If the previous turn asked the user to confirm a Report match, the
         # current turn's reply ("yes" / "data" / refinement) determines the
         # action here. Always clear the pending state so we do not loop.
+        # ``skip_report_match`` is a one-shot guard so a "no" reply does not
+        # re-trigger the same confirm prompt on the same turn.
+        skip_report_match = False
         pending = self._get_pending_report_confirm(conversation_id)
         if pending and pending.get("report_id"):
             self._clear_pending_report_confirm(conversation_id)
@@ -313,6 +316,8 @@ class PipelineService:
                 # agent loop on the user's reply text rather than failing.
             elif reply_kind == "no":
                 # Replay the user's ORIGINAL question through the agent loop.
+                # Skip report-matching for this turn — otherwise the same
+                # report would re-match and we would re-prompt indefinitely.
                 original = pending.get("original_question") or message
                 logger.info(
                     "User declined report; running agent path on original question",
@@ -320,6 +325,7 @@ class PipelineService:
                     trace_id=trace_id,
                 )
                 message = original
+                skip_report_match = True
             # reply_kind == "other" → treat as a refinement; fall through
             # with the new message text. Pending is already cleared above.
 
@@ -392,7 +398,8 @@ class PipelineService:
             second_score = float(matched_reports[1].get("score") or 0.0) if len(matched_reports) > 1 else 0.0
 
             if (
-                top_match
+                not skip_report_match
+                and top_match
                 and top_score >= AUTO_FIRE_THRESHOLD
                 and (top_score - second_score) >= 1.0
             ):
@@ -442,7 +449,8 @@ class PipelineService:
                 }
 
             if (
-                top_match
+                not skip_report_match
+                and top_match
                 and top_score >= CONFIRM_THRESHOLD
             ):
                 # Confirm-band match — ask the user before firing the report.
