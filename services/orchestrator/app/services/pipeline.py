@@ -45,6 +45,12 @@ from app.services.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError
 from app.services.course_corrector import CourseAction, CourseCorrector
 from app.services.graph_manager import GraphManager
 from app.services.interaction_logger import InteractionLogger
+from app.services.patterns import (
+    DispatchContext,
+    PatternDispatcher,
+    TeamContext,
+    build_default_registry,
+)
 from app.utils.audit import audit
 from app.utils.logger import logger
 from app.utils.telemetry import REQUEST_TOTAL
@@ -118,6 +124,19 @@ class PipelineService:
                 layer="service",
                 error=str(exc),
             )
+
+        # Question-pattern dispatcher (Phase 1: SHADOW mode — runs every
+        # registered pattern's detect() and stamps the decision trace on
+        # the TaskGraph for the UI, but does NOT drive routing yet).
+        # Phase 4 flips ``self._pattern_routing_enabled`` to True.
+        self._pattern_registry = build_default_registry()
+        self._pattern_dispatcher = PatternDispatcher(self._pattern_registry.all())
+        self._pattern_routing_enabled = False
+        # Per-request scratch for the dispatcher. Reset at the top of
+        # execute(); read by _run_pattern_dispatch_shadow() between
+        # step 2 and step 3.
+        self._last_translation: Dict[str, Any] = {}
+        self._last_team_context: TeamContext = TeamContext()
 
     # ------------------------------------------------------------------
     # Agent DB-ID resolver
@@ -201,6 +220,9 @@ class PipelineService:
         # this pipeline instance can't leak into bidding.
         self._current_schema_meta_assignments = {}
         self._current_schema_meta_descriptions: set = set()
+        # Reset dispatcher scratch — see __init__.
+        self._last_translation = {}
+        self._last_team_context = TeamContext()
 
         logger.info(
             "Pipeline execution started",
@@ -362,6 +384,26 @@ class PipelineService:
                 trace_id=trace_id,
                 team_context=team_context,
                 conversation_id=conversation_id,
+            )
+
+            # Step 2b: PATTERN DISPATCH (shadow mode in Phase 1).
+            # Runs every registered pattern's detect() in parallel and
+            # stamps a DecisionTrace on the TaskGraph for the UI. Does
+            # not drive routing yet — the legacy gates below still win.
+            try:
+                prior_turns_for_dispatch = await self._fetch_prior_turns_from_messages(
+                    conversation_id=conversation_id, trace_id=trace_id,
+                )
+            except Exception:
+                prior_turns_for_dispatch = []
+            await self._run_pattern_dispatch_shadow(
+                graph_id=graph_id,
+                message=message,
+                team_id=team_id,
+                conversation_id=conversation_id,
+                session_id=session_id,
+                trace_id=trace_id,
+                prior_turns=prior_turns_for_dispatch,
             )
 
             # Read translator metadata once — both the deterministic-Report
@@ -870,6 +912,11 @@ class PipelineService:
             context_parts.append(f"Total agents: {len(agents_list)}")
             context_parts.append("")
 
+            # Build a structured TeamContext alongside the prompt text so
+            # the pattern dispatcher can filter agents by tool type
+            # without re-fetching from agent-mgmt.
+            tc_agents: List[Dict[str, Any]] = []
+
             for agent in agents_list:
                 a_name = agent.get("agent_name", agent.get("name", "?"))
                 a_role = agent.get("role", "specialist")
@@ -878,9 +925,11 @@ class PipelineService:
 
                 # Fetch this agent's tools
                 a_id = agent.get("agent_id", "")
+                a_tools: List[Dict[str, Any]] = []
                 try:
                     tools = await self._agent_mgmt.get_agent_tools(agent_id=a_id, trace_id=trace_id)
                     if tools:
+                        a_tools = list(tools)
                         tool_names = [t.get("tool_name", t.get("name", "?")) for t in tools]
                         tool_types = [t.get("tool_type", "?") for t in tools]
                         for tn, tt in zip(tool_names, tool_types):
@@ -891,7 +940,22 @@ class PipelineService:
                     context_parts.append("  - Tools: unavailable")
                 context_parts.append("")
 
-            return "\n".join(context_parts)
+                tc_agents.append({
+                    "agent_id": a_id,
+                    "agent_name": a_name,
+                    "role": a_role,
+                    "foundation_model": a_model,
+                    "tools": a_tools,
+                })
+
+            text = "\n".join(context_parts)
+            self._last_team_context = TeamContext(
+                team_id=team_id,
+                name=team_name,
+                agents=tc_agents,
+                text=text,
+            )
+            return text
 
         except CircuitBreakerOpenError:
             logger.warning(
@@ -910,6 +974,82 @@ class PipelineService:
                 trace_id=trace_id,
             )
             return ""
+
+    async def _run_pattern_dispatch_shadow(
+        self,
+        graph_id: str,
+        message: str,
+        team_id: str,
+        conversation_id: str,
+        session_id: str,
+        trace_id: str,
+        prior_turns: List[Dict[str, Any]],
+    ) -> None:
+        """Phase 1: run the pattern dispatcher in shadow mode.
+
+        Builds a ``DispatchContext`` from the cached translator output
+        and team facts, runs every registered pattern's ``detect()`` in
+        parallel, and stamps the resulting ``DecisionTrace`` on the
+        TaskGraph as a JSON property so the Pipeline-Jobs UI can render
+        the candidate-score table. Does NOT drive routing — the legacy
+        ``if/elif`` dispatch in ``execute()`` is still authoritative.
+
+        Failures are non-fatal: a broken dispatcher must not break the
+        pipeline. The legacy path keeps running.
+        """
+        try:
+            ctx = DispatchContext(
+                question=message or "",
+                team_id=team_id or "",
+                conversation_id=conversation_id or "",
+                trace_id=trace_id or "",
+                session_id=session_id or "",
+                graph_id=graph_id or "",
+                prior_turns=list(prior_turns or []),
+                translator=dict(self._last_translation or {}),
+                team=self._last_team_context,
+            )
+            _, _, trace = await self._pattern_dispatcher.dispatch(ctx, shadow=True)
+
+            # Stamp on TaskGraph for the UI. JSON-serialise the trace
+            # body once; Neo4j stores it as a string property.
+            try:
+                payload = json.dumps(trace.to_dict())
+            except Exception:
+                payload = "{}"
+            try:
+                await self._neo4j.run_query(
+                    """
+                    MATCH (g:TaskGraph {graph_id: $graph_id})
+                    SET g.pattern_decision_trace = $trace_json,
+                        g.pattern_winner         = $winner,
+                        g.pattern_shadow         = $shadow,
+                        g.updated_at             = datetime()
+                    """,
+                    {
+                        "graph_id": graph_id,
+                        "trace_json": payload,
+                        "winner": trace.winner or "",
+                        "shadow": True,
+                    },
+                    trace_id=trace_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to stamp pattern decision trace",
+                    layer="service",
+                    graph_id=graph_id,
+                    error=str(exc),
+                    trace_id=trace_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Pattern dispatch (shadow) failed — non-fatal",
+                layer="service",
+                graph_id=graph_id,
+                error=str(exc),
+                trace_id=trace_id,
+            )
 
     async def _build_schema_meta_subtasks(
         self,
@@ -1668,6 +1808,8 @@ class PipelineService:
             trace_id=trace_id,
             prior_turns=prior_turns,
         )
+        # Stash for the pattern dispatcher (shadow mode in Phase 1).
+        self._last_translation = dict(translation or {})
 
         # F4 — capture clarification & auditor-issue signals on the
         # TaskGraph so the chat response layer can short-circuit and surface
