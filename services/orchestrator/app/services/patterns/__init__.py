@@ -13,8 +13,16 @@ See ``ARCHITECTURE.md`` and the patterns sketch in the conversation log
 for the design rationale.
 """
 
+from app.services.patterns.business import BusinessPattern
+from app.services.patterns.clarify import ClarifyPattern
+from app.services.patterns.column_value import ColumnValuePattern
 from app.services.patterns.dispatcher import PatternDispatcher
+from app.services.patterns.freeform import FreeFormPattern
+from app.services.patterns.metadata import MetadataPattern
+from app.services.patterns.rag import RAGPattern
 from app.services.patterns.registry import PatternRegistry, build_default_registry
+from app.services.patterns.report import ReportPattern
+from app.services.patterns.team_self import TeamSelfPattern
 from app.services.patterns.types import (
     CandidateScore,
     DecisionTrace,
@@ -28,16 +36,24 @@ from app.services.patterns.types import (
 )
 
 __all__ = [
+    "BusinessPattern",
     "CandidateScore",
+    "ClarifyPattern",
+    "ColumnValuePattern",
     "DecisionTrace",
     "DispatchContext",
     "ExecutionPlan",
     "ExecutionResult",
+    "FreeFormPattern",
+    "MetadataPattern",
     "PatternDispatcher",
     "PatternMatch",
     "PatternRegistry",
     "QuestionPattern",
+    "RAGPattern",
+    "ReportPattern",
     "Subtask",
     "TeamContext",
+    "TeamSelfPattern",
     "build_default_registry",
 ]

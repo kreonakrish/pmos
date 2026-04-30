@@ -36,8 +36,32 @@ class PatternRegistry:
 def build_default_registry() -> PatternRegistry:
     """Return the production pattern set.
 
-    Phase 1: empty — the dispatcher will run, find no candidates, and
-    record a no-winner trace alongside the legacy routing. Each later
-    phase adds a pattern here.
+    Phase 3: every pattern is registered. Order is the final tie-break
+    when two patterns have the same priority — list the most specific
+    detectors first.
+
+    The dispatcher is still in shadow mode (Phase 1's flag) — these
+    patterns score every request but routing is driven by the legacy
+    if/elif gates until Phase 4.
     """
-    return PatternRegistry()
+    # Local imports keep registry.py importable without pulling in
+    # every pattern's deps when only the type is needed.
+    from app.services.patterns.business import BusinessPattern
+    from app.services.patterns.clarify import ClarifyPattern
+    from app.services.patterns.column_value import ColumnValuePattern
+    from app.services.patterns.freeform import FreeFormPattern
+    from app.services.patterns.metadata import MetadataPattern
+    from app.services.patterns.rag import RAGPattern
+    from app.services.patterns.report import ReportPattern
+    from app.services.patterns.team_self import TeamSelfPattern
+
+    return PatternRegistry([
+        TeamSelfPattern(),     # priority 95
+        ReportPattern(),       # priority 90
+        ClarifyPattern(),      # priority 85
+        RAGPattern(),          # priority 80
+        MetadataPattern(),     # priority 70
+        ColumnValuePattern(),  # priority 65
+        BusinessPattern(),     # priority 50
+        FreeFormPattern(),     # priority 0 (catch-all)
+    ])
