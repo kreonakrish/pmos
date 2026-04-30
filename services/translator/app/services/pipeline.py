@@ -313,25 +313,30 @@ class TranslatorPipeline:
                 pass
             return empty_res
 
-        # Schema-meta short-circuit. Catalog-shape questions ("how many
-        # tables have loan_id columns") must skip the ontology pipeline:
-        # span tokenisation matches the column name against unrelated
-        # BusinessAttributes that share a substring (e.g. "loan" → every
-        # `Servicing.Loan.*` attribute), the synonym detector clusters
-        # them by suffix, and the user gets a confused clarification
-        # while the team's DB-tool agents never run. Hand off to the
-        # orchestrator's broadcast path with a clean intent.
-        is_schema_meta, schema_meta_column = self._detect_schema_meta_question(question)
-        if is_schema_meta:
+        # Catalog/column broadcast short-circuit. Two related question
+        # patterns must skip the ontology pipeline:
+        #   * "how many tables have loan_id columns"  (catalog SHAPE)
+        #   * "value of loan_id across these tables"  (data SAMPLING)
+        # Both fail the same way under the ontology path: span "loan_id"
+        # tokenises to "loan", every `Servicing.Loan.*` BA matches, the
+        # synonym detector clusters by suffix, and the user gets a
+        # confused clarification while the DB/GRAPH agents — the only
+        # ones who can introspect or sample real catalogs — never run.
+        # Hand off to the orchestrator's broadcast path with the right
+        # intent so it can pick the matching SQL/Cypher plan.
+        column_kind, schema_meta_column = self._detect_column_question(question)
+        if column_kind:
+            broadcast_intent = f"{column_kind}_question"  # schema_meta_question | column_value_question
             logger.info(
-                "Schema-meta question detected — short-circuiting ontology pipeline",
+                "Broadcast question detected — short-circuiting ontology pipeline",
                 layer="service",
                 trace_id=trace_id,
+                kind=column_kind,
                 column=schema_meta_column,
                 question_len=len(question),
             )
             sm_res = empty_translation_result(trace_id=trace_id)
-            sm_res["intent"] = "schema_meta_question"
+            sm_res["intent"] = broadcast_intent
             sm_res["fallback_used"] = True
             sm_res["clarification_needed"] = False
             sm_res["clarification_question"] = None
@@ -346,10 +351,10 @@ class TranslatorPipeline:
                     resource_type="Conversation",
                     resource_id=conversation_id or None,
                     payload={
-                        "intent": "schema_meta_question",
+                        "intent": broadcast_intent,
                         "schema_meta_column": schema_meta_column,
                         "fallback_used": True,
-                        "reason": "schema_meta_short_circuit",
+                        "reason": f"{column_kind}_short_circuit",
                         "dialog_turn": dialog_turn,
                     },
                 )
@@ -2182,6 +2187,109 @@ class TranslatorPipeline:
                     continue
                 return True, cand
         return True, None
+
+    # ------------------------------------------------------------------
+    # Column-value broadcast detection
+    # ------------------------------------------------------------------
+    # "what is the value of loan_id across these tables", "give me sample
+    # of 5 values from each of these tables" — same root cause as
+    # schema-meta: span "loan_id" tokenises to "loan", matches every
+    # `Servicing.Loan.*_balance` BA in the ontology, the synonym detector
+    # clusters them by `_balance` suffix, and the user gets the same
+    # nonsense clarification while the agents (which CAN sample the
+    # actual rows) never run. Treat these as a sibling broadcast intent:
+    # bypass the ontology gate, hand each DB/GRAPH agent a "list tables
+    # with column X, then SELECT a sample from each" plan.
+    _COLUMN_VALUE_VERBS = (
+        r"(?:value|values|sample|samples|sampling|rows?|records?|"
+        r"data|observations?|examples?|entries|instances?)"
+    )
+    _COLUMN_VALUE_SCOPE = (
+        # Multi-source qualifier — at least one of these must be present
+        # to confirm the user wants cross-table coverage. A single-table
+        # data question ("show me 5 rows of loans") shouldn't broadcast.
+        r"(?:across|in\s+each|from\s+each|from\s+all|from\s+the|"
+        r"from\s+these|from\s+those|every\s+(?:table|database|source)|"
+        r"\btables\b|\bdatabases\b|data\s*sources?|"
+        r"\bdatasets\b|\btools\b)"
+    )
+    _COLUMN_VALUE_COLUMN_PATTERNS = (
+        # quoted name
+        r"['\"`]([a-zA-Z][a-zA-Z0-9_]*)['\"`]",
+        # "value(s)/sample/rows of <col>" or "for/from <col>"
+        r"\b(?:value|values|sample|samples|sampling|rows?|records?|data|"
+        r"examples?)\s+(?:of|for|from|in)\s+(?:the\s+|each\s+|every\s+)?"
+        r"([a-zA-Z][a-zA-Z0-9_]*?_[a-zA-Z][a-zA-Z0-9_]*)\b",
+        # "<col> value(s)/sample/rows"
+        r"\b([a-zA-Z][a-zA-Z0-9_]*?_[a-zA-Z][a-zA-Z0-9_]*)\s+"
+        r"(?:value|values|sample|samples|rows?|records?|data)\b",
+        # column/field <name>
+        r"\b(?:column|columns|field|fields|attribute|attributes)\s+"
+        r"(?:named\s+|called\s+)?([a-zA-Z][a-zA-Z0-9_]*)\b",
+        # bare snake-case identifier near a value verb (last resort)
+        r"\b([a-zA-Z][a-zA-Z0-9_]*?_[a-zA-Z][a-zA-Z0-9_]*)\b",
+    )
+
+    @classmethod
+    def _detect_column_value_question(cls, question: str) -> Tuple[bool, Optional[str]]:
+        """Detect cross-source data-sampling questions for a specific
+        column ("value of loan_id across these tables", "sample 5 rows of
+        loan_id from each table"). Returns ``(is_value_q, column)``.
+
+        Conservative on purpose — we only return True when we see BOTH a
+        value/sample verb AND a multi-source qualifier (across / each /
+        plural tables / from these). A single-source data question
+        ("show me 5 rows of the loans table") shouldn't broadcast.
+        """
+        if not question:
+            return False, None
+        q = question.strip()
+        q_lower = q.lower()
+
+        verb_re = re.compile(rf"\b{cls._COLUMN_VALUE_VERBS}\b", re.IGNORECASE)
+        scope_re = re.compile(rf"\b{cls._COLUMN_VALUE_SCOPE}\b", re.IGNORECASE)
+        if not (verb_re.search(q_lower) and scope_re.search(q_lower)):
+            return False, None
+
+        skip = cls._SCHEMA_META_STOP_TOKENS
+        skip_extra = {
+            "table", "tables", "database", "databases", "schema", "schemas",
+            "dataset", "datasets", "system", "systems",
+            "catalog", "catalogs", "store", "stores",
+            "column", "columns", "field", "fields",
+            "attribute", "attributes", "property", "properties",
+            "value", "values", "sample", "samples", "row", "rows",
+            "record", "records", "data", "name", "id",
+        }
+        for pat in cls._COLUMN_VALUE_COLUMN_PATTERNS:
+            for m in re.finditer(pat, q):
+                cand = (m.group(1) or "").strip()
+                cand_l = cand.lower()
+                if not cand or cand_l in skip or cand_l in skip_extra:
+                    continue
+                if len(cand_l) < 2:
+                    continue
+                return True, cand
+        return True, None
+
+    @classmethod
+    def _detect_column_question(
+        cls, question: str
+    ) -> Tuple[str, Optional[str]]:
+        """Unified detector for both broadcast intents.
+
+        Returns ``(kind, column)`` where ``kind`` is one of:
+          ``"schema_meta"`` — catalog-shape question
+          ``"column_value"`` — cross-source data-sampling for a column
+          ``""`` — neither; let the normal ontology pipeline handle it
+        """
+        is_meta, col = cls._detect_schema_meta_question(question)
+        if is_meta:
+            return "schema_meta", col
+        is_val, col = cls._detect_column_value_question(question)
+        if is_val:
+            return "column_value", col
+        return "", None
 
     @staticmethod
     def _best_domain(canonical_entities: List[Dict[str, Any]]) -> Optional[str]:

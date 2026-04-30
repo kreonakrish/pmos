@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from datetime import datetime
@@ -916,18 +917,24 @@ class PipelineService:
         question: str,
         column: str,
         trace_id: str,
+        kind: str = "schema_meta",
+        sample_n: int = 5,
     ) -> List[Tuple[str, str, str]]:
         """Build one broadcast subtask per team agent that has a
         DATABASE or GRAPH tool.
+
+        ``kind`` controls the SQL/Cypher plan baked into each subtask:
+          * ``schema_meta``  — list tables / nodes that have the column.
+          * ``column_value`` — list tables, then SELECT a sample of N
+            values from each. ``sample_n`` defaults to 5; pass a
+            different value when the user asks for a different count.
 
         Returns a list of ``(subtask_description, agent_id, agent_name)``.
         Empty list when no agent on the team has a DB/Graph tool — caller
         falls back to bare LLM decomposition.
 
-        The description is explicit about which agent owns the subtask
-        and which tools it should run. This is the broadcast pattern the
-        user asked for: each agent reports the catalog matches it can
-        see, and step-8 aggregation merges them into the final answer.
+        Each agent reports only on ITS OWN datasources; step-8 aggregation
+        merges the per-agent answers into the final response.
         """
         if not team_id:
             return []
@@ -939,9 +946,10 @@ class PipelineService:
             )
         except Exception as exc:
             logger.warning(
-                "Could not fetch team for schema-meta broadcast",
+                "Could not fetch team for broadcast subtasks",
                 layer="service",
                 team_id=team_id,
+                kind=kind,
                 error=str(exc),
                 trace_id=trace_id,
             )
@@ -963,6 +971,8 @@ class PipelineService:
                 f"the column the user asks about in this question: "
                 f"\"{question}\""
             )
+
+        col_l = (column or "").lower()
 
         for agent in agents_list:
             a_name = (
@@ -996,41 +1006,81 @@ class PipelineService:
                 tool_lines.append(f"  - {tn} ({tt}) {ep}".rstrip())
             tools_block = "\n".join(tool_lines)
 
+            # SQL plan + return-format vary by kind.
+            if kind == "column_value":
+                col_eq = repr(col_l) if col_l else "LOWER(<col>)"
+                col_like = repr("%" + col_l + "%") if col_l else "LOWER('%<col>%')"
+                col_ident = column or "<col>"
+                plan = (
+                    " 1. For each DATABASE tool, first list its tables with "
+                    f"the column via:\n"
+                    f"      SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME\n"
+                    f"      FROM information_schema.COLUMNS\n"
+                    f"      WHERE LOWER(COLUMN_NAME) = {col_eq}\n"
+                    f"        OR LOWER(COLUMN_NAME) LIKE {col_like}\n"
+                    f"      ORDER BY TABLE_SCHEMA, TABLE_NAME;\n"
+                    f" 2. For EACH table returned in step 1, run:\n"
+                    f"      SELECT `{col_ident}` FROM `<schema>`.`<table>` "
+                    f"WHERE `{col_ident}` IS NOT NULL LIMIT {sample_n};\n"
+                    f" 3. For each GRAPH tool (Neo4j), find node labels "
+                    f"with the property and sample values:\n"
+                    f"      CALL db.schema.nodeTypeProperties() YIELD "
+                    f"nodeType, propertyName WHERE toLower(propertyName) "
+                    f"CONTAINS toLower($col) RETURN nodeType, propertyName;\n"
+                    f"      Then for each label, MATCH (n:<Label>) WHERE "
+                    f"n.{col_ident} IS NOT NULL RETURN n.{col_ident} "
+                    f"LIMIT {sample_n};\n"
+                    f" 4. Run EVERY tool you have — partial coverage is "
+                    f"the correct answer for your slice; silence is NOT.\n"
+                    f" 5. Return a Markdown table with columns: Tool, "
+                    f"Database/Schema, Table/NodeLabel, Sample {col_ident} "
+                    f"values (comma-separated, up to {sample_n}). After "
+                    f"the table, list any tables that returned zero rows, "
+                    f"and any tools that had no matching tables."
+                )
+            else:  # schema_meta (default)
+                col_eq = repr(col_l) if col_l else "LOWER(<col>)"
+                col_like = repr("%" + col_l + "%") if col_l else "LOWER('%<col>%')"
+                plan = (
+                    " 1. For each DATABASE tool, run an information_schema "
+                    f"query like:\n"
+                    f"      SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME\n"
+                    f"      FROM information_schema.COLUMNS\n"
+                    f"      WHERE LOWER(COLUMN_NAME) = {col_eq}\n"
+                    f"        OR LOWER(COLUMN_NAME) LIKE {col_like}\n"
+                    f"      ORDER BY TABLE_SCHEMA, TABLE_NAME;\n"
+                    f" 2. For each GRAPH tool (Neo4j), introspect the schema, e.g.:\n"
+                    f"      CALL db.schema.nodeTypeProperties() YIELD "
+                    f"nodeType, propertyName WHERE toLower(propertyName) "
+                    f"CONTAINS toLower($col) RETURN *;\n"
+                    f"      CALL db.schema.relTypeProperties() YIELD "
+                    f"relType, propertyName WHERE toLower(propertyName) "
+                    f"CONTAINS toLower($col) RETURN *;\n"
+                    f" 3. Run every tool you have — silence is NOT an answer. "
+                    f"If a tool returns zero rows, report that explicitly.\n"
+                    f" 4. Return a Markdown table with columns: Tool, "
+                    f"Database/Schema, Table/NodeLabel, Column/Property. "
+                    f"Below it, give a one-line count: \"<N> matches across "
+                    f"<K> tools\". If no matches, say so plainly."
+                )
+
             desc = (
                 f"You are {a_name}. Answer this catalog question for "
                 f"YOUR datasources only — do NOT delegate to other agents.\n\n"
                 f"User question: {question}\n\n"
                 f"Looking for: {col_phrase}\n\n"
                 f"Tools you must use:\n{tools_block}\n\n"
-                f"Plan:\n"
-                f" 1. For each DATABASE tool, run an information_schema "
-                f"query like:\n"
-                f"      SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME\n"
-                f"      FROM information_schema.COLUMNS\n"
-                f"      WHERE LOWER(COLUMN_NAME) "
-                f"      {('= ' + repr(column.lower())) if column else 'LIKE LOWER(...)'}\n"
-                f"      OR LOWER(COLUMN_NAME) LIKE "
-                f"      {repr('%' + (column.lower() if column else '') + '%') if column else 'LOWER(...)'}\n"
-                f"      ORDER BY TABLE_SCHEMA, TABLE_NAME;\n"
-                f" 2. For each GRAPH tool (Neo4j), introspect the schema, e.g.:\n"
-                f"      CALL db.schema.nodeTypeProperties() YIELD nodeType, propertyName "
-                f"WHERE toLower(propertyName) CONTAINS toLower($col) RETURN *;\n"
-                f"      CALL db.schema.relTypeProperties() YIELD relType, propertyName "
-                f"WHERE toLower(propertyName) CONTAINS toLower($col) RETURN *;\n"
-                f" 3. Run every tool you have — silence is NOT an answer. "
-                f"If a tool returns zero rows, report that explicitly.\n"
-                f" 4. Return a Markdown table with columns: Tool, "
-                f"Database/Schema, Table/NodeLabel, Column/Property. "
-                f"Below it, give a one-line count: \"<N> matches across "
-                f"<K> tools\". If no matches, say so plainly."
+                f"Plan:\n{plan}"
             )
             out.append((desc, a_id, a_name))
 
         logger.info(
-            "Schema-meta broadcast plan",
+            "Broadcast plan built",
             layer="service",
             team_id=team_id,
+            kind=kind,
             agent_count=len(out),
+            sample_n=sample_n if kind == "column_value" else None,
             trace_id=trace_id,
         )
         return out
@@ -1692,20 +1742,53 @@ class PipelineService:
 
         used_ontology = bool(canonical_entity_names) and bool(domain_subtasks)
 
-        # Schema-meta broadcast — translator detected a catalog-shape
-        # question. Build one subtask per team agent that has a DATABASE
-        # or GRAPH tool, telling each to introspect ITS OWN catalog and
+        # Catalog/column broadcast — translator detected one of:
+        #   schema_meta_question   — "how many tables have X column"
+        #   column_value_question  — "value of X across these tables"
+        # Build one subtask per team agent that has a DATABASE or GRAPH
+        # tool, telling each to introspect / sample ITS OWN catalog and
         # report back. Pre-assign each subtask to the named agent so the
-        # bidder can't misroute. The aggregation step (step 8) combines
-        # the per-agent answers into the user-visible response.
+        # bidder can't misroute. Step 8 aggregation combines the per-
+        # agent answers into the user-visible response.
         schema_meta_assignments: Dict[str, str] = {}
-        if intent == "schema_meta_question":
+        if intent in ("schema_meta_question", "column_value_question"):
             sm_column = str(translation.get("schema_meta_column") or "").strip()
+            sm_kind = (
+                "column_value"
+                if intent == "column_value_question"
+                else "schema_meta"
+            )
+            # Parse "<N> samples" / "sample of <N>" / "<N> rows" from
+            # the question so the agent samples the count the user asked
+            # for. Falls back to 5 when no number was given.
+            sample_n = 5
+            if sm_kind == "column_value":
+                m = re.search(
+                    r"\b(?:sample(?:\s+of)?|of|first|top|limit)\s*"
+                    r"(\d{1,4})\b",
+                    message or "",
+                    re.IGNORECASE,
+                )
+                if not m:
+                    m = re.search(
+                        r"\b(\d{1,4})\s*(?:samples?|rows?|values?|records?)\b",
+                        message or "",
+                        re.IGNORECASE,
+                    )
+                if m:
+                    try:
+                        n = int(m.group(1))
+                        if 1 <= n <= 1000:
+                            sample_n = n
+                    except (TypeError, ValueError):
+                        pass
             sm_subtasks = await self._build_schema_meta_subtasks(
                 team_id=team_id,
                 question=message,
                 column=sm_column,
                 trace_id=trace_id,
+                kind=sm_kind,
+                sample_n=sample_n,
             )
             if sm_subtasks:
                 # Pre-assign: subtask description -> agent_id. Read by the
