@@ -125,18 +125,24 @@ class PipelineService:
                 error=str(exc),
             )
 
-        # Question-pattern dispatcher (Phase 1: SHADOW mode — runs every
-        # registered pattern's detect() and stamps the decision trace on
-        # the TaskGraph for the UI, but does NOT drive routing yet).
-        # Phase 4 flips ``self._pattern_routing_enabled`` to True.
+        # Question-pattern dispatcher. ``_pattern_routing_enabled`` is
+        # the cutover flag flipped in Phase 4: when True, the
+        # dispatcher's winner drives routing for the Report (auto-fire +
+        # confirm) and Clarify branches. The other patterns
+        # (TeamSelf, RAG-only, Metadata, ColumnValue, Business,
+        # FreeForm) keep flowing through the existing helpers — their
+        # decisions are recorded on the trace but execution is
+        # unchanged from today.
         self._pattern_registry = build_default_registry()
         self._pattern_dispatcher = PatternDispatcher(self._pattern_registry.all())
-        self._pattern_routing_enabled = False
+        self._pattern_routing_enabled = True
         # Per-request scratch for the dispatcher. Reset at the top of
-        # execute(); read by _run_pattern_dispatch_shadow() between
-        # step 2 and step 3.
+        # execute(); read by _run_pattern_dispatch() between step 2 and
+        # the legacy gates so the gates can defer to the winner.
         self._last_translation: Dict[str, Any] = {}
         self._last_team_context: TeamContext = TeamContext()
+        self._last_pattern_winner: Optional[str] = None
+        self._last_pattern_payload: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Agent DB-ID resolver
@@ -223,6 +229,8 @@ class PipelineService:
         # Reset dispatcher scratch — see __init__.
         self._last_translation = {}
         self._last_team_context = TeamContext()
+        self._last_pattern_winner = None
+        self._last_pattern_payload = {}
 
         logger.info(
             "Pipeline execution started",
@@ -386,17 +394,20 @@ class PipelineService:
                 conversation_id=conversation_id,
             )
 
-            # Step 2b: PATTERN DISPATCH (shadow mode in Phase 1).
-            # Runs every registered pattern's detect() in parallel and
-            # stamps a DecisionTrace on the TaskGraph for the UI. Does
-            # not drive routing yet — the legacy gates below still win.
+            # Step 2b: PATTERN DISPATCH.
+            # Runs every registered pattern's detect() in parallel,
+            # stamps a DecisionTrace on the TaskGraph for the UI, and
+            # caches the winner so the gates below can defer to it
+            # (Phase 4 cutover). When dispatch fails or routing is
+            # disabled, the legacy gates re-derive from translator
+            # output as before.
             try:
                 prior_turns_for_dispatch = await self._fetch_prior_turns_from_messages(
                     conversation_id=conversation_id, trace_id=trace_id,
                 )
             except Exception:
                 prior_turns_for_dispatch = []
-            await self._run_pattern_dispatch_shadow(
+            await self._run_pattern_dispatch(
                 graph_id=graph_id,
                 message=message,
                 team_id=team_id,
@@ -444,11 +455,41 @@ class PipelineService:
             top_score = float(top_match.get("score") or 0.0) if top_match else 0.0
             second_score = float(matched_reports[1].get("score") or 0.0) if len(matched_reports) > 1 else 0.0
 
+            # Phase 4 — defer the Report band classification to the
+            # dispatcher when routing is enabled. We still recompute the
+            # legacy thresholds locally so the path stays correct when
+            # dispatch failed (winner=None) or is in shadow mode.
+            dispatcher_says_report = (
+                self._pattern_routing_enabled
+                and self._last_pattern_winner == "report"
+            )
+            dispatcher_report_kind = (
+                str(self._last_pattern_payload.get("kind") or "")
+                if dispatcher_says_report else ""
+            )
+            legacy_auto_fire = bool(
+                top_match
+                and top_score >= AUTO_FIRE_THRESHOLD
+                and (top_score - second_score) >= 1.0
+            )
+            legacy_confirm = bool(
+                top_match and top_score >= CONFIRM_THRESHOLD
+            )
+            should_auto_fire = (
+                dispatcher_report_kind == "auto_fire"
+                if dispatcher_says_report
+                else legacy_auto_fire
+            )
+            should_confirm = (
+                dispatcher_report_kind == "confirm"
+                if dispatcher_says_report
+                else legacy_confirm
+            )
+
             if (
                 not skip_report_match
                 and top_match
-                and top_score >= AUTO_FIRE_THRESHOLD
-                and (top_score - second_score) >= 1.0
+                and should_auto_fire
             ):
                 logger.info(
                     "Pipeline short-circuited for deterministic Report",
@@ -498,7 +539,7 @@ class PipelineService:
             if (
                 not skip_report_match
                 and top_match
-                and top_score >= CONFIRM_THRESHOLD
+                and should_confirm
             ):
                 # Confirm-band match — ask the user before firing the report.
                 # Persist pending state on the conversation so the next turn
@@ -558,9 +599,20 @@ class PipelineService:
                     "auditor_issue_kind": None,
                 }
 
-            # F4 — clarification short-circuit (only fires when no
-            # deterministic Report match took precedence above).
-            if meta and meta.get("need") and meta.get("question"):
+            # F4 — clarification short-circuit. Phase 4: prefer the
+            # dispatcher's verdict; fall back to the translator-meta
+            # read when routing is disabled or dispatch failed.
+            dispatcher_says_clarify = (
+                self._pattern_routing_enabled
+                and self._last_pattern_winner == "clarify"
+            )
+            legacy_clarify = bool(meta and meta.get("need") and meta.get("question"))
+            should_clarify = (
+                dispatcher_says_clarify
+                if self._pattern_routing_enabled and self._last_pattern_winner is not None
+                else legacy_clarify
+            )
+            if should_clarify and meta and meta.get("question"):
                 await self._neo4j.update_graph_status(
                     graph_id, "AWAITING_CLARIFICATION", trace_id=trace_id,
                 )
@@ -975,7 +1027,7 @@ class PipelineService:
             )
             return ""
 
-    async def _run_pattern_dispatch_shadow(
+    async def _run_pattern_dispatch(
         self,
         graph_id: str,
         message: str,
@@ -985,18 +1037,19 @@ class PipelineService:
         trace_id: str,
         prior_turns: List[Dict[str, Any]],
     ) -> None:
-        """Phase 1: run the pattern dispatcher in shadow mode.
+        """Run the dispatcher and stamp the decision trace.
 
-        Builds a ``DispatchContext`` from the cached translator output
-        and team facts, runs every registered pattern's ``detect()`` in
-        parallel, and stamps the resulting ``DecisionTrace`` on the
-        TaskGraph as a JSON property so the Pipeline-Jobs UI can render
-        the candidate-score table. Does NOT drive routing — the legacy
-        ``if/elif`` dispatch in ``execute()`` is still authoritative.
+        Phase 4: ``_pattern_routing_enabled`` controls whether downstream
+        gates consult ``self._last_pattern_winner`` instead of
+        re-deriving from translator output. Either way the trace is
+        always recorded for the UI.
 
         Failures are non-fatal: a broken dispatcher must not break the
-        pipeline. The legacy path keeps running.
+        pipeline. ``_last_pattern_winner`` stays None, the legacy gates
+        still see the cached translator output via the Neo4j read
+        path, and execution proceeds.
         """
+        shadow = not self._pattern_routing_enabled
         try:
             ctx = DispatchContext(
                 question=message or "",
@@ -1009,7 +1062,16 @@ class PipelineService:
                 translator=dict(self._last_translation or {}),
                 team=self._last_team_context,
             )
-            _, _, trace = await self._pattern_dispatcher.dispatch(ctx, shadow=True)
+            winner, match, trace = await self._pattern_dispatcher.dispatch(
+                ctx, shadow=shadow,
+            )
+
+            if winner is not None and match is not None:
+                self._last_pattern_winner = winner.name
+                self._last_pattern_payload = dict(match.payload or {})
+            else:
+                self._last_pattern_winner = None
+                self._last_pattern_payload = {}
 
             # Stamp on TaskGraph for the UI. JSON-serialise the trace
             # body once; Neo4j stores it as a string property.
@@ -1030,7 +1092,7 @@ class PipelineService:
                         "graph_id": graph_id,
                         "trace_json": payload,
                         "winner": trace.winner or "",
-                        "shadow": True,
+                        "shadow": shadow,
                     },
                     trace_id=trace_id,
                 )
@@ -1044,12 +1106,14 @@ class PipelineService:
                 )
         except Exception as exc:
             logger.warning(
-                "Pattern dispatch (shadow) failed — non-fatal",
+                "Pattern dispatch failed — non-fatal, falling back to legacy gates",
                 layer="service",
                 graph_id=graph_id,
                 error=str(exc),
                 trace_id=trace_id,
             )
+            self._last_pattern_winner = None
+            self._last_pattern_payload = {}
 
     async def _build_schema_meta_subtasks(
         self,

@@ -227,10 +227,16 @@ async def test_dispatch_marks_shadow_flag():
 # Registry
 # ---------------------------------------------------------------------------
 
-def test_default_registry_is_empty_during_phase_one():
-    """Phase 1 ships an empty registry — patterns are added in Phase 3."""
+def test_default_registry_includes_all_eight_patterns():
+    """Phase 3 fills the registry. Order is the final tie-break, so the
+    set of names is what matters here — priority controls actual
+    routing (covered in test_patterns.py)."""
     reg = build_default_registry()
-    assert list(reg) == []
+    names = [p.name for p in reg]
+    assert set(names) == {
+        "team_self", "report", "clarify", "rag",
+        "metadata", "column_value", "business", "freeform",
+    }
 
 
 def test_registry_preserves_insertion_order():
