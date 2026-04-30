@@ -313,6 +313,50 @@ class TranslatorPipeline:
                 pass
             return empty_res
 
+        # Schema-meta short-circuit. Catalog-shape questions ("how many
+        # tables have loan_id columns") must skip the ontology pipeline:
+        # span tokenisation matches the column name against unrelated
+        # BusinessAttributes that share a substring (e.g. "loan" → every
+        # `Servicing.Loan.*` attribute), the synonym detector clusters
+        # them by suffix, and the user gets a confused clarification
+        # while the team's DB-tool agents never run. Hand off to the
+        # orchestrator's broadcast path with a clean intent.
+        is_schema_meta, schema_meta_column = self._detect_schema_meta_question(question)
+        if is_schema_meta:
+            logger.info(
+                "Schema-meta question detected — short-circuiting ontology pipeline",
+                layer="service",
+                trace_id=trace_id,
+                column=schema_meta_column,
+                question_len=len(question),
+            )
+            sm_res = empty_translation_result(trace_id=trace_id)
+            sm_res["intent"] = "schema_meta_question"
+            sm_res["fallback_used"] = True
+            sm_res["clarification_needed"] = False
+            sm_res["clarification_question"] = None
+            sm_res["schema_meta_column"] = schema_meta_column or ""
+            sm_res["schema_meta_question"] = question
+            try:
+                await _audit.write(
+                    trace_id=trace_id,
+                    actor="translator",
+                    actor_type="SERVICE",
+                    action="translator.done",
+                    resource_type="Conversation",
+                    resource_id=conversation_id or None,
+                    payload={
+                        "intent": "schema_meta_question",
+                        "schema_meta_column": schema_meta_column,
+                        "fallback_used": True,
+                        "reason": "schema_meta_short_circuit",
+                        "dialog_turn": dialog_turn,
+                    },
+                )
+            except Exception:
+                pass
+            return sm_res
+
         # 1. NER + Intent — prior_turns prepended as dialog history.
         intent, spans = await self._step1_ner_intent(
             question, trace_id=trace_id, prior_turns=prior_turns
@@ -536,17 +580,36 @@ class TranslatorPipeline:
             prior_turns=prior_turns,
         )
 
+        # F8 — explicit routing hints. When the user names a file (.docx,
+        # .pdf, ...), a specific table ("foreclosures table"), the graph
+        # explicitly ("home lending graph", "neo4j"), or a record id (L0009),
+        # the question is precise enough that the report-match and
+        # synonym-narrowing short-circuits do more harm than good — they
+        # bounce the user through clarification loops while a capable agent
+        # never gets to run. Bypass both gates so the agent loop runs and
+        # picks the right tool from the team's catalog.
+        routing_hints = self._detect_explicit_routing_hints(question)
+
         # Ext2 — Report resolution. Walk the (:Report) nodes in the ontology
         # graph, score each against the question + canonical entities + any
         # team mention. The orchestrator decides whether to run the command
         # directly (high-confidence single match) or just surface as context.
-        matched_reports = await self._step6b_report_resolution(
-            question=question,
-            spans=spans,
-            canonical_entities=canonical_entities,
-            prior_turns=prior_turns,
-            trace_id=trace_id,
-        )
+        if routing_hints:
+            matched_reports = []
+            logger.info(
+                "Skipping report resolution due to explicit routing hints",
+                layer="service",
+                trace_id=trace_id,
+                hints=routing_hints,
+            )
+        else:
+            matched_reports = await self._step6b_report_resolution(
+                question=question,
+                spans=spans,
+                canonical_entities=canonical_entities,
+                prior_turns=prior_turns,
+                trace_id=trace_id,
+            )
 
         # 7. Used ontology subgraph
         used_subgraph = self._step7_used_subgraph(
@@ -666,13 +729,21 @@ class TranslatorPipeline:
                     "The translator could not match the user's question to "
                     "any ontology concept."
                 )
-                clarification_question = self._build_narrowing_question(
-                    prior_turns=prior_turns,
-                    canonical_entities=canonical_entities,
-                    synonym_clusters=synonym_clusters,
-                    dialog_turn=dialog_turn,
-                )
-                clarification_needed = True
+                # If the user gave explicit hints (a table, file, graph
+                # mention, or record id), let the agent loop run instead of
+                # asking the user to rephrase — the agent has direct tool
+                # access and the hint is already actionable.
+                if routing_hints:
+                    clarification_question = None
+                    clarification_needed = False
+                else:
+                    clarification_question = self._build_narrowing_question(
+                        prior_turns=prior_turns,
+                        canonical_entities=canonical_entities,
+                        synonym_clusters=synonym_clusters,
+                        dialog_turn=dialog_turn,
+                    )
+                    clarification_needed = True
 
             no_res_id = raise_or_dedupe(
                 kind=issue_kind,
@@ -721,7 +792,14 @@ class TranslatorPipeline:
                     if ml in user_text or ml.rsplit(".", 1)[-1] in user_text:
                         user_acked = True
                         break
-            if user_acked:
+            # Explicit routing hints (a specific table, file, graph mention,
+            # or record id) over-ride synonym narrowing — the user's question
+            # is precise; bouncing them through "Among ... which one?" just
+            # blocks the agent loop. Auditor issue stays raised above.
+            if routing_hints:
+                clarification_needed = False
+                clarification_question = None
+            elif user_acked:
                 clarification_needed = False
                 clarification_question = None
             else:
@@ -1943,6 +2021,167 @@ class TranslatorPipeline:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    # File extensions that imply the user is asking about a document and
+    # therefore wants RAG retrieval, not a saved-report/SQL match.
+    _DOCUMENT_EXTENSIONS = (
+        "docx", "doc", "pdf", "xlsx", "xls", "csv", "txt", "md",
+        "pptx", "ppt", "html", "htm", "rtf",
+    )
+
+    # Phrase fragments that signal the user is asking about the live graph
+    # (Neo4j ontology / home-lending knowledge graph) — should bypass the
+    # SQL-leaning report match and route to the graph tool via the agent.
+    _GRAPH_PHRASES = (
+        "knowledge graph",
+        "home lending graph",
+        "lending graph",
+        "ontology graph",
+        "graph database",
+        "in the graph",
+        "from the graph",
+        "neo4j",
+        "cypher",
+    )
+
+    @classmethod
+    def _detect_explicit_routing_hints(cls, question: str) -> Dict[str, Any]:
+        """Detect signals that make the question precise enough to bypass
+        the report-match and synonym-narrowing short-circuits.
+
+        Returns a dict with any of:
+          ``document``    — file-extension mention (.docx, .pdf, ...)
+          ``graph``       — graph/Neo4j/ontology phrase
+          ``tables``      — list of "<name> table" mentions (lowercased)
+          ``record_ids``  — list of capitalized-prefix record ids (e.g. L0009)
+
+        Empty dict means no explicit signal — the existing pipeline behavior
+        applies.
+        """
+        if not question:
+            return {}
+        q_lower = question.lower()
+        out: Dict[str, Any] = {}
+
+        # Document references — file extension after a token.
+        ext_pattern = r"\.(?:" + "|".join(cls._DOCUMENT_EXTENSIONS) + r")\b"
+        if re.search(ext_pattern, q_lower):
+            out["document"] = True
+
+        # Graph references — any phrase from the allow-list.
+        for phrase in cls._GRAPH_PHRASES:
+            if phrase in q_lower:
+                out["graph"] = True
+                break
+
+        # Explicit "<name> table" references — capture the noun before "table".
+        tables = re.findall(r"\b([a-z][a-z0-9_]{2,})\s+table\b", q_lower)
+        if tables:
+            out["tables"] = tables
+
+        # Record-id pattern — short alpha prefix + 3+ digits, e.g. L0009, FC123.
+        # Use the original-case question so we only catch obviously-id-shaped
+        # tokens, not regular words.
+        record_ids = re.findall(r"\b[A-Z]{1,3}\d{3,}\b", question)
+        if record_ids:
+            out["record_ids"] = record_ids
+
+        return out
+
+    # Phrases that strongly suggest the question is about catalog SHAPE
+    # (which tables / databases / schemas have a column named X) rather
+    # than the values stored in those columns. The ontology pipeline
+    # handles the latter; the former needs information_schema / db.schema
+    # introspection on the actual datasources, which only the agent loop
+    # can run.
+    _SCHEMA_META_OBJECT_TOKENS = r"(?:tables?|databases?|schemas?|datasets?|systems?|catalogs?|stores?)"
+    _SCHEMA_META_FIELD_TOKENS = r"(?:columns?|fields?|attributes?|properties)"
+    _SCHEMA_META_VERBS = r"(?:have|has|contain|contains|with|where|use|uses|reference|references|expose|exposes)"
+
+    # Identifier shapes we accept as "the column the user is asking about".
+    # Order matters: snake_case / quoted forms beat bare lowercase tokens
+    # so we prefer "loan_id" over "loan" / "id".
+    _SCHEMA_META_COLUMN_PATTERNS = (
+        # quoted: "loan_id", `loan_id`, 'loan_id'
+        r"['\"`]([a-zA-Z][a-zA-Z0-9_]*)['\"`]",
+        # column/field <name> or column named/called <name>
+        r"\b(?:column|columns|field|fields|attribute|attributes)\s+(?:named\s+|called\s+)?([a-zA-Z][a-zA-Z0-9_]*)\b",
+        # <snake_case_name> column / field — stronger signal than bare word.
+        r"\b([a-zA-Z][a-zA-Z0-9_]*?_[a-zA-Z][a-zA-Z0-9_]*)\s+(?:columns?|fields?|attributes?)\b",
+        # bare <name> column / field — last resort, weakest pattern.
+        r"\b([a-zA-Z][a-zA-Z0-9_]*)\s+(?:columns?|fields?|attributes?)\b",
+    )
+
+    # Tokens that look identifier-shaped but are filler words. Skip them
+    # when extracting the column name so we don't grab "the" out of
+    # "the loan_id column".
+    _SCHEMA_META_STOP_TOKENS = frozenset({
+        "the", "a", "an", "any", "every", "all", "some", "many", "more",
+        "this", "that", "these", "those", "your", "their", "such", "same",
+        "primary", "foreign", "unique", "common", "shared", "related",
+        "named", "called", "specific", "particular", "given",
+    })
+
+    @classmethod
+    def _detect_schema_meta_question(cls, question: str) -> Tuple[bool, Optional[str]]:
+        """Detect catalog meta-questions ("how many tables have <col>",
+        "where does <col> exist", "which databases contain <col> column").
+
+        Returns ``(is_schema_meta, column_name_or_None)``. When the
+        question is a schema-meta question we always return ``True`` —
+        even if we couldn't extract a column name — because the
+        translator should still skip the ontology pipeline and let the
+        agents see the original wording.
+        """
+        if not question:
+            return False, None
+        q = question.strip()
+        q_lower = q.lower()
+
+        # Pattern 1: "<verb-of-having>" + catalog-object + field-token.
+        # Examples: "tables that have a loan_id column",
+        #           "databases with X field",
+        #           "which schemas use a borrower_id column".
+        catalog_field_re = re.compile(
+            rf"\b{cls._SCHEMA_META_OBJECT_TOKENS}\b[\s\w]{{0,80}}?\b{cls._SCHEMA_META_FIELD_TOKENS}\b"
+            rf"|\b{cls._SCHEMA_META_FIELD_TOKENS}\b[\s\w]{{0,80}}?\b{cls._SCHEMA_META_OBJECT_TOKENS}\b",
+            re.IGNORECASE,
+        )
+        # Pattern 2: explicit existence verbs about a column/field —
+        # "where does <col> exist", "is there a <col> column", "in which
+        # tables can I find <col>".
+        existence_re = re.compile(
+            r"\b(?:where\s+(?:is|does|do|are|can\s+(?:i|we)\s+find)"
+            r"|in\s+which\s+(?:tables?|databases?|schemas?|datasets?)"
+            r"|is\s+(?:there|the)\s+(?:a\s+)?(?:column|field|attribute)"
+            r"|does\s+(?:any|the)\s+(?:table|database|schema|dataset)"
+            r"|which\s+(?:tables?|databases?|schemas?|datasets?)\s+(?:have|contain|with|has))\b",
+            re.IGNORECASE,
+        )
+
+        is_meta = bool(catalog_field_re.search(q_lower)) or bool(existence_re.search(q_lower))
+        if not is_meta:
+            return False, None
+
+        # Try each column-extraction pattern in priority order; pick the
+        # first non-stop, non-object/-field-token candidate.
+        skip = cls._SCHEMA_META_STOP_TOKENS
+        skip_extra = {"table", "tables", "database", "databases", "schema",
+                      "schemas", "dataset", "datasets", "system", "systems",
+                      "catalog", "catalogs", "store", "stores",
+                      "column", "columns", "field", "fields",
+                      "attribute", "attributes", "property", "properties",
+                      "name", "id"}
+        for pat in cls._SCHEMA_META_COLUMN_PATTERNS:
+            for m in re.finditer(pat, q):
+                cand = (m.group(1) or "").strip()
+                cand_l = cand.lower()
+                if not cand or cand_l in skip or cand_l in skip_extra:
+                    continue
+                if len(cand_l) < 2:
+                    continue
+                return True, cand
+        return True, None
 
     @staticmethod
     def _best_domain(canonical_entities: List[Dict[str, Any]]) -> Optional[str]:

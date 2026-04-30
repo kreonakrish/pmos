@@ -139,6 +139,18 @@ class TranslationResult(TypedDict, total=False):
     # agent bid loop.
     matched_reports: List[MatchedReport]
 
+    # Schema-meta short-circuit. Set when the user is asking about the
+    # SHAPE of the catalog ("how many tables have <col> column", "where
+    # does <col> exist") rather than the data inside columns. The
+    # ontology pipeline is the wrong tool for these — it'll noisily
+    # match the column token against unrelated BAs that share a substring.
+    # The orchestrator broadcasts the question to every team agent that
+    # has a DATABASE or GRAPH tool; each agent introspects its own
+    # catalog (information_schema for SQL, db.schema.* for Neo4j) and
+    # the aggregation step combines the answers.
+    schema_meta_column: str
+    schema_meta_question: str
+
 
 def empty_translation_result(trace_id: str = "") -> TranslationResult:
     """Default-shaped result used when ontology returns nothing."""
@@ -159,4 +171,6 @@ def empty_translation_result(trace_id: str = "") -> TranslationResult:
         auditor_issue_id=None,
         auditor_issue_kind=None,
         matched_reports=[],
+        schema_meta_column="",
+        schema_meta_question="",
     )

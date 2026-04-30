@@ -72,6 +72,13 @@ class TranslationResponse(BaseModel):
     # source_uri, source_name}], uses_attributes, score, why}.
     matched_reports: List[Dict[str, Any]] = Field(default_factory=list)
 
+    # Schema-meta short-circuit. Surface the extracted column name (and
+    # the original question) so the orchestrator can build per-agent
+    # catalog-introspection subtasks. Empty string when not a schema-meta
+    # question — orchestrator treats unset/empty the same way.
+    schema_meta_column: str = ""
+    schema_meta_question: str = ""
+
 
 # ---------------------------------------------------------------------------
 # Promote example request

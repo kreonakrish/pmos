@@ -196,6 +196,10 @@ class PipelineService:
         # Store context for sub-agent spawning
         self._current_team_id = team_id
         self._current_conversation_id = conversation_id
+        # Reset schema-meta override so stale state from a prior turn on
+        # this pipeline instance can't leak into bidding.
+        self._current_schema_meta_assignments = {}
+        self._current_schema_meta_descriptions: set = set()
 
         logger.info(
             "Pipeline execution started",
@@ -566,24 +570,60 @@ class PipelineService:
             agent_assignments: Dict[str, Agent] = {}
 
             if all_agents and node_descriptions:
-                negotiation_results, bandit_decisions = await self._step3_negotiate(
-                    graph_id=graph_id,
-                    node_descriptions=node_descriptions,
-                    team_agents=all_agents,
-                    trace_id=trace_id,
-                    team_id=team_id,
-                    session_id=session_id,
+                # Schema-meta path: every subtask was already pre-assigned
+                # by _step2_graph_construction to a specific agent based on
+                # its DATABASE/GRAPH tools. Bidding here would burn ~15s
+                # per subtask × N subtasks (LLM bid timeouts) and the
+                # winner would be overridden anyway. Skip negotiation.
+                sm_overrides = getattr(self, "_current_schema_meta_assignments", None) or {}
+                sm_only_run = bool(sm_overrides) and all(
+                    desc in sm_overrides for desc in node_descriptions
                 )
-                # Build agent assignments from negotiation winners
-                for desc, neg_result in negotiation_results.items():
-                    if neg_result.winner:
-                        # Find the matching Agent object
-                        winner_agent = next(
-                            (a for a in all_agents if a.agent_id == neg_result.winner.agent_id),
+
+                if not sm_only_run:
+                    negotiation_results, bandit_decisions = await self._step3_negotiate(
+                        graph_id=graph_id,
+                        node_descriptions=node_descriptions,
+                        team_agents=all_agents,
+                        trace_id=trace_id,
+                        team_id=team_id,
+                        session_id=session_id,
+                    )
+                    # Build agent assignments from negotiation winners
+                    for desc, neg_result in negotiation_results.items():
+                        if neg_result.winner:
+                            # Find the matching Agent object
+                            winner_agent = next(
+                                (a for a in all_agents if a.agent_id == neg_result.winner.agent_id),
+                                None,
+                            )
+                            if winner_agent:
+                                agent_assignments[desc] = winner_agent
+                else:
+                    logger.info(
+                        "Skipping capability negotiation — every subtask is "
+                        "pre-assigned by schema-meta broadcast",
+                        layer="service",
+                        graph_id=graph_id,
+                        subtask_count=len(node_descriptions),
+                        trace_id=trace_id,
+                    )
+
+                # Schema-meta override. When the translator detected a
+                # catalog-shape question, _step2 built per-agent broadcast
+                # subtasks each tagged with its target agent_id. Force
+                # the assignment to that agent so a stray bid winner can't
+                # claim a subtask intended for someone else.
+                if sm_overrides:
+                    for desc, target_aid in sm_overrides.items():
+                        target = next(
+                            (a for a in all_agents if a.agent_id == target_aid),
                             None,
                         )
-                        if winner_agent:
-                            agent_assignments[desc] = winner_agent
+                        if target:
+                            agent_assignments[desc] = target
+                    # Clear so later turns on this pipeline instance start fresh.
+                    self._current_schema_meta_assignments = {}
 
             # Step 4-7: EXECUTION loop (with correction + expansion)
             node_results = await self._step4_to_7_execution(
@@ -869,6 +909,131 @@ class PipelineService:
                 trace_id=trace_id,
             )
             return ""
+
+    async def _build_schema_meta_subtasks(
+        self,
+        team_id: str,
+        question: str,
+        column: str,
+        trace_id: str,
+    ) -> List[Tuple[str, str, str]]:
+        """Build one broadcast subtask per team agent that has a
+        DATABASE or GRAPH tool.
+
+        Returns a list of ``(subtask_description, agent_id, agent_name)``.
+        Empty list when no agent on the team has a DB/Graph tool — caller
+        falls back to bare LLM decomposition.
+
+        The description is explicit about which agent owns the subtask
+        and which tools it should run. This is the broadcast pattern the
+        user asked for: each agent reports the catalog matches it can
+        see, and step-8 aggregation merges them into the final answer.
+        """
+        if not team_id:
+            return []
+        try:
+            team_data = await self._cb_agent_mgmt.call(
+                self._agent_mgmt.get_team,
+                team_id=team_id,
+                trace_id=trace_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not fetch team for schema-meta broadcast",
+                layer="service",
+                team_id=team_id,
+                error=str(exc),
+                trace_id=trace_id,
+            )
+            return []
+
+        agents_list = team_data.get("agents", []) or []
+        out: List[Tuple[str, str, str]] = []
+
+        # Tag the column hint into the description so the agent knows
+        # exactly what to look for. When we couldn't extract a column,
+        # surface the original question so the agent can interpret it.
+        if column:
+            col_phrase = (
+                f"a column named '{column}' (case-insensitive; treat "
+                f"'%{column}%' partial matches as additional candidates)"
+            )
+        else:
+            col_phrase = (
+                f"the column the user asks about in this question: "
+                f"\"{question}\""
+            )
+
+        for agent in agents_list:
+            a_name = (
+                agent.get("agent_name")
+                or agent.get("name")
+                or "?"
+            )
+            a_id = str(agent.get("agent_id") or "")
+            if not a_id:
+                continue
+            try:
+                tools = await self._agent_mgmt.get_agent_tools(
+                    agent_id=a_id, trace_id=trace_id,
+                )
+            except Exception:
+                tools = []
+            db_or_graph = [
+                t for t in (tools or [])
+                if str(t.get("tool_type") or "").upper() in ("DATABASE", "GRAPH")
+            ]
+            if not db_or_graph:
+                continue
+
+            # Compact tool inventory the agent can paste back into its
+            # prompt without re-deriving from team_context.
+            tool_lines = []
+            for t in db_or_graph:
+                tn = t.get("tool_name") or t.get("name") or "?"
+                tt = str(t.get("tool_type") or "?").upper()
+                ep = t.get("tool_endpoint") or t.get("endpoint") or ""
+                tool_lines.append(f"  - {tn} ({tt}) {ep}".rstrip())
+            tools_block = "\n".join(tool_lines)
+
+            desc = (
+                f"You are {a_name}. Answer this catalog question for "
+                f"YOUR datasources only — do NOT delegate to other agents.\n\n"
+                f"User question: {question}\n\n"
+                f"Looking for: {col_phrase}\n\n"
+                f"Tools you must use:\n{tools_block}\n\n"
+                f"Plan:\n"
+                f" 1. For each DATABASE tool, run an information_schema "
+                f"query like:\n"
+                f"      SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME\n"
+                f"      FROM information_schema.COLUMNS\n"
+                f"      WHERE LOWER(COLUMN_NAME) "
+                f"      {('= ' + repr(column.lower())) if column else 'LIKE LOWER(...)'}\n"
+                f"      OR LOWER(COLUMN_NAME) LIKE "
+                f"      {repr('%' + (column.lower() if column else '') + '%') if column else 'LOWER(...)'}\n"
+                f"      ORDER BY TABLE_SCHEMA, TABLE_NAME;\n"
+                f" 2. For each GRAPH tool (Neo4j), introspect the schema, e.g.:\n"
+                f"      CALL db.schema.nodeTypeProperties() YIELD nodeType, propertyName "
+                f"WHERE toLower(propertyName) CONTAINS toLower($col) RETURN *;\n"
+                f"      CALL db.schema.relTypeProperties() YIELD relType, propertyName "
+                f"WHERE toLower(propertyName) CONTAINS toLower($col) RETURN *;\n"
+                f" 3. Run every tool you have — silence is NOT an answer. "
+                f"If a tool returns zero rows, report that explicitly.\n"
+                f" 4. Return a Markdown table with columns: Tool, "
+                f"Database/Schema, Table/NodeLabel, Column/Property. "
+                f"Below it, give a one-line count: \"<N> matches across "
+                f"<K> tools\". If no matches, say so plainly."
+            )
+            out.append((desc, a_id, a_name))
+
+        logger.info(
+            "Schema-meta broadcast plan",
+            layer="service",
+            team_id=team_id,
+            agent_count=len(out),
+            trace_id=trace_id,
+        )
+        return out
 
     async def _assign_agents_to_subtasks(
         self,
@@ -1526,6 +1691,58 @@ class PipelineService:
                 dataset_binding_strings.append(str(b))
 
         used_ontology = bool(canonical_entity_names) and bool(domain_subtasks)
+
+        # Schema-meta broadcast — translator detected a catalog-shape
+        # question. Build one subtask per team agent that has a DATABASE
+        # or GRAPH tool, telling each to introspect ITS OWN catalog and
+        # report back. Pre-assign each subtask to the named agent so the
+        # bidder can't misroute. The aggregation step (step 8) combines
+        # the per-agent answers into the user-visible response.
+        schema_meta_assignments: Dict[str, str] = {}
+        if intent == "schema_meta_question":
+            sm_column = str(translation.get("schema_meta_column") or "").strip()
+            sm_subtasks = await self._build_schema_meta_subtasks(
+                team_id=team_id,
+                question=message,
+                column=sm_column,
+                trace_id=trace_id,
+            )
+            if sm_subtasks:
+                # Pre-assign: subtask description -> agent_id. Read by the
+                # main pipeline AFTER negotiation runs so we can override
+                # any mis-routing.
+                schema_meta_assignments = {
+                    desc: aid for desc, aid, _ in sm_subtasks
+                }
+                self._current_schema_meta_assignments = dict(schema_meta_assignments)
+                # Tag these descriptions so the executor force-accepts
+                # the answer (each agent only covers ITS own datasources;
+                # the score band would otherwise call partial coverage a
+                # failure and bounce to a useless fallback agent).
+                self._current_schema_meta_descriptions = set(schema_meta_assignments.keys())
+                # The decomposition we send into the graph is just the
+                # description list — assignments are picked up post-hoc.
+                domain_subtasks = [desc for desc, _, _ in sm_subtasks]
+                used_ontology = True  # we have explicit subtasks; skip LLM decomp
+                logger.info(
+                    "Schema-meta broadcast subtasks built",
+                    layer="service",
+                    graph_id=graph_id,
+                    trace_id=trace_id,
+                    column=sm_column,
+                    subtask_count=len(sm_subtasks),
+                )
+            else:
+                # No agent has a DATABASE/GRAPH tool. Fall back to the
+                # bare LLM decomposition path; the original question text
+                # will route to whichever agent the LLM picks.
+                logger.info(
+                    "Schema-meta question detected but no DB/GRAPH agents on team",
+                    layer="service",
+                    graph_id=graph_id,
+                    trace_id=trace_id,
+                    column=sm_column,
+                )
 
         # 2. Fallback to bare LLM decomposition when the ontology gave us
         #    nothing usable.
@@ -2412,6 +2629,27 @@ class PipelineService:
                 band = score_data.get("band", {})
                 band_low = band.get("low", 0.5)
                 recommendation = score_data.get("recommendation", "proceed")
+
+                # Schema-meta override: each broadcast subtask is bound to
+                # ONE agent's datasources by design — partial coverage is
+                # the correct answer, not a failure. The scorer treats
+                # "I have no loan_id in my one DB" as low-coverage versus
+                # the original question; that bounces to a fallback agent
+                # that has nothing useful to offer (GitHubResearcher,
+                # PythonAnalyst). Force proceed so the agent's honest
+                # per-datasource report flows into step-8 aggregation.
+                if description in getattr(self, "_current_schema_meta_descriptions", set()):
+                    if recommendation != "proceed":
+                        logger.info(
+                            "Schema-meta node — forcing proceed despite below-band score",
+                            layer="service",
+                            node_id=node_id,
+                            score=score,
+                            band_low=band_low,
+                            agent_name=agent.name if agent else "?",
+                            trace_id=trace_id,
+                        )
+                    recommendation = "proceed"
 
                 # Step 4e: Band check
                 if score >= band_low or recommendation == "proceed":
