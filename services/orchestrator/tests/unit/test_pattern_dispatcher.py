@@ -227,14 +227,14 @@ async def test_dispatch_marks_shadow_flag():
 # Registry
 # ---------------------------------------------------------------------------
 
-def test_default_registry_includes_all_eight_patterns():
-    """Phase 3 fills the registry. Order is the final tie-break, so the
+def test_default_registry_includes_all_patterns():
+    """Phase 3+ fills the registry. Order is the final tie-break, so the
     set of names is what matters here — priority controls actual
     routing (covered in test_patterns.py)."""
     reg = build_default_registry()
     names = [p.name for p in reg]
     assert set(names) == {
-        "team_self", "report", "clarify", "rag",
+        "team_self", "report", "entity_count", "clarify", "rag",
         "metadata", "column_value", "business", "freeform",
     }
 

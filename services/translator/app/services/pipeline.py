@@ -2272,16 +2272,118 @@ class TranslatorPipeline:
                 return True, cand
         return True, None
 
+    # ------------------------------------------------------------------
+    # Entity-count broadcast detection
+    # ------------------------------------------------------------------
+    # "how many loans are there", "count of borrowers", "total number of
+    # mortgages" — pure count of a business entity, no specific column.
+    # Same trap as the other broadcasts: token-tokenisation matches every
+    # `total_*_amount` BA in the ontology, the LLM resolver picks
+    # attributes when the user wanted the entity, and the synonym
+    # detector clusters the attributes by `_amount` suffix. Bypass the
+    # whole ontology path; let the agents count the canonical entity in
+    # their own datasources and the python_reduce step total the
+    # numbers (no double-counting parent + subtype).
+    _ENTITY_COUNT_VERB_RE = re.compile(
+        r"\b(?:how\s+many|number\s+of|count\s+of|total(?:\s+number)?\s+of?|"
+        r"how\s+much|"
+        r"total\s+(?=[a-z]))\b",  # "total loans" matches via lookahead
+        re.IGNORECASE,
+    )
+    # When any of these appear we hand off to MetadataPattern,
+    # ColumnValuePattern, or BusinessPattern instead. These are the
+    # signals that say "this isn't a pure entity-count question".
+    # Two compiled forms — word-bounded keywords and the operator
+    # alternation — because ``\b<\b`` won't fire on ``" > "`` (no word
+    # boundary on either side of the operator).
+    _ENTITY_COUNT_DISQUALIFIERS_RE = re.compile(
+        r"\b(?:tables?|columns?|fields?|attributes?|databases?|schemas?|"
+        r"datasets?|catalogs?|"
+        r"sample|samples|rows?|records?|values?|"
+        r"average|sum|max|min|median|"
+        r"where\s+|having\s+|group\s+by)\b",
+        re.IGNORECASE,
+    )
+    # Predicate operators with a numeric / quoted RHS — strong signal
+    # the user wants a filtered count, which BusinessPattern handles.
+    _ENTITY_COUNT_PREDICATE_RE = re.compile(
+        r"[<>=!]=?\s*['\"\d]"
+    )
+    # Filler adjectives the user often layers in. Strip them when
+    # extracting the entity noun so we get "loans" out of
+    # "how many total active outstanding loans".
+    _ENTITY_COUNT_FILLERS_RE = (
+        r"(?:total|active|inactive|pending|outstanding|closed|open|"
+        r"new|the|all|currently|"
+        r"distinct|unique)"
+    )
+
+    @classmethod
+    def _detect_entity_count_question(
+        cls, question: str
+    ) -> Tuple[bool, Optional[str]]:
+        """Detect "how many <plural-noun>" / "count of <noun>" / "total
+        <noun>" — a pure entity-count question with no attribute or
+        predicate reference. Returns ``(is_count_q, entity_token)``.
+
+        Conservative: defers to MetadataPattern / ColumnValuePattern /
+        BusinessPattern when their disqualifier tokens appear (table /
+        column / sample / value / predicate / aggregator).
+        """
+        if not question:
+            return False, None
+        q = question.strip()
+        q_l = q.lower()
+
+        if not cls._ENTITY_COUNT_VERB_RE.search(q_l):
+            return False, None
+        if cls._ENTITY_COUNT_DISQUALIFIERS_RE.search(q_l):
+            return False, None
+        if cls._ENTITY_COUNT_PREDICATE_RE.search(q_l):
+            return False, None
+
+        # Extract the noun after the count verb. Strip filler words.
+        m = re.search(
+            rf"\b(?:how\s+many|number\s+of|count\s+of|total(?:\s+number)?\s+of?"
+            rf"|how\s+much|total)\s+"
+            rf"(?:{cls._ENTITY_COUNT_FILLERS_RE}\s+)*"
+            rf"([a-zA-Z][a-zA-Z0-9_]*)\b",
+            q, re.IGNORECASE,
+        )
+        if not m:
+            return True, None  # phrasing matched but couldn't pull a noun
+        cand = (m.group(1) or "").strip()
+        cl = cand.lower()
+        # Reject filler-tokens that slipped through (regex backtracking can
+        # still capture them when there's no following noun).
+        if (cl in cls._SCHEMA_META_STOP_TOKENS
+                or cl in {"total", "active", "inactive", "pending",
+                          "outstanding", "closed", "open", "new",
+                          "distinct", "unique", "currently", "are", "is",
+                          "do", "does", "have", "has"}):
+            return True, None
+        if len(cl) < 2:
+            return True, None
+        return True, cand
+
     @classmethod
     def _detect_column_question(
         cls, question: str
     ) -> Tuple[str, Optional[str]]:
-        """Unified detector for both broadcast intents.
+        """Unified detector for the three broadcast intents.
 
-        Returns ``(kind, column)`` where ``kind`` is one of:
-          ``"schema_meta"`` — catalog-shape question
+        Returns ``(kind, token)`` where ``kind`` is one of:
+          ``"schema_meta"``  — catalog-shape question (column → ``token``)
           ``"column_value"`` — cross-source data-sampling for a column
-          ``""`` — neither; let the normal ontology pipeline handle it
+          ``"entity_count"`` — pure count of a business entity
+                              (entity-noun → ``token``)
+          ``""``             — none of the above; let the normal ontology
+                              pipeline handle it.
+
+        Order matters: schema_meta and column_value detectors fire on
+        more specific phrasings; entity_count is broader and runs last
+        so its disqualifier set doesn't have to enumerate every shape
+        the others catch.
         """
         is_meta, col = cls._detect_schema_meta_question(question)
         if is_meta:
@@ -2289,6 +2391,9 @@ class TranslatorPipeline:
         is_val, col = cls._detect_column_value_question(question)
         if is_val:
             return "column_value", col
+        is_count, entity = cls._detect_entity_count_question(question)
+        if is_count:
+            return "entity_count", entity
         return "", None
 
     @staticmethod

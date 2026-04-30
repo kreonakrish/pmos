@@ -19,6 +19,7 @@ from app.services.patterns import (
     ClarifyPattern,
     ColumnValuePattern,
     DispatchContext,
+    EntityCountPattern,
     FreeFormPattern,
     MetadataPattern,
     PatternDispatcher,
@@ -298,6 +299,82 @@ async def test_column_value_pattern_skips_single_table_query():
 
 
 @pytest.mark.asyncio
+async def test_entity_count_pattern_via_translator_intent():
+    """The translator emits intent='entity_count_question' with the
+    entity token in schema_meta_column. EntityCountPattern picks it up."""
+    ctx = _ctx(
+        "how many total loans are there in the system",
+        translator={"intent": "entity_count_question",
+                    "schema_meta_column": "loans"},
+        team=_team(["DATABASE"], ["GRAPH"]),
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert m.accepted
+    assert m.payload["entity"] == "loans"
+    assert len(m.payload["db_agent_ids"]) == 2
+    assert m.payload["aggregation"] == "python_reduce"
+
+
+@pytest.mark.asyncio
+async def test_entity_count_pattern_via_regex_only():
+    """Regex carries the decision when translator wasn't run."""
+    ctx = _ctx(
+        "how many borrowers do we have",
+        team=_team(["DATABASE"]),
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert m.accepted
+    assert m.payload["entity"] == "borrowers"
+
+
+@pytest.mark.asyncio
+async def test_entity_count_pattern_skips_when_table_token_present():
+    """When the user mentions 'tables' or 'columns', let MetadataPattern
+    or ColumnValuePattern take over — EntityCountPattern is for pure
+    counts only."""
+    ctx = _ctx(
+        "how many tables have loan_id columns",
+        team=_team(["DATABASE"]),
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert not m.accepted
+
+
+@pytest.mark.asyncio
+async def test_entity_count_pattern_skips_when_predicate_present():
+    """A WHERE-clause-like predicate ('term_months > 300') makes this a
+    BusinessPattern question, not an entity-count broadcast."""
+    ctx = _ctx(
+        "how many loans in pmos_servicing.loans have term_months > 300",
+        team=_team(["DATABASE"]),
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert not m.accepted
+
+
+@pytest.mark.asyncio
+async def test_entity_count_pattern_skips_aggregator_questions():
+    """'average loan amount' / 'sum of payments' aren't entity counts;
+    BusinessPattern handles them."""
+    ctx = _ctx(
+        "what is the average loan amount across all servicing tables",
+        team=_team(["DATABASE"]),
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert not m.accepted
+
+
+@pytest.mark.asyncio
+async def test_entity_count_pattern_drops_score_when_no_db_agents():
+    ctx = _ctx(
+        "how many loans are there",
+        team=_team(["GITHUB"]),  # no DATABASE/GRAPH agents
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert not m.accepted, "should fall through when no DB/GRAPH agents on team"
+
+
+@pytest.mark.asyncio
 async def test_business_pattern_when_translator_bound_entities():
     ctx = _ctx(
         "how many loans in pmos_servicing have term_months > 300",
@@ -386,6 +463,59 @@ async def test_route_loan_count_in_servicing():
             "canonical_entities": [{"name": "Loan"}],
             "dataset_bindings": [{"asset_fq_name": "pmos_servicing.loans"}],
             "domain_subtasks": ["count loans"],
+            "intent": "metric_lookup",
+        },
+        team=_team(["DATABASE"]),
+    )
+    _, _, trace = await disp.dispatch(ctx)
+    assert trace.winner == "business"
+
+
+@pytest.mark.asyncio
+async def test_route_pure_entity_count_beats_clarify():
+    """The user's actual failing case: 'how many total loans are there
+    in the system'. Translator's synonym detector mis-fires on
+    'total_*_amount' BAs and emits a clarification — EntityCountPattern
+    (priority 86) must override Clarify (priority 85) and win the
+    dispatch so the broadcast count + python_reduce path fires."""
+    disp = _full_dispatcher()
+    ctx = _ctx(
+        "how many total loans are there in the system",
+        translator={
+            "intent": "entity_count_question",
+            "schema_meta_column": "loans",
+            # Even if the translator ALSO surfaced a stale clarification,
+            # EntityCount must still win.
+            "clarification_needed": True,
+            "clarification_question": "Did you mean total_loan_amount or total_payment_amount?",
+        },
+        team=_team(
+            ["DATABASE"],   # SakilaAnalyst-shaped
+            ["DATABASE", "GRAPH"],  # HomeLendingAnalyst-shaped
+            ["PYTHON"],     # PythonAnalyst — used by python_reduce
+        ),
+    )
+    _, _, trace = await disp.dispatch(ctx)
+    assert trace.winner == "entity_count"
+    # And the trace should record entity_count as accepted with the
+    # entity token and python_reduce flag in evidence/payload.
+    cand = next(c for c in trace.candidates if c.name == "entity_count")
+    assert cand.accepted
+    assert "loans" in cand.explanation
+
+
+@pytest.mark.asyncio
+async def test_route_filtered_count_stays_on_business():
+    """'how many loans where term_months > 300' is a filtered count,
+    not a pure entity count — BusinessPattern handles it (predicates
+    need the agent loop)."""
+    disp = _full_dispatcher()
+    ctx = _ctx(
+        "how many loans in pmos_servicing.loans have term_months > 300",
+        translator={
+            "canonical_entities": [{"name": "Loan"}],
+            "dataset_bindings": [{"asset_fq_name": "pmos_servicing.loans"}],
+            "domain_subtasks": ["count loans with term_months > 300"],
             "intent": "metric_lookup",
         },
         team=_team(["DATABASE"]),

@@ -49,6 +49,7 @@ def build_default_registry() -> PatternRegistry:
     from app.services.patterns.business import BusinessPattern
     from app.services.patterns.clarify import ClarifyPattern
     from app.services.patterns.column_value import ColumnValuePattern
+    from app.services.patterns.entity_count import EntityCountPattern
     from app.services.patterns.freeform import FreeFormPattern
     from app.services.patterns.metadata import MetadataPattern
     from app.services.patterns.rag import RAGPattern
@@ -58,6 +59,7 @@ def build_default_registry() -> PatternRegistry:
     return PatternRegistry([
         TeamSelfPattern(),     # priority 95
         ReportPattern(),       # priority 90
+        EntityCountPattern(),  # priority 86  — beats Clarify on count Qs
         ClarifyPattern(),      # priority 85
         RAGPattern(),          # priority 80
         MetadataPattern(),     # priority 70

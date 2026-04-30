@@ -1155,6 +1155,11 @@ class PipelineService:
           * ``column_value`` — list tables, then SELECT a sample of N
             values from each. ``sample_n`` defaults to 5; pass a
             different value when the user asks for a different count.
+          * ``entity_count`` — count rows per loan-shaped table /
+            label-shaped node so step-8 python_reduce can total them
+            without double-counting parent + subtype rows. The
+            ``column`` arg is the entity token in this mode (e.g.
+            ``"loans"``), not a real column name.
 
         Returns a list of ``(subtask_description, agent_id, agent_name)``.
         Empty list when no agent on the team has a DB/Graph tool — caller
@@ -1185,10 +1190,24 @@ class PipelineService:
         agents_list = team_data.get("agents", []) or []
         out: List[Tuple[str, str, str]] = []
 
-        # Tag the column hint into the description so the agent knows
-        # exactly what to look for. When we couldn't extract a column,
-        # surface the original question so the agent can interpret it.
-        if column:
+        # Tag the hint into the description so the agent knows exactly
+        # what to look for. The ``column`` argument is reused for the
+        # entity-count case as the entity token (e.g. "loans"); the
+        # phrasing differs.
+        if kind == "entity_count":
+            ent = (column or "").strip()
+            if ent:
+                col_phrase = (
+                    f"the business entity '{ent}' "
+                    f"(table names containing the token, or Neo4j labels "
+                    f"matching, count as candidates)"
+                )
+            else:
+                col_phrase = (
+                    f"the entity the user asks to count in this question: "
+                    f"\"{question}\""
+                )
+        elif column:
             col_phrase = (
                 f"a column named '{column}' (case-insensitive; treat "
                 f"'%{column}%' partial matches as additional candidates)"
@@ -1264,6 +1283,54 @@ class PipelineService:
                     f"values (comma-separated, up to {sample_n}). After "
                     f"the table, list any tables that returned zero rows, "
                     f"and any tools that had no matching tables."
+                )
+            elif kind == "entity_count":
+                # Entity-count broadcast — agent returns a JSON array of
+                # one row per source. python_reduce dedupes and totals.
+                ent = (column or "").lower()
+                # Heuristic patterns: tables/labels whose name contains
+                # the entity token. If the entity is plural ("loans"),
+                # the singular form usually appears in label names
+                # (Loan, BridgeLoan); strip a trailing 's' to broaden
+                # the match.
+                singular = ent[:-1] if (ent.endswith("s") and len(ent) > 3) else ent
+                tbl_like = repr("%" + singular + "%") if singular else "LOWER('%<ent>%')"
+                lbl_like = singular or "<ent>"
+                plan = (
+                    f" 1. For each DATABASE tool, find candidate tables:\n"
+                    f"      SELECT TABLE_SCHEMA, TABLE_NAME\n"
+                    f"      FROM information_schema.TABLES\n"
+                    f"      WHERE TABLE_TYPE = 'BASE TABLE'\n"
+                    f"        AND LOWER(TABLE_NAME) LIKE {tbl_like}\n"
+                    f"      ORDER BY TABLE_SCHEMA, TABLE_NAME;\n"
+                    f" 2. For each candidate, run:\n"
+                    f"      SELECT COUNT(*) AS n FROM `<schema>`.`<table>`;\n"
+                    f"    If a candidate is clearly a child/subtype of another "
+                    f"(e.g. `bridgeloans` ⊂ `loans`), record both counts but "
+                    f"include `is_subtype_of: '<parent_table>'` on the child row.\n"
+                    f" 3. For each GRAPH tool (Neo4j), find candidate labels:\n"
+                    f"      CALL db.labels() YIELD label\n"
+                    f"      WHERE toLower(label) CONTAINS toLower('{lbl_like}')\n"
+                    f"      RETURN label;\n"
+                    f" 4. For each label, run:\n"
+                    f"      MATCH (n:`<label>`) RETURN count(n) AS n;\n"
+                    f"    Multi-label nodes (e.g. `:BridgeLoan:Loan`) make "
+                    f"`:BridgeLoan` a subtype of `:Loan` — set `is_subtype_of` "
+                    f"on the child row.\n"
+                    f" 5. Run EVERY tool you have. If a tool returns zero "
+                    f"candidates, include a single row with count=0.\n"
+                    f" 6. Return a JSON array (NOT prose). Each element:\n"
+                    f"      {{\n"
+                    f"        \"tool\": \"<tool_name>\",\n"
+                    f"        \"source\": \"<schema.table or label>\",\n"
+                    f"        \"type\": \"table\" | \"label\",\n"
+                    f"        \"label_or_table\": \"<name>\",\n"
+                    f"        \"count\": <int>,\n"
+                    f"        \"is_subtype_of\": \"<parent>\"   // OPTIONAL\n"
+                    f"      }}\n"
+                    f"    Return ONLY the JSON array — no surrounding prose. "
+                    f"Step-8 python_reduce will compute the headline total "
+                    f"and the breakdown table."
                 )
             else:  # schema_meta (default)
                 col_eq = repr(col_l) if col_l else "LOWER(<col>)"
@@ -1980,11 +2047,14 @@ class PipelineService:
         # bidder can't misroute. Step 8 aggregation combines the per-
         # agent answers into the user-visible response.
         schema_meta_assignments: Dict[str, str] = {}
-        if intent in ("schema_meta_question", "column_value_question"):
+        if intent in ("schema_meta_question", "column_value_question",
+                       "entity_count_question"):
             sm_column = str(translation.get("schema_meta_column") or "").strip()
             sm_kind = (
                 "column_value"
                 if intent == "column_value_question"
+                else "entity_count"
+                if intent == "entity_count_question"
                 else "schema_meta"
             )
             # Parse "<N> samples" / "sample of <N>" / "<N> rows" from
@@ -2036,13 +2106,43 @@ class PipelineService:
                 # description list — assignments are picked up post-hoc.
                 domain_subtasks = [desc for desc, _, _ in sm_subtasks]
                 used_ontology = True  # we have explicit subtasks; skip LLM decomp
+
+                # entity_count delegates aggregation to the team's
+                # PythonAnalyst — LLMs are unreliable at exact arithmetic
+                # and the no-double-count rule for parent/subtype rows
+                # is far easier to express in code than in prompt.
+                if sm_kind == "entity_count":
+                    self._current_aggregation_strategy = "python_reduce"
+                    self._current_aggregation_instructions = (
+                        "Each per-source row is a JSON describing a count "
+                        "from one tool/source. Each row has fields like:\n"
+                        "  tool, source, type ('table'|'label'), label_or_table, "
+                        "count, and optionally is_subtype_of.\n\n"
+                        "Aggregation rules:\n"
+                        " 1. Group by canonical (parent) entity. A row is a "
+                        "subtype when 'is_subtype_of' is set OR when its "
+                        "label_or_table is plausibly a subtype of another "
+                        "row's label_or_table (e.g. BridgeLoan ⊂ Loan in the "
+                        "same tool).\n"
+                        " 2. Do NOT add subtype counts to the parent's total — "
+                        "the parent count already includes them. Surface the "
+                        "subtype breakdown separately.\n"
+                        " 3. Sum the canonical (non-subtype) counts across "
+                        "tools to get the headline total.\n"
+                        " 4. Return: a Markdown table with one row per tool/"
+                        "source showing source, type, count; then a "
+                        "'### Subtype breakdown' section if any; then a single "
+                        "bold line: '**Total: <N> <entity>**'."
+                    )
                 logger.info(
-                    "Schema-meta broadcast subtasks built",
+                    "Broadcast subtasks built",
                     layer="service",
                     graph_id=graph_id,
                     trace_id=trace_id,
+                    kind=sm_kind,
                     column=sm_column,
                     subtask_count=len(sm_subtasks),
+                    aggregation=self._current_aggregation_strategy,
                 )
             else:
                 # No agent has a DATABASE/GRAPH tool. Fall back to the
