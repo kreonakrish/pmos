@@ -143,6 +143,15 @@ class PipelineService:
         self._last_team_context: TeamContext = TeamContext()
         self._last_pattern_winner: Optional[str] = None
         self._last_pattern_payload: Dict[str, Any] = {}
+        # Step-8 aggregation strategy. ``"default"`` runs the LLM
+        # synthesis path. ``"python_reduce"`` hands per-source node
+        # results to the team's PYTHON-tool agent so deterministic
+        # reductions (counts, sums, averages, dedup) happen in code,
+        # not in an LLM. Set by patterns/helpers that build broadcast
+        # subtasks; falls back to ``"default"`` when no PYTHON agent
+        # is on the team.
+        self._current_aggregation_strategy: str = "default"
+        self._current_aggregation_instructions: str = ""
 
     # ------------------------------------------------------------------
     # Agent DB-ID resolver
@@ -231,6 +240,8 @@ class PipelineService:
         self._last_team_context = TeamContext()
         self._last_pattern_winner = None
         self._last_pattern_payload = {}
+        self._current_aggregation_strategy = "default"
+        self._current_aggregation_instructions = ""
 
         logger.info(
             "Pipeline execution started",
@@ -797,14 +808,26 @@ class PipelineService:
                             trace_id=trace_id,
                         )
 
-            # Step 8: AGGREGATION
-            final_response = await self._step8_aggregation(
-                message=message,
-                node_results=node_results,
-                graph_id=graph_id,
-                primary=primary,
-                trace_id=trace_id,
-            )
+            # Step 8: AGGREGATION. Strategy is set by whoever built the
+            # subtasks (patterns, broadcast helpers); falls back to
+            # ``"default"`` LLM synthesis when nothing opted in.
+            if self._current_aggregation_strategy == "python_reduce":
+                final_response = await self._step8_python_reduce(
+                    message=message,
+                    node_results=node_results,
+                    graph_id=graph_id,
+                    primary=primary,
+                    trace_id=trace_id,
+                    instructions=self._current_aggregation_instructions or "",
+                )
+            else:
+                final_response = await self._step8_aggregation(
+                    message=message,
+                    node_results=node_results,
+                    graph_id=graph_id,
+                    primary=primary,
+                    trace_id=trace_id,
+                )
 
             # Step 9: RESPONSE & LEARNING
             primary_db_id = self._resolve_agent_db_id(primary)
@@ -3451,6 +3474,151 @@ class PipelineService:
         )
         await self._neo4j.update_graph_status(graph_id, "COMPLETED", trace_id=trace_id)
         return final
+
+    async def _step8_python_reduce(
+        self,
+        message: str,
+        node_results: List[Dict[str, Any]],
+        graph_id: str,
+        primary: Optional[Agent],
+        trace_id: str,
+        instructions: str = "",
+    ) -> str:
+        """Aggregate node results via the team's PYTHON-tool agent.
+
+        LLMs are unreliable at exact arithmetic. When the per-source
+        node results are structured numbers (counts, sums, averages,
+        breakdowns), routing the reduction through Python is both
+        cheaper and more correct.
+
+        Falls back to LLM synthesis (``_step8_aggregation``) when the
+        team has no agent with a ``PYTHON`` tool — the system stays
+        usable on teams that don't include a PythonAnalyst.
+        """
+        successful = [
+            r for r in node_results
+            if r.get("status") in ("SUCCESS", "AUTO_CORRECTED")
+        ]
+        if not successful:
+            logger.warning(
+                "No successful node results to python-reduce",
+                layer="service",
+                graph_id=graph_id,
+                trace_id=trace_id,
+            )
+            return "I was unable to complete the requested task at this time."
+
+        # Find an agent that has a PYTHON tool. ``agents_with_tool_type``
+        # already returns agents whose ``tools`` list includes one.
+        py_agents = self._last_team_context.agents_with_tool_type("PYTHON")
+        if not py_agents:
+            logger.info(
+                "python_reduce requested but no PYTHON-tool agent on team — "
+                "falling back to LLM synthesis",
+                layer="service",
+                graph_id=graph_id,
+                trace_id=trace_id,
+            )
+            return await self._step8_aggregation(
+                message=message,
+                node_results=node_results,
+                graph_id=graph_id,
+                primary=primary,
+                trace_id=trace_id,
+            )
+
+        py_dict = py_agents[0]
+        py_agent = Agent(
+            agent_id=str(py_dict.get("agent_id") or ""),
+            name=str(py_dict.get("agent_name") or "PythonAnalyst"),
+            foundation_model=str(py_dict.get("foundation_model") or settings.llm_model),
+            role=str(py_dict.get("role") or "specialist"),
+            raw=dict(py_dict),
+        )
+        agent_db_id = self._resolve_agent_db_id(py_agent) or 0
+
+        # Encode per-source results as a JSON list the agent can paste
+        # straight into Python. Truncate each ``llm_response`` so a
+        # rambling agent answer doesn't blow up the prompt.
+        try:
+            inputs_payload = json.dumps([
+                {
+                    "subtask": r.get("description", "")[:500],
+                    "agent": r.get("agent_name", ""),
+                    "tools_used": r.get("tools_used", []),
+                    "result": (r.get("llm_response", "") or "")[:8000],
+                }
+                for r in successful
+            ], ensure_ascii=False, indent=2)
+        except Exception:
+            inputs_payload = json.dumps([], ensure_ascii=False)
+
+        default_instructions = (
+            "Aggregate the per-source results into a single coherent answer. "
+            "Use your Python tool for any arithmetic or deduplication — do "
+            "NOT eyeball numbers. After running Python, return a Markdown "
+            "table summarising the per-source results, plus one bold line "
+            "with the overall answer."
+        )
+        body = instructions.strip() or default_instructions
+
+        description = (
+            f"Original user request: {message}\n\n"
+            f"Per-source results from the multi-tool fan-out (JSON):\n"
+            f"```json\n{inputs_payload}\n```\n\n"
+            f"Aggregation rules:\n{body}\n\n"
+            f"Format: Markdown. Use a table for the breakdown and a bold "
+            f"final line for the headline number/result. Do NOT call "
+            f"DATABASE/GRAPH tools — those rows above already ran. Only "
+            f"call your Python tool."
+        )
+        system_prompt = (
+            "You are a numeric reducer. The fan-out has already happened "
+            "and you have the per-source results in front of you. Run "
+            "deterministic Python to combine them; return only the final "
+            "Markdown answer."
+        )
+
+        logger.info(
+            "Running step-8 python_reduce",
+            layer="service",
+            graph_id=graph_id,
+            agent_id=py_agent.agent_id,
+            agent_name=py_agent.name,
+            successful_count=len(successful),
+            trace_id=trace_id,
+        )
+
+        try:
+            response, _ = await self._execute_agent_with_tools(
+                agent=py_agent,
+                agent_id=py_agent.agent_id or str(agent_db_id),
+                system_prompt=system_prompt,
+                task_description=description,
+                trace_id=trace_id,
+                team_id=getattr(self, "_current_team_id", ""),
+                graph_id=graph_id,
+                node_id="",
+                conversation_id=getattr(self, "_current_conversation_id", ""),
+            )
+        except Exception as exc:
+            logger.warning(
+                "python_reduce failed — falling back to LLM synthesis",
+                layer="service",
+                graph_id=graph_id,
+                error=str(exc),
+                trace_id=trace_id,
+            )
+            return await self._step8_aggregation(
+                message=message,
+                node_results=node_results,
+                graph_id=graph_id,
+                primary=primary,
+                trace_id=trace_id,
+            )
+
+        await self._neo4j.update_graph_status(graph_id, "COMPLETED", trace_id=trace_id)
+        return response or "I was unable to complete the requested task at this time."
 
     # ------------------------------------------------------------------
     # Step 9: RESPONSE & LEARNING
