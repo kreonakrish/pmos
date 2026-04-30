@@ -22,6 +22,7 @@ export interface Job {
 export interface JobDetail extends Job {
   nodes: JobNode[];
   edges: Array<{ from: string; to: string; type: string }>;
+  pattern_decision?: PatternDecisionTrace | null;
 }
 
 export interface JobNode {
@@ -35,6 +36,43 @@ export interface JobNode {
   execution_time_ms: number | null;
   created_at: string;
   updated_at: string;
+}
+
+/** One candidate row in the pattern-dispatcher decision trace. */
+export interface PatternCandidateScore {
+  name: string;
+  priority: number;
+  score: number;
+  threshold: number;
+  accepted: boolean;
+  evidence: string[];
+  explanation: string;
+  error: string | null;
+  duration_ms: number;
+}
+
+/** Translator state captured at dispatch time — light summary, not the
+ *  full TranslationResult. */
+export interface PatternTranslatorSummary {
+  intent?: string | null;
+  domain?: string | null;
+  fallback_used?: boolean | null;
+  n_canonical_entities?: number;
+  n_dataset_bindings?: number;
+  n_matched_reports?: number;
+  schema_meta_column?: string;
+}
+
+/** Full decision-trace payload the orchestrator stamps on TaskGraph and
+ *  the UI renders in the Pattern Decision tab. */
+export interface PatternDecisionTrace {
+  candidates: PatternCandidateScore[];
+  winner: string | null;
+  duration_ms: number;
+  translator_summary: PatternTranslatorSummary;
+  /** True while the dispatcher is in shadow mode (Phase 1) — the trace
+   *  was recorded but the legacy gates drove routing. */
+  shadow: boolean;
 }
 
 export function useJobs(limit = 50) {

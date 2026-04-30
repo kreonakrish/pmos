@@ -22,6 +22,7 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import { useJobs, useJobDetail } from '@/api/jobs';
 import type { Job } from '@/api/jobs';
+import PatternDecision from '@/components/Jobs/PatternDecision';
 
 const STATUS_CONFIG: Record<string, { color: 'success' | 'error' | 'warning' | 'info' | 'default'; icon: React.ReactNode }> = {
   COMPLETED: { color: 'success', icon: <CheckCircleIcon fontSize="small" /> },
@@ -131,6 +132,13 @@ function JobRow({ job }: { job: Job }) {
             <Alert severity="warning" variant="outlined" sx={{ mb: 2, fontSize: '0.82rem' }}>
               {job.recovery_note}
             </Alert>
+          )}
+
+          {/* Pattern decision trace — why this question was routed where */}
+          {detail?.pattern_decision && (
+            <Box sx={{ mb: 2 }}>
+              <PatternDecision trace={detail.pattern_decision} />
+            </Box>
           )}
 
           {/* Task nodes table */}

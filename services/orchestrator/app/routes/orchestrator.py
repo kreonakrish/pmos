@@ -628,6 +628,23 @@ async def get_job(
             for k, v in graph.items()
         }
 
+        # Deserialize pattern decision trace from JSON string for the UI.
+        # The dispatcher stamps it as a string so Neo4j can store it; the
+        # client wants structured candidates / winner / translator_summary.
+        pattern_decision = None
+        raw_trace = graph.get("pattern_decision_trace")
+        if raw_trace:
+            try:
+                pattern_decision = json.loads(raw_trace)
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "Could not parse pattern_decision_trace JSON",
+                    layer="router",
+                    graph_id=graph_id,
+                    error=str(exc),
+                    trace_id=trace_id,
+                )
+
         # Fetch all nodes in this graph
         node_rows = await neo4j.run_query(
             """
@@ -658,6 +675,7 @@ async def get_job(
             "graph": graph_serialized,
             "nodes": nodes,
             "edges": edges,
+            "pattern_decision": pattern_decision,
             "trace_id": trace_id,
         }
 
