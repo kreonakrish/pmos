@@ -20,7 +20,7 @@ import re
 import time
 import uuid
 from datetime import datetime
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 import httpx
 import mysql.connector
@@ -3089,6 +3089,17 @@ class PipelineService:
                 if rag_context:
                     base_prompt += rag_context
 
+                # Phase 5 — Bid contract. If this node has a structured bid
+                # plan/coverage stamped by capability_negotiation, prepend it
+                # to the system prompt so the agent runs the work it
+                # promised at bid time instead of re-discovering schema or
+                # over-promising another agent's slice.
+                bid_contract = await self._fetch_bid_contract(
+                    node_id=node_id, trace_id=trace_id,
+                )
+                if bid_contract:
+                    base_prompt += f"\n\n{bid_contract}"
+
                 llm_response, tool_calls_made = await self._execute_agent_with_tools(
                     agent=agent,
                     agent_id=agent_uuid or str(agent_id),
@@ -3408,6 +3419,124 @@ class PipelineService:
     # ------------------------------------------------------------------
     # Per-agent tool execution via sandbox
     # ------------------------------------------------------------------
+
+    async def _fetch_bid_contract(
+        self,
+        node_id: str,
+        trace_id: str = "",
+    ) -> str:
+        """Read bid_plan/bid_coverage off the TaskNode and render it as a
+        commitment block for the agent's system prompt.
+
+        Returns "" when:
+          - node_id is empty (legacy / speculative paths),
+          - the node has no bid contract stamped (bidding was skipped, e.g.
+            schema-meta override),
+          - the bid format is 'legacy' (no structured plan to commit to),
+          - or the lookup fails (we degrade to today's behaviour rather
+            than block the node on Neo4j flakiness).
+        """
+        if not node_id:
+            return ""
+        try:
+            rows = await self._neo4j.run_query(
+                """
+                MATCH (n:TaskNode {node_id: $node_id})
+                RETURN n.bid_plan AS bid_plan,
+                       n.bid_coverage AS bid_coverage,
+                       n.bid_plan_format AS bid_plan_format
+                """,
+                {"node_id": node_id},
+                trace_id=trace_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Bid-contract lookup failed (non-fatal)",
+                layer="service",
+                node_id=node_id,
+                error=str(exc),
+                trace_id=trace_id,
+            )
+            return ""
+
+        if not rows:
+            return ""
+        row = rows[0]
+        plan_format = (row.get("bid_plan_format") or "").lower()
+        if plan_format == "legacy":
+            return ""
+        plan_json = row.get("bid_plan") or ""
+        coverage_json = row.get("bid_coverage") or ""
+        if not plan_json and not coverage_json:
+            return ""
+
+        try:
+            plan = json.loads(plan_json) if plan_json else []
+        except Exception:
+            plan = []
+        try:
+            coverage = json.loads(coverage_json) if coverage_json else {}
+        except Exception:
+            coverage = {}
+
+        if not plan and not coverage:
+            return ""
+
+        lines: List[str] = ["== BID CONTRACT =="]
+        lines.append(
+            "At bid time you committed to the following slice of work. "
+            "Run this plan. If reality differs (a column is missing, a "
+            "join doesn't return rows), deviate and explain why in your "
+            "reasoning — but do NOT silently abandon parts you committed to."
+        )
+
+        if isinstance(coverage, dict) and coverage.get("answerable"):
+            answerable = coverage.get("answerable") or []
+            not_ans = coverage.get("not_answerable") or []
+            lines.append(
+                "\nYour committed parts (answerable): "
+                + ", ".join(str(p) for p in answerable)
+            )
+            if not_ans:
+                lines.append(
+                    "Other agents handle (not your slice): "
+                    + ", ".join(str(p) for p in not_ans)
+                )
+
+        plan_kinds: Set[str] = set()
+        if isinstance(plan, list) and plan:
+            lines.append("\nPlan steps:")
+            for i, step in enumerate(plan, start=1):
+                if not isinstance(step, dict):
+                    continue
+                kind = str(step.get("kind") or "").lower()
+                if kind:
+                    plan_kinds.add(kind)
+                tool = step.get("tool") or "?"
+                purpose = step.get("purpose") or ""
+                sketch = (step.get("sketch") or "")[:600]
+                cols = step.get("expected_columns") or []
+                lines.append(f"  {i}. tool={tool}  kind={kind or '?'}")
+                if purpose:
+                    lines.append(f"     purpose: {purpose}")
+                if sketch:
+                    lines.append(f"     sketch: {sketch}")
+                if cols:
+                    lines.append(f"     expected_columns: {cols}")
+
+        # When the plan touches a database/graph, demand row-level JSON so
+        # the step-8 reducer (Phase 6) can join across agents instead of
+        # parsing prose.
+        if plan_kinds & {"sql", "cypher"}:
+            lines.append(
+                "\nOUTPUT: return your data as a JSON array of row objects "
+                "inside a fenced ```json block, with the columns named in "
+                "`expected_columns` above. Free-text prose is fine for "
+                "context, but the structured array is what downstream "
+                "reduction will join on."
+            )
+
+        return "\n".join(lines)
 
     async def _execute_agent_with_tools(
         self,
