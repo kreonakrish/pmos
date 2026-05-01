@@ -304,3 +304,160 @@ def test_aggregation_strategy_defaults_to_default():
     svc = _make_service()
     assert svc._current_aggregation_strategy == "default"
     assert svc._current_aggregation_instructions == ""
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — reducer gets join keys + expected columns from bid plans
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def _service_with_bid_meta(bid_meta_rows):
+    """A pipeline whose Neo4j returns the given rows for the bid-meta lookup."""
+    svc = _make_service()
+    svc._last_team_context = _team_with_python()
+    svc._neo4j.run_query = AsyncMock(return_value=bid_meta_rows)
+    return svc
+
+
+def _capture_executor(svc):
+    captured: Dict[str, Any] = {}
+
+    async def _capture(**kwargs):
+        captured.update(kwargs)
+        return "ok", []
+
+    svc._execute_agent_with_tools = _capture  # type: ignore[assignment]
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_python_reduce_passes_expected_columns_per_source():
+    """Each input item should carry the bid plan's `expected_columns`
+    so the reducer's prompt knows what shape each agent promised."""
+    svc = _service_with_bid_meta([
+        {"node_id": "n-orig", "bid_plan_format": "structured",
+         "bid_plan": _json.dumps([{"tool": "OrigDB", "kind": "sql",
+                                   "expected_columns": ["loan_id",
+                                                        "originated_at"]}]),
+         "bid_coverage": _json.dumps({"answerable": ["origination"]})},
+        {"node_id": "n-serv", "bid_plan_format": "structured",
+         "bid_plan": _json.dumps([{"tool": "ServDB", "kind": "sql",
+                                   "expected_columns": ["loan_id",
+                                                        "current_status"]}]),
+         "bid_coverage": _json.dumps({"answerable": ["servicing"]})},
+    ])
+    captured = _capture_executor(svc)
+
+    await svc._step8_python_reduce(
+        message="cross-schema",
+        node_results=[
+            {"node_id": "n-orig", "description": "originated count",
+             "llm_response": "[{loan_id:1}]", "status": "SUCCESS",
+             "agent_name": "OrigAgent"},
+            {"node_id": "n-serv", "description": "servicing tenure",
+             "llm_response": "[{loan_id:1, current_status: ACTIVE}]",
+             "status": "SUCCESS", "agent_name": "ServAgent"},
+        ],
+        graph_id="g-1", primary=None, trace_id="tr-1",
+    )
+
+    desc = captured["task_description"]
+    # Each per-source entry should carry expected_columns.
+    m = __import__("re").search(r"```json\n(.*?)```", desc, __import__("re").DOTALL)
+    assert m
+    parsed = _json.loads(m.group(1))
+    assert parsed[0]["expected_columns"] == ["loan_id", "originated_at"]
+    assert parsed[1]["expected_columns"] == ["loan_id", "current_status"]
+    assert parsed[0]["answerable"] == ["origination"]
+
+
+@pytest.mark.asyncio
+async def test_python_reduce_surfaces_candidate_join_keys():
+    """A column name in two or more agents' expected_columns becomes a
+    candidate join key the reducer is told to merge on."""
+    svc = _service_with_bid_meta([
+        {"node_id": "n-1", "bid_plan_format": "structured",
+         "bid_plan": _json.dumps([{"tool": "A", "kind": "sql",
+                                   "expected_columns": ["loan_id", "amount"]}]),
+         "bid_coverage": _json.dumps({})},
+        {"node_id": "n-2", "bid_plan_format": "structured",
+         "bid_plan": _json.dumps([{"tool": "B", "kind": "sql",
+                                   "expected_columns": ["loan_id", "status"]}]),
+         "bid_coverage": _json.dumps({})},
+    ])
+    captured = _capture_executor(svc)
+
+    await svc._step8_python_reduce(
+        message="cross-schema",
+        node_results=[
+            {"node_id": "n-1", "description": "from A", "llm_response": "ok",
+             "status": "SUCCESS"},
+            {"node_id": "n-2", "description": "from B", "llm_response": "ok",
+             "status": "SUCCESS"},
+        ],
+        graph_id="g-2", primary=None, trace_id="tr-2",
+    )
+
+    desc = captured["task_description"]
+    # `loan_id` appears in both → join key. `amount` and `status` only once → not.
+    assert "CANDIDATE JOIN KEYS" in desc
+    assert "loan_id" in desc.split("CANDIDATE JOIN KEYS")[1].split("\n")[0]
+    # Make sure unique columns aren't surfaced as keys (they may appear
+    # elsewhere in the prompt as expected_columns, but not in the keys list).
+    keys_line = desc.split("CANDIDATE JOIN KEYS")[1].split("\n")[0]
+    assert "amount" not in keys_line
+    assert "status" not in keys_line
+
+
+@pytest.mark.asyncio
+async def test_python_reduce_skips_join_hint_when_no_overlap():
+    """Single-source case (no overlap) → no CANDIDATE JOIN KEYS block."""
+    svc = _service_with_bid_meta([
+        {"node_id": "n-1", "bid_plan_format": "structured",
+         "bid_plan": _json.dumps([{"tool": "A", "kind": "sql",
+                                   "expected_columns": ["foo"]}]),
+         "bid_coverage": _json.dumps({})},
+    ])
+    captured = _capture_executor(svc)
+
+    await svc._step8_python_reduce(
+        message="single",
+        node_results=[
+            {"node_id": "n-1", "description": "x", "llm_response": "ok",
+             "status": "SUCCESS"},
+        ],
+        graph_id="g-3", primary=None, trace_id="tr-3",
+    )
+    assert "CANDIDATE JOIN KEYS" not in captured["task_description"]
+
+
+@pytest.mark.asyncio
+async def test_python_reduce_ignores_legacy_bids_for_join_keys():
+    """A legacy-format bid contributes nothing to expected_columns or
+    join keys — the reducer just sees `expected_columns: []` for it."""
+    svc = _service_with_bid_meta([
+        {"node_id": "n-1", "bid_plan_format": "legacy",
+         "bid_plan": _json.dumps([{"tool": "A", "expected_columns": ["loan_id"]}]),
+         "bid_coverage": ""},
+        {"node_id": "n-2", "bid_plan_format": "structured",
+         "bid_plan": _json.dumps([{"tool": "B", "kind": "sql",
+                                   "expected_columns": ["loan_id"]}]),
+         "bid_coverage": _json.dumps({})},
+    ])
+    captured = _capture_executor(svc)
+
+    await svc._step8_python_reduce(
+        message="mixed",
+        node_results=[
+            {"node_id": "n-1", "description": "legacy", "llm_response": "ok",
+             "status": "SUCCESS"},
+            {"node_id": "n-2", "description": "structured", "llm_response": "ok",
+             "status": "SUCCESS"},
+        ],
+        graph_id="g-4", primary=None, trace_id="tr-4",
+    )
+    desc = captured["task_description"]
+    # Only one structured agent declared loan_id; legacy is ignored → not a join key.
+    assert "CANDIDATE JOIN KEYS" not in desc

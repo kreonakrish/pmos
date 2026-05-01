@@ -3875,19 +3875,92 @@ class PipelineService:
         )
         agent_db_id = self._resolve_agent_db_id(py_agent) or 0
 
+        # Phase 6 — pull each successful node's bid plan + coverage so the
+        # reducer can see what each agent committed to (which columns it
+        # promised to return) and infer join keys. A column name appearing
+        # in 2+ agents' `expected_columns` is treated as a candidate join
+        # key — exactly the mechanism that lets origination.loan_id meet
+        # servicing.loan_id in a single pandas merge.
+        node_ids = [
+            r.get("node_id", "") for r in successful if r.get("node_id")
+        ]
+        bid_meta_by_node: Dict[str, Dict[str, Any]] = {}
+        if node_ids:
+            try:
+                rows = await self._neo4j.run_query(
+                    """
+                    UNWIND $ids AS nid
+                    MATCH (n:TaskNode {node_id: nid})
+                    RETURN n.node_id AS node_id,
+                           n.bid_plan AS bid_plan,
+                           n.bid_coverage AS bid_coverage,
+                           n.bid_plan_format AS bid_plan_format
+                    """,
+                    {"ids": node_ids},
+                    trace_id=trace_id,
+                )
+                for row in rows or []:
+                    nid = row.get("node_id")
+                    if not nid:
+                        continue
+                    fmt = (row.get("bid_plan_format") or "").lower()
+                    if fmt == "legacy":
+                        continue
+                    plan_raw = row.get("bid_plan") or ""
+                    cov_raw = row.get("bid_coverage") or ""
+                    try:
+                        plan = json.loads(plan_raw) if plan_raw else []
+                    except Exception:
+                        plan = []
+                    try:
+                        cov = json.loads(cov_raw) if cov_raw else {}
+                    except Exception:
+                        cov = {}
+                    bid_meta_by_node[nid] = {"plan": plan, "coverage": cov}
+            except Exception as exc:
+                logger.warning(
+                    "Reducer bid-meta lookup failed (non-fatal)",
+                    layer="service",
+                    graph_id=graph_id,
+                    error=str(exc),
+                    trace_id=trace_id,
+                )
+
+        # Compute candidate join keys: any column name that appears in the
+        # `expected_columns` of two or more agents' plans.
+        col_sources: Dict[str, Set[str]] = {}
+        for nid, meta in bid_meta_by_node.items():
+            for step in meta.get("plan") or []:
+                if not isinstance(step, dict):
+                    continue
+                for col in step.get("expected_columns") or []:
+                    col_sources.setdefault(str(col), set()).add(nid)
+        join_keys = sorted(c for c, srcs in col_sources.items() if len(srcs) >= 2)
+
         # Encode per-source results as a JSON list the agent can paste
         # straight into Python. Truncate each ``llm_response`` so a
         # rambling agent answer doesn't blow up the prompt.
         try:
-            inputs_payload = json.dumps([
-                {
+            payload_items: List[Dict[str, Any]] = []
+            for r in successful:
+                nid = r.get("node_id", "")
+                meta = bid_meta_by_node.get(nid, {})
+                expected_columns: List[str] = []
+                for step in meta.get("plan") or []:
+                    if isinstance(step, dict):
+                        for c in step.get("expected_columns") or []:
+                            if c and c not in expected_columns:
+                                expected_columns.append(str(c))
+                cov = meta.get("coverage") or {}
+                payload_items.append({
                     "subtask": r.get("description", "")[:500],
                     "agent": r.get("agent_name", ""),
                     "tools_used": r.get("tools_used", []),
+                    "expected_columns": expected_columns,
+                    "answerable": (cov.get("answerable") or [])[:12],
                     "result": (r.get("llm_response", "") or "")[:8000],
-                }
-                for r in successful
-            ], ensure_ascii=False, indent=2)
+                })
+            inputs_payload = json.dumps(payload_items, ensure_ascii=False, indent=2)
         except Exception:
             inputs_payload = json.dumps([], ensure_ascii=False)
 
@@ -3900,11 +3973,24 @@ class PipelineService:
         )
         body = instructions.strip() or default_instructions
 
+        join_hint_block = ""
+        if join_keys:
+            join_hint_block = (
+                f"\nCANDIDATE JOIN KEYS (columns each agent committed to "
+                f"return; appear in two or more sources): {join_keys}\n"
+                f"When the per-source results are row-level JSON arrays, "
+                f"join them on these keys (pandas.merge) before aggregating "
+                f"so cross-schema rows line up. Look for ```json fences in "
+                f"each agent's `result` field — those are the row-level "
+                f"arrays you can parse with json.loads.\n"
+            )
+
         description = (
             f"Original user request: {message}\n\n"
             f"Per-source results from the multi-tool fan-out (JSON):\n"
-            f"```json\n{inputs_payload}\n```\n\n"
-            f"Aggregation rules:\n{body}\n\n"
+            f"```json\n{inputs_payload}\n```\n"
+            f"{join_hint_block}"
+            f"\nAggregation rules:\n{body}\n\n"
             f"Format: Markdown. Use a table for the breakdown and a bold "
             f"final line for the headline number/result. Do NOT call "
             f"DATABASE/GRAPH tools — those rows above already ran. Only "
