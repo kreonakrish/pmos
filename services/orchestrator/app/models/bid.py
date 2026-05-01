@@ -25,6 +25,38 @@ class BidRequest(BaseModel):
     dataset_bindings: List[str] = Field(default_factory=list)
 
 
+class BidPlanStep(BaseModel):
+    """A single step in the agent's commitment plan.
+
+    The agent's bid promises to run roughly this query against this tool;
+    execution carries the plan forward as the system prompt's commitment
+    contract. Reality may differ; the plan is a sketch, not a literal SQL.
+    """
+    tool: str = ""                       # tool name the step targets
+    kind: str = "sql"                    # "sql" | "cypher" | "api" | "python"
+    sketch: str = ""                     # SQL/Cypher template the agent intends to run
+    expected_columns: List[str] = Field(default_factory=list)
+    purpose: str = ""                    # which part of the question this step addresses
+
+
+class BidCoverage(BaseModel):
+    """Agent's self-assessment of which question parts it can/can't answer.
+
+    Used by coverage-aware ranking (single-winner) and complementary-winner
+    selection (multi-winner set cover). ``answerable`` is the contract:
+    if the agent wins, it owes results for these parts.
+    """
+    answerable: List[str] = Field(default_factory=list)
+    not_answerable: List[str] = Field(default_factory=list)
+    reason_missing: str = ""
+
+    def ratio(self) -> float:
+        total = len(self.answerable) + len(self.not_answerable)
+        if total == 0:
+            return 0.0
+        return len(self.answerable) / total
+
+
 class BidResponse(BaseModel):
     """An individual agent's bid for a task."""
     agent_id: str
@@ -48,6 +80,16 @@ class BidResponse(BaseModel):
     dataset_access_verified: bool = True
     accessible_assets: List[str] = Field(default_factory=list)
 
+    # Phase 22 — bid as capability contract. ``coverage`` is the agent's
+    # self-declared answerable/not-answerable split; ``plan`` is the SQL/
+    # Cypher/Python sketch it commits to running. Both are produced by the
+    # bid LLM with grounded schema/sample context. When the bid LLM returns
+    # the legacy {confidence, reasoning, eligible} shape (or fails parsing
+    # the new shape), these stay empty and ranking falls back to legacy.
+    coverage: Optional[BidCoverage] = None
+    plan: List[BidPlanStep] = Field(default_factory=list)
+    plan_format: str = "structured"  # "structured" | "legacy"
+
 
 class NegotiationResult(BaseModel):
     """Outcome of capability negotiation for a single task."""
@@ -58,3 +100,11 @@ class NegotiationResult(BaseModel):
     all_bids: List[BidResponse] = Field(default_factory=list)
     negotiation_time_ms: int = 0
     trace_id: str = ""
+
+    # Phase 22 — when no single bid covers the question, the orchestrator
+    # picks a complementary cover (multiple winners, each owning a slice).
+    # ``complementary_winners`` is the chosen set in execution order.
+    # ``uncovered_parts`` are question parts no bid claimed; step-9
+    # synthesis surfaces these as "we don't have data for X."
+    complementary_winners: List[BidResponse] = Field(default_factory=list)
+    uncovered_parts: List[str] = Field(default_factory=list)

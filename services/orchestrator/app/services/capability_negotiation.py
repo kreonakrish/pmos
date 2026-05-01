@@ -17,7 +17,13 @@ from app.adapters.llm_adapter import LLMAdapter
 from app.adapters.memory_adapter import MemoryAdapter
 from app.adapters.neo4j_adapter import Neo4jAdapter
 from app.config import settings
-from app.models.bid import BidRequest, BidResponse, NegotiationResult
+from app.models.bid import (
+    BidCoverage,
+    BidPlanStep,
+    BidRequest,
+    BidResponse,
+    NegotiationResult,
+)
 from app.services.agent_selector import Agent
 from app.services.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError
 from app.utils.logger import logger
@@ -257,6 +263,7 @@ class CapabilityNegotiationService:
         # agents whose tools demonstrably reach the required data.
         accessible_metadata: Dict[str, Dict[str, Any]] = {}
         accessible_assets: List[str] = []
+        asset_relationships: List[Dict[str, Any]] = []
         if bid_request.dataset_bindings and tool_uuids:
             try:
                 rows = await self._neo4j.run_query(
@@ -274,11 +281,15 @@ class CapabilityNegotiationService:
                     RETURN binding AS asset_fq_name,
                            a.asset_type AS asset_type,
                            a.comment    AS asset_comment,
+                           a.row_count  AS row_count,
                            ds.source_type AS source_type,
                            collect(DISTINCT {
                              column: col.name,
                              data_type: col.data_type,
                              sample_values: col.sample_values,
+                             is_pk: col.is_pk,
+                             is_fk: col.is_fk,
+                             fk_references: col.fk_references,
                              business_attribute: ba.name,
                              business_entity: ba.entity,
                              business_domain: ba.domain,
@@ -301,6 +312,7 @@ class CapabilityNegotiationService:
                             "asset_type": row.get("asset_type") or "TABLE",
                             "asset_comment": row.get("asset_comment") or "",
                             "source_type": row.get("source_type") or "",
+                            "row_count": row.get("row_count"),
                         }
                         accessible_assets.append(asset)
             except Exception as exc:
@@ -312,6 +324,44 @@ class CapabilityNegotiationService:
                     trace_id=trace_id,
                 )
 
+            # Pull RELATED_TO edges between any pair of accessible assets so a
+            # multi-tool agent can see the join paths (loan_id ↔ loan_id) in
+            # its bid prompt and commit to a cross-schema plan. Limited to
+            # relationships among assets THIS agent can reach — irrelevant
+            # cross-DB joins it cannot run are noise.
+            if accessible_assets:
+                try:
+                    rel_rows = await self._neo4j.run_query(
+                        """
+                        UNWIND $assets AS aname
+                        MATCH (a:DataAsset {fq_name: aname})
+                        OPTIONAL MATCH (a)-[r:RELATED_TO]->(b:DataAsset)
+                          WHERE b.fq_name IN $assets
+                        WITH aname, r, b
+                        WHERE r IS NOT NULL
+                        RETURN aname AS from_asset,
+                               b.fq_name AS to_asset,
+                               r.via AS via
+                        """,
+                        {"assets": accessible_assets},
+                        trace_id=trace_id,
+                    )
+                    for r in rel_rows or []:
+                        if r.get("from_asset") and r.get("to_asset"):
+                            asset_relationships.append({
+                                "from": r["from_asset"],
+                                "to": r["to_asset"],
+                                "via": r.get("via") or "",
+                            })
+                except Exception as exc:
+                    logger.warning(
+                        "Bid-time relationship lookup failed (non-fatal)",
+                        layer="service",
+                        agent_id=agent.agent_id,
+                        error=str(exc),
+                        trace_id=trace_id,
+                    )
+
         # Render the accessible-data summary for the bid prompt. We cap at a
         # handful of columns per asset and at most 3 sample values per column
         # so prompt size stays bounded — the LLM doesn't need every row, just
@@ -321,39 +371,63 @@ class CapabilityNegotiationService:
         data_text_lines: List[str] = []
         source_types_seen: Set[str] = set()
         if accessible_metadata:
-            for asset, meta in list(accessible_metadata.items())[:6]:
+            for asset, meta in list(accessible_metadata.items())[:8]:
                 cols = meta.get("columns") or []
                 asset_type = meta.get("asset_type") or "TABLE"
                 source_type = (meta.get("source_type") or "").upper()
                 comment = meta.get("asset_comment") or ""
+                row_count = meta.get("row_count")
                 if source_type:
                     source_types_seen.add(source_type)
 
+                row_count_text = (
+                    f"  [~{int(row_count):,} rows]"
+                    if isinstance(row_count, (int, float)) and row_count
+                    else ""
+                )
+
                 if asset_type == "NODE_LABEL":
                     bare = asset.split(".")[-1]
-                    data_text_lines.append(f"\nNODE LABEL (:{bare}):")
+                    data_text_lines.append(f"\nNODE LABEL (:{bare}):{row_count_text}")
                 elif asset_type == "RELATIONSHIP":
                     data_text_lines.append(
-                        f"\nRELATIONSHIP {comment or asset}:"
+                        f"\nRELATIONSHIP {comment or asset}:{row_count_text}"
                     )
                 else:
-                    data_text_lines.append(f"\nASSET {asset}:")
+                    data_text_lines.append(f"\nASSET {asset}:{row_count_text}")
 
-                for c in cols[:12]:
+                for c in cols[:30]:
                     name = c.get("column")
                     dtype = c.get("data_type") or "?"
                     ba = c.get("business_attribute")
                     samples = c.get("sample_values") or []
+                    flags: List[str] = []
+                    if c.get("is_pk"):
+                        flags.append("PK")
+                    if c.get("is_fk"):
+                        ref = c.get("fk_references") or ""
+                        flags.append(f"FK→{ref}" if ref else "FK")
+                    flag_text = f"  [{','.join(flags)}]" if flags else ""
                     if isinstance(samples, list):
                         samples = [str(s)[:40] for s in samples[:3]]
                         samples_text = f"  samples: {samples}" if samples else ""
                     else:
                         samples_text = ""
-                    line = f"  - {name} ({dtype})"
+                    line = f"  - {name} ({dtype}){flag_text}"
                     if ba:
                         line += f"  ↔ {c.get('business_domain') or '?'}.{c.get('business_entity') or '?'}.{ba}"
                     line += samples_text
                     data_text_lines.append(line)
+
+            # Cross-asset relationships — surface join paths so a multi-tool
+            # agent can commit to a join in its bid plan.
+            if asset_relationships:
+                data_text_lines.append("\nKNOWN JOIN PATHS:")
+                for rel in asset_relationships[:20]:
+                    via = rel.get("via") or "?"
+                    data_text_lines.append(
+                        f"  - {rel.get('from')}  ⟶  {rel.get('to')}   via {via}"
+                    )
         data_text = "\n".join(data_text_lines)
         # If any required asset is graph-shaped, hint to the agent which query
         # language to use. Mixed (SQL + Cypher) tasks are rare but possible —
@@ -428,19 +502,46 @@ class CapabilityNegotiationService:
             bid_prompt += f"YOUR RELEVANT MEMORY/CONTEXT:\n{memory_context[:500]}\n\n"
 
         bid_prompt += (
-            "Respond with ONLY a JSON object (no other text):\n"
+            "Respond with ONLY a JSON object (no other text). Your bid is a "
+            "CONTRACT — `coverage.answerable` is what you commit to deliver if "
+            "you win. `plan` is the SQL/Cypher/Python sketch you intend to run.\n"
             "{\n"
-            '  "confidence": <float 0.0-1.0, how confident you are you can handle this task>,\n'
-            '  "reasoning": "<brief explanation grounded in the schema/samples above>",\n'
-            '  "eligible": <true if you can attempt the task, false if completely unqualified>\n'
+            '  "confidence": <float 0.0-1.0>,\n'
+            '  "eligible": <true|false>,\n'
+            '  "reasoning": "<why this fit, grounded in the schema/samples above>",\n'
+            '  "coverage": {\n'
+            '    "answerable":     ["<question part you can fully answer>", ...],\n'
+            '    "not_answerable": ["<question part you cannot answer>", ...],\n'
+            '    "reason_missing": "<why those parts are out of reach for your tools>"\n'
+            '  },\n'
+            '  "plan": [\n'
+            '    {"tool": "<tool name>", "kind": "sql|cypher|api|python",\n'
+            '     "sketch": "<SQL/Cypher/code sketch grounded in real columns>",\n'
+            '     "expected_columns": ["<col1>", "<col2>"],\n'
+            '     "purpose": "<which answerable part this step addresses>"}\n'
+            "  ]\n"
             "}\n\n"
-            "IMPORTANT: When REQUIRED PHYSICAL ASSETS is present and your tools "
-            "DEMONSTRABLY reach them with matching columns (per the schema "
-            "summary), bid HIGH (≥0.8). When the assets are required but your "
-            "tools cannot reach them, bid LOW (≤0.3) — keyword/tool-type match "
-            "without dataset access is not sufficient. For non-data tasks, "
-            "score on tool-task fit as before."
+            "RULES:\n"
+            "- Decompose the user task into discrete *parts* (e.g. count, dates, "
+            "tenure, status). Put each part in EXACTLY ONE of `answerable` / "
+            "`not_answerable`.\n"
+            "- `plan` must reference real tool names from YOUR TOOLS above and "
+            "real column/asset names from REQUIRED PHYSICAL ASSETS above. "
+            "Don't invent columns that aren't in the schema summary.\n"
+            "- If you have multiple tools, commit to a SEPARATE plan step for "
+            "each tool you intend to call. Multi-tool agents are expected to "
+            "stitch via `expected_columns` join keys.\n"
+            "- When REQUIRED PHYSICAL ASSETS is present and your tools "
+            "DEMONSTRABLY reach them, bid HIGH (≥0.8). When you can't reach "
+            "them, bid LOW (≤0.3) and put the parts in `not_answerable`.\n"
+            "- For non-data tasks (chat/summary/system), `coverage.answerable` "
+            "should still list what you'll do; `plan` may be empty or contain "
+            "a single API/Python step."
         )
+
+        coverage: Optional[BidCoverage] = None
+        plan_steps: List[BidPlanStep] = []
+        plan_format = "structured"
 
         try:
             raw_response = await self._llm.complete(
@@ -463,6 +564,22 @@ class CapabilityNegotiationService:
             if tools and confidence > 0.0:
                 confidence = min(1.0, confidence + 0.05)
 
+            # Extract structured coverage + plan. When the LLM returned the
+            # legacy {confidence, reasoning, eligible} shape, both fields are
+            # absent — we mark the bid plan_format="legacy" so ranking can
+            # fall back to confidence-only scoring.
+            coverage_data = bid_data.get("coverage")
+            plan_data = bid_data.get("plan")
+            has_structured = isinstance(coverage_data, dict) or isinstance(plan_data, list)
+            if has_structured:
+                coverage = self._coerce_coverage(coverage_data)
+                plan_steps = self._coerce_plan(plan_data)
+                # If neither survived coercion, treat as legacy.
+                if coverage is None and not plan_steps:
+                    plan_format = "legacy"
+            else:
+                plan_format = "legacy"
+
         except Exception as exc:
             logger.warning(
                 "LLM bid assessment failed; using heuristic",
@@ -475,6 +592,7 @@ class CapabilityNegotiationService:
             confidence = agent.success_rate * agent.accuracy_rate
             reasoning = f"Heuristic bid (LLM failed): success={agent.success_rate}, accuracy={agent.accuracy_rate}"
             eligible = True
+            plan_format = "legacy"
 
         # If the task carried dataset_bindings, stamp the bid with the
         # outcome of the bid-time grounding check. This is what the post-
@@ -498,6 +616,9 @@ class CapabilityNegotiationService:
                 provider=provider,
                 dataset_access_verified=verified,
                 accessible_assets=accessible_assets,
+                coverage=coverage,
+                plan=plan_steps,
+                plan_format=plan_format,
             )
             if not verified and bid_request.dataset_bindings:
                 bid_response.error = (
@@ -517,6 +638,9 @@ class CapabilityNegotiationService:
             eligible=eligible,
             foundation_model=model,
             provider=provider,
+            coverage=coverage,
+            plan=plan_steps,
+            plan_format=plan_format,
         )
 
     # ------------------------------------------------------------------
@@ -678,8 +802,25 @@ class CapabilityNegotiationService:
         trace_id: str = "",
     ) -> None:
         """Write the negotiation result to the TaskNode and create ExecutionEvents."""
-        # Update TaskNode with assigned agent
+        # Update TaskNode with assigned agent. Plan + coverage are stored as
+        # JSON strings on the node so the execution prompt builder can pick
+        # them up later (and the UI Decision tab can render them) without
+        # another negotiation lookup.
         fallback_ids = [b.agent_id for b in fallback_chain]
+        try:
+            bid_plan_json = json.dumps(
+                [step.model_dump() for step in (winner.plan or [])],
+                ensure_ascii=False,
+            )
+            bid_coverage_json = (
+                json.dumps(winner.coverage.model_dump(), ensure_ascii=False)
+                if winner.coverage
+                else ""
+            )
+        except Exception:
+            bid_plan_json = ""
+            bid_coverage_json = ""
+
         try:
             cypher = """
             MATCH (n:TaskNode {node_id: $task_id})
@@ -687,6 +828,9 @@ class CapabilityNegotiationService:
                 n.assigned_agent_name = $agent_name,
                 n.fallback_agent_ids = $fallback_ids,
                 n.bid_confidence = $confidence,
+                n.bid_plan = $bid_plan,
+                n.bid_coverage = $bid_coverage,
+                n.bid_plan_format = $plan_format,
                 n.updated_at = datetime()
             """
             await self._neo4j.run_query(
@@ -697,6 +841,9 @@ class CapabilityNegotiationService:
                     "agent_name": winner.agent_name,
                     "fallback_ids": fallback_ids,
                     "confidence": winner.confidence,
+                    "bid_plan": bid_plan_json,
+                    "bid_coverage": bid_coverage_json,
+                    "plan_format": winner.plan_format,
                 },
                 trace_id=trace_id,
             )
@@ -729,6 +876,11 @@ class CapabilityNegotiationService:
                         "reasoning": bid.reasoning,
                         "eligible": bid.eligible,
                         "is_winner": is_winner,
+                        "plan_format": bid.plan_format,
+                        "coverage": (
+                            bid.coverage.model_dump() if bid.coverage else None
+                        ),
+                        "plan": [s.model_dump() for s in (bid.plan or [])],
                     }),
                     correlation_id=trace_id,
                     trace_id=trace_id,
@@ -782,30 +934,107 @@ class CapabilityNegotiationService:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _coerce_coverage(raw: Any) -> Optional[BidCoverage]:
+        """Coerce a possibly-malformed coverage dict into BidCoverage.
+
+        Returns None when the input isn't dict-shaped or yields no parts —
+        ranking treats the absence as legacy and falls back accordingly.
+        """
+        if not isinstance(raw, dict):
+            return None
+        ans = raw.get("answerable") or []
+        notans = raw.get("not_answerable") or []
+        if not isinstance(ans, list):
+            ans = []
+        if not isinstance(notans, list):
+            notans = []
+        # Defensive: keep strings only, drop None/empty.
+        ans = [str(x).strip() for x in ans if x is not None and str(x).strip()]
+        notans = [str(x).strip() for x in notans if x is not None and str(x).strip()]
+        if not ans and not notans:
+            return None
+        return BidCoverage(
+            answerable=ans[:24],
+            not_answerable=notans[:24],
+            reason_missing=str(raw.get("reason_missing") or "")[:500],
+        )
+
+    @staticmethod
+    def _coerce_plan(raw: Any) -> List[BidPlanStep]:
+        """Coerce a possibly-malformed plan list into BidPlanStep[]."""
+        if not isinstance(raw, list):
+            return []
+        steps: List[BidPlanStep] = []
+        for item in raw[:12]:  # cap to keep storage bounded
+            if not isinstance(item, dict):
+                continue
+            cols = item.get("expected_columns") or []
+            if not isinstance(cols, list):
+                cols = []
+            cols = [str(c).strip() for c in cols if str(c).strip()][:30]
+            steps.append(BidPlanStep(
+                tool=str(item.get("tool") or "")[:120],
+                kind=str(item.get("kind") or "sql").lower()[:20],
+                sketch=str(item.get("sketch") or "")[:2000],
+                expected_columns=cols,
+                purpose=str(item.get("purpose") or "")[:300],
+            ))
+        return steps
+
+    @staticmethod
     def _parse_bid_response(raw: str) -> Dict[str, Any]:
-        """Parse LLM JSON response with fallback for malformed output."""
+        """Parse LLM JSON response with fallback for malformed output.
+
+        The new bid shape is nested ({coverage:{...}, plan:[{...}]}), so the
+        flat ``\\{[^{}]*\\}`` regex no longer covers it. We brace-balance to
+        pull the first complete top-level JSON object.
+        """
         # Try direct JSON parse
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # Try extracting JSON from markdown code block
+        # Try extracting JSON from markdown code block (greedy across newlines).
         import re
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+        match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(1))
             except (json.JSONDecodeError, ValueError):
                 pass
 
-        # Try finding first { ... } block
-        match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except (json.JSONDecodeError, ValueError):
-                pass
+        # Brace-balance: find first '{' then read until matching '}', honoring
+        # string literals so a brace inside a quoted SQL sketch doesn't fool us.
+        start = raw.find("{")
+        if start != -1:
+            depth = 0
+            in_string = False
+            escape = False
+            for i in range(start, len(raw)):
+                ch = raw[i]
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = raw[start:i + 1]
+                        try:
+                            return json.loads(candidate)
+                        except (json.JSONDecodeError, ValueError):
+                            break
 
-        # Last resort: return defaults
+        # Last resort: return defaults — caller treats missing coverage/plan
+        # as legacy bid shape and skips structured ranking.
         return {"confidence": 0.5, "reasoning": raw[:200], "eligible": True}
