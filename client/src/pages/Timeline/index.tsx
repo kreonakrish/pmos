@@ -41,6 +41,7 @@ import {
   type TimelineEvent,
   type StreamHandle,
 } from '@/api/timeline';
+import { listFeedback, type FeedbackRow } from '@/api/feedback';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Status → color mapping per the observability contract in the plan.
@@ -70,7 +71,12 @@ function kindLabel(kind: string): string {
     .replace('tool.call', 'Tool call')
     .replace('tool.result', 'Tool result')
     .replace('score.evaluated', 'Score evaluated')
-    .replace('memory.refreshed', 'Memory refresh');
+    .replace('memory.refreshed', 'Memory refresh')
+    .replace('auto_correct.triggered', 'Auto-correct triggered')
+    .replace('auto_correct.completed', 'Auto-correct completed')
+    .replace('subagent.spawned', 'Sub-agent spawned')
+    .replace('subagent.refused', 'Sub-agent refused')
+    .replace('memory.written', 'Memory written');
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -295,6 +301,39 @@ function ActivityRow({ ev }: { ev: TimelineEvent }) {
   } else if (ev.kind === 'memory.refreshed') {
     const ents = (ev.payload?.entities as string[]) ?? [];
     summary = `memory refresh on entities: ${ents.slice(0, 4).join(', ')}${ents.length > 4 ? '…' : ''}`;
+  } else if (ev.kind === 'auto_correct.triggered') {
+    const a = ev.payload?.agent_name as string | undefined;
+    const ps = ev.payload?.prior_score as number | undefined;
+    const bl = ev.payload?.band_low as number | undefined;
+    summary = `↻ ${a ?? 'agent'} below band — re-prompting (prior ${ps?.toFixed?.(2) ?? ps} < ${bl?.toFixed?.(2) ?? bl})`;
+    icon = <WarningAmberIcon fontSize="small" color="warning" />;
+  } else if (ev.kind === 'auto_correct.completed') {
+    const a = ev.payload?.agent_name as string | undefined;
+    const fs = ev.payload?.final_score as number | undefined;
+    const improved = Boolean(ev.payload?.improved);
+    const retried = Boolean(ev.payload?.retried);
+    if (!retried) {
+      summary = `${a ?? 'agent'} — auto_correct logged (no retry context)`;
+    } else if (improved) {
+      summary = `✓ ${a ?? 'agent'} retry passed (final ${fs?.toFixed?.(2) ?? fs})`;
+      icon = <CheckCircleIcon fontSize="small" color="success" />;
+    } else {
+      summary = `✗ ${a ?? 'agent'} retry still below band (final ${fs?.toFixed?.(2) ?? fs})`;
+      icon = <ErrorIcon fontSize="small" color="error" />;
+    }
+  } else if (ev.kind === 'subagent.spawned') {
+    const parent = ev.payload?.parent_agent_name as string | undefined;
+    const td = (ev.payload?.task_description as string) ?? '';
+    const depth = ev.payload?.depth as number | undefined;
+    summary = `${parent ?? 'agent'} → sub-agent (depth ${depth ?? '?'}): ${td.slice(0, 120)}`;
+  } else if (ev.kind === 'subagent.refused') {
+    const reason = (ev.payload?.reason as string) ?? '';
+    summary = `sub-agent refused: ${reason}`;
+    icon = <WarningAmberIcon fontSize="small" color="warning" />;
+  } else if (ev.kind === 'memory.written') {
+    const kind = (ev.payload?.artifact_kind as string) ?? '';
+    const key = (ev.payload?.key as string) ?? '';
+    summary = `learned: ${kind} ${key ? `(${key})` : ''}`;
   } else {
     summary = JSON.stringify(ev.payload).slice(0, 120);
   }
@@ -390,6 +429,51 @@ function RoundCard({ round, isLast }: { round: Round; isLast: boolean }) {
   );
 }
 
+function CarryingForwardPanel({ items }: { items: FeedbackRow[] }) {
+  if (!items || items.length === 0) return null;
+  const lastFew = items.slice(0, 4);
+  return (
+    <Paper
+      variant="outlined"
+      sx={{
+        p: 1.5,
+        mb: 2,
+        borderLeft: 4,
+        borderLeftColor: 'info.main',
+        bgcolor: 'background.paper',
+      }}
+    >
+      <Stack direction="row" alignItems="center" spacing={1}>
+        <Chip
+          label="CARRYING FORWARD"
+          size="small"
+          color="info"
+          sx={{ fontWeight: 700, letterSpacing: 0.5 }}
+        />
+        <Typography variant="subtitle2">
+          User feedback from prior turns is being injected into the team's prompt
+        </Typography>
+      </Stack>
+      <Stack spacing={0.5} sx={{ mt: 1, pl: 1 }}>
+        {lastFew.map((f) => {
+          const symbol = f.rating === 'UP' ? '👍' : f.rating === 'DOWN' ? '👎' : '•';
+          return (
+            <Typography key={f.id} variant="body2" sx={{ color: 'text.secondary' }}>
+              {symbol} <b>{f.rating}</b>
+              {f.comment ? ` — ${f.comment.slice(0, 200)}` : ''}
+            </Typography>
+          );
+        })}
+        {items.length > lastFew.length && (
+          <Typography variant="caption" color="text.secondary">
+            …and {items.length - lastFew.length} more
+          </Typography>
+        )}
+      </Stack>
+    </Paper>
+  );
+}
+
 function CompletedBanner({ ev }: { ev: TimelineEvent }) {
   const sufficient = Boolean(ev.payload?.sufficient);
   const rounds = ev.payload?.rounds as number | undefined;
@@ -426,6 +510,7 @@ export default function TimelinePage() {
   const conversationId = id ?? '';
 
   const [events, setEvents] = useState<TimelineEvent[]>([]);
+  const [feedbackRows, setFeedbackRows] = useState<FeedbackRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [mode, setMode] = useState<'live' | 'replay'>('live');
   const seenRef = useRef<Set<string>>(new Set());
@@ -452,6 +537,25 @@ export default function TimelinePage() {
       setError((err as Error).message);
     }
   };
+
+  // Phase C.5: pull prior feedback so the timeline can render the
+  // "Carrying forward" panel above the round list. This is a one-shot
+  // fetch — we don't need it to be live.
+  useEffect(() => {
+    if (!conversationId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const items = await listFeedback(conversationId, 20);
+        if (!cancelled) setFeedbackRows(items);
+      } catch {
+        // best-effort; absence of feedback is the common case
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId]);
 
   useEffect(() => {
     if (!conversationId) return;
@@ -537,6 +641,8 @@ export default function TimelinePage() {
           {error}
         </Alert>
       )}
+
+      <CarryingForwardPanel items={feedbackRows} />
 
       {events.length === 0 ? (
         <Stack spacing={1}>

@@ -935,8 +935,24 @@ async def get_session(
 
 
 class ConversationFeedbackRequest(BaseModel):
-    message_id: str
-    feedback: Literal["positive", "negative"]
+    """Per-message user feedback. Accepts either the legacy shape used by
+    ``MessageBubble.FeedbackButtons`` (``message_id`` + ``feedback``) or the
+    Phase C.3 shape from the new FeedbackWidget (``rating`` + optional
+    ``comment`` + ``turn_id``). Both end up in the same ``user_feedback`` row
+    AND are distributed to scoring as a reward signal.
+    """
+
+    # Legacy fields (still supported)
+    message_id: Optional[str] = None
+    feedback: Optional[Literal["positive", "negative"]] = None
+
+    # Phase C.3 fields
+    rating: Optional[Literal["UP", "DOWN", "NEUTRAL"]] = None
+    comment: Optional[str] = None
+    turn_id: Optional[str] = None
+    graph_id: Optional[str] = None
+    trace_id: Optional[str] = None
+
     team_id: Optional[str] = None
 
 
@@ -952,6 +968,102 @@ async def conversation_feedback(
     """Distribute user feedback to all agents in a team for a conversation message."""
     trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     pipeline = _get_pipeline(request)
+
+    # Phase C.3: normalize the two accepted payload shapes into a single
+    # canonical (rating, comment, turn_id) tuple. Validation: at least one
+    # of {feedback, rating, comment} must be present.
+    rating: str = "NEUTRAL"
+    if body.rating:
+        rating = body.rating
+    elif body.feedback == "positive":
+        rating = "UP"
+    elif body.feedback == "negative":
+        rating = "DOWN"
+    elif body.comment:
+        rating = "NEUTRAL"
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "rating, feedback, or comment required", "code": "INVALID_FEEDBACK"},
+        )
+
+    turn_id = body.turn_id or body.message_id
+
+    # Phase C.3: persist to user_feedback so the prompt assembler can read
+    # prior-turn signals on the next turn. Best-effort — never block the
+    # legacy agent-distribution flow on this insert.
+    try:
+        import mysql.connector
+        from app.config import settings as _settings_uf
+
+        user_id_raw = request.headers.get("x-user-id")
+        user_id = None
+        if user_id_raw:
+            try:
+                user_id = int(user_id_raw)
+            except (TypeError, ValueError):
+                user_id = None
+
+        conn_uf = mysql.connector.connect(
+            host=_settings_uf.mysql_host,
+            port=_settings_uf.mysql_port,
+            user=_settings_uf.mysql_user,
+            password=_settings_uf.mysql_password,
+            database=_settings_uf.mysql_db,
+            connection_timeout=5,
+        )
+        try:
+            cur_uf = conn_uf.cursor()
+            cur_uf.execute(
+                """
+                INSERT INTO user_feedback
+                    (conversation_id, trace_id, graph_id, turn_id,
+                     user_id, rating, comment)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    conversation_id,
+                    (body.trace_id or trace_id)[:128],
+                    body.graph_id,
+                    turn_id,
+                    user_id,
+                    rating,
+                    (body.comment or "")[:8000] or None,
+                ),
+            )
+            conn_uf.commit()
+            cur_uf.close()
+        finally:
+            try:
+                conn_uf.close()
+            except Exception:
+                pass
+
+        # Emit memory.written so the timeline shows feedback being captured.
+        try:
+            from app.utils.events import events as _events_fb
+            await _events_fb.publish(
+                conversation_id=conversation_id,
+                kind="memory.written",
+                trace_id=trace_id,
+                graph_id=body.graph_id,
+                payload={
+                    "artifact_kind": "user_feedback",
+                    "key": f"turn:{turn_id or 'latest'}",
+                    "rating": rating,
+                    "comment_preview": (body.comment or "")[:140],
+                },
+            )
+        except Exception:
+            pass
+    except Exception as _uf_exc:
+        logger.warning(
+            "user_feedback_insert_failed_in_orchestrator_route",
+            layer="router",
+            conversation_id=conversation_id,
+            error=str(_uf_exc)[:300],
+            trace_id=trace_id,
+        )
 
     # Resolve team_id: use provided value or look it up from the conversation.
     # The orchestrator doesn't carry a pooled async MySQL handle on
@@ -989,10 +1101,23 @@ async def conversation_feedback(
             )
 
     if not team_id:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "Could not determine team_id for conversation", "code": "NO_TEAM_ID", "trace_id": trace_id},
+        # Phase C.3: the user_feedback row was already saved above; only
+        # the agent-distribution side needs team_id. Return 200 with a
+        # flag so the client knows the row is captured but downstream
+        # scoring fan-out was skipped.
+        logger.info(
+            "Feedback recorded but team_id unavailable — skipping agent distribution",
+            layer="router",
+            conversation_id=conversation_id,
+            trace_id=trace_id,
         )
+        return {
+            "accepted": True,
+            "agents_notified": 0,
+            "rating": rating,
+            "team_distribution": "skipped_no_team_id",
+            "trace_id": trace_id,
+        }
 
     logger.info(
         "Conversation feedback received",
@@ -1036,9 +1161,18 @@ async def conversation_feedback(
         if not agents:
             return {"accepted": True, "agents_notified": 0, "trace_id": trace_id}
 
-        # 2. Determine score and reward signal based on feedback
-        score = 1.0 if body.feedback == "positive" else 0.0
-        reward_signal = 1.0 if body.feedback == "positive" else -0.5
+        # 2. Determine score and reward signal based on the normalized rating
+        if rating == "UP":
+            score = 1.0
+            reward_signal = 1.0
+        elif rating == "DOWN":
+            score = 0.0
+            reward_signal = -0.5
+        else:
+            # NEUTRAL — comment-only feedback. Don't push a misleading
+            # reward into scoring; just persist the comment row above.
+            score = 0.5
+            reward_signal = 0.0
 
         # 3. Send feedback to scoring service for each agent
         agents_notified = 0
@@ -1055,7 +1189,7 @@ async def conversation_feedback(
 
                 feedback_payload = {
                     "agent_id": agent_id_int,
-                    "task_id": body.message_id,
+                    "task_id": turn_id or "",
                     "session_id": conversation_id,
                     "feedback_source": "USER",
                     "feedback_type": "SCORE",

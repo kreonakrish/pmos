@@ -385,6 +385,16 @@ class PipelineService:
                     trace_id=trace_id,
                 ) or ""
 
+            # Phase C.3: pull prior-turn user feedback for this conversation
+            # and prepend it to the team context. The agents downstream see
+            # "user pushed back on X on prior turn" before they plan, which
+            # is the cheapest signal we have for "don't do that again".
+            feedback_block = await self._fetch_recent_user_feedback(
+                conversation_id=conversation_id, limit=5, trace_id=trace_id,
+            )
+            if feedback_block:
+                team_context = (team_context + "\n\n" + feedback_block).strip()
+
             # Step 1: REQUEST INTAKE
             graph_id, sop_context = await self._step1_intake(
                 session_id=session_id,
@@ -877,6 +887,11 @@ class PipelineService:
             except Exception:
                 pass
 
+            # Phase B.2: track avg score across rounds so we can short-
+            # circuit when the team is not actually getting better. The
+            # initial round's avg is set just below before the loop opens.
+            score_history: List[float] = []
+
             # Loop bounds: rounds 2..MAX. Round 1 already happened above.
             for outer_round in range(2, self.MAX_OUTER_ROUNDS + 1):
                 # 1) Sufficiency judge
@@ -889,6 +904,28 @@ class PipelineService:
                     trace_id=trace_id,
                 )
                 judge_meta = judge
+
+                # Phase B.2: append this round's avg score to history and
+                # check for a plateau. We need at least two prior rounds
+                # (so history has 2+ entries) before the check kicks in.
+                _avg_now = judge.get("avg_score")
+                if _avg_now is not None:
+                    score_history.append(float(_avg_now))
+                plateau_hit = False
+                if len(score_history) >= 2:
+                    delta = score_history[-1] - score_history[-2]
+                    if delta < self.PLATEAU_EPSILON:
+                        plateau_hit = True
+                        logger.info(
+                            "Outer-loop plateau — score not improving across rounds",
+                            layer="service",
+                            graph_id=graph_id,
+                            round=outer_round - 1,
+                            history=score_history,
+                            delta=delta,
+                            epsilon=self.PLATEAU_EPSILON,
+                            trace_id=trace_id,
+                        )
 
                 try:
                     from app.utils.events import events as _events
@@ -913,6 +950,22 @@ class PipelineService:
                 if judge["sufficient"]:
                     sufficient = True
                     outer_round_final = outer_round - 1
+                    break
+
+                # Phase B.2: plateau gate — bail early if more iterations
+                # are unlikely to help. The judge's `sufficient=False` is
+                # respected upstream, so accepting here means "best-effort,
+                # not enough capability to close the gap".
+                if plateau_hit:
+                    sufficient = False
+                    outer_round_final = outer_round - 1
+                    judge_meta = {
+                        **judge,
+                        "reason": (
+                            f"plateau: score history={score_history} "
+                            f"(epsilon={self.PLATEAU_EPSILON}). " + (judge.get("reason") or "")
+                        ),
+                    }
                     break
 
                 # 2) Delta re-decompose: convert gaps into new SUBTASK nodes
@@ -1110,6 +1163,159 @@ class PipelineService:
                     issue_kind = meta_rows[0].get("issue_kind")
             except Exception:
                 pass
+
+            # ──────────────────────────────────────────────────────────────
+            # Phase C.2: persist durable learning artifacts at the end of a
+            # successful (or best-effort capped) run. The writes are
+            # best-effort; failures are logged but don't break the response.
+            # We learn the most when sufficient=True; on cap-reached we
+            # still record the decomposition so the next similar question
+            # can see what was tried.
+            # ──────────────────────────────────────────────────────────────
+            try:
+                from app.services import learning as _learning
+                from app.utils.events import events as _events_for_learn
+
+                # 1) Effective decomposition (all rounds combined into the
+                #    final sub-task list as it stood at the end of the run).
+                final_subtasks: List[str] = list(node_descriptions or [])
+                # Pull any delta nodes added during outer-loop rounds.
+                try:
+                    extras = await self._neo4j.run_query(
+                        """
+                        MATCH (n:TaskNode {graph_id: $graph_id})
+                        WHERE n.node_type = 'SUBTASK'
+                        RETURN n.description AS desc, n.iteration AS it
+                        ORDER BY n.iteration ASC, n.created_at ASC
+                        """,
+                        {"graph_id": graph_id},
+                        trace_id=trace_id,
+                    )
+                    if extras:
+                        final_subtasks = [
+                            (r.get("desc") or "")[:500]
+                            for r in extras if r.get("desc")
+                        ]
+                except Exception:
+                    pass
+
+                _scores_now = [
+                    float(nr.get("score")) for nr in (node_results or [])
+                    if nr.get("score") is not None
+                ]
+                _avg_now = (sum(_scores_now) / len(_scores_now)) if _scores_now else None
+
+                if sufficient and final_subtasks:
+                    n_dec = await _learning.write_effective_decomposition({
+                        "conversation_id": conversation_id,
+                        "graph_id": graph_id,
+                        "intent": _intent_for_judge,
+                        "user_question": message,
+                        "subtask_list": final_subtasks,
+                        "n_subtasks": len(final_subtasks),
+                        "rounds_to_success": outer_round_final or 1,
+                        "avg_score": _avg_now,
+                    })
+                    if n_dec:
+                        try:
+                            await _events_for_learn.publish(
+                                conversation_id=conversation_id,
+                                kind="memory.written",
+                                trace_id=trace_id,
+                                graph_id=graph_id,
+                                round_n=outer_round_final or 1,
+                                status="SUCCESS",
+                                payload={
+                                    "artifact_kind": "effective_decomposition",
+                                    "key": _intent_for_judge or "unknown",
+                                    "n_subtasks": len(final_subtasks),
+                                    "rows": n_dec,
+                                },
+                            )
+                        except Exception:
+                            pass
+
+                # 2) Agent-tool affinity from successful node results.
+                affinity = _learning.affinity_rows_from_results(
+                    node_results or [],
+                    graph_id=graph_id,
+                    intent=_intent_for_judge,
+                )
+                if affinity:
+                    n_aff = await _learning.write_agent_tool_affinity(affinity)
+                    if n_aff:
+                        try:
+                            await _events_for_learn.publish(
+                                conversation_id=conversation_id,
+                                kind="memory.written",
+                                trace_id=trace_id,
+                                graph_id=graph_id,
+                                round_n=outer_round_final or 1,
+                                status="SUCCESS",
+                                payload={
+                                    "artifact_kind": "agent_tool_affinity",
+                                    "key": _intent_for_judge or "unknown",
+                                    "rows": n_aff,
+                                },
+                            )
+                        except Exception:
+                            pass
+
+                # 3) Entity resolutions used by the team. We surface only
+                #    the canonical entities that came back from the
+                #    translator (already grounded against the ontology) —
+                #    those are the ones a future turn can reuse.
+                ent_rows: List[Dict[str, Any]] = []
+                try:
+                    last_t = getattr(self, "_last_translation", {}) or {}
+                    for ce in (last_t.get("canonical_entities") or [])[:20]:
+                        if not isinstance(ce, str) or not ce.strip():
+                            continue
+                        ent_rows.append({
+                            "conversation_id": conversation_id,
+                            "graph_id": graph_id,
+                            "intent": _intent_for_judge or None,
+                            "raw_phrase": (message or "")[:500],
+                            "canonical_entity": ce.strip()[:500],
+                            "ontology_version": (
+                                (last_t.get("ontology_versions") or [None])[0]
+                                if last_t.get("ontology_versions") else None
+                            ),
+                            "score": _avg_now,
+                            "source": "translator",
+                        })
+                except Exception:
+                    ent_rows = []
+                if ent_rows:
+                    n_ent = await _learning.write_entity_resolutions(ent_rows)
+                    if n_ent:
+                        try:
+                            await _events_for_learn.publish(
+                                conversation_id=conversation_id,
+                                kind="memory.written",
+                                trace_id=trace_id,
+                                graph_id=graph_id,
+                                round_n=outer_round_final or 1,
+                                status="SUCCESS",
+                                payload={
+                                    "artifact_kind": "entity_resolution",
+                                    "key": _intent_for_judge or "unknown",
+                                    "rows": n_ent,
+                                },
+                            )
+                        except Exception:
+                            pass
+            except Exception as _learn_exc:
+                # Never let learning writes break the live response.
+                try:
+                    logger.warning(
+                        "learning_artifacts_phase_failed",
+                        layer="service",
+                        error=str(_learn_exc)[:300],
+                        trace_id=trace_id,
+                    )
+                except Exception:
+                    pass
 
             # Phase A: emit pipeline.completed for the timeline UI.
             try:
@@ -3033,6 +3239,11 @@ class PipelineService:
     # nodes from the sufficiency judge's identified gaps.
     MAX_OUTER_ROUNDS = 3
     SUFFICIENCY_BAND = 0.7  # forces sufficient=False if avg score below this
+    # Phase B.2: marginal-improvement plateau threshold. If the average
+    # node score did not improve by at least this much between two
+    # consecutive outer rounds, stop iterating — adding more sub-tasks is
+    # unlikely to help and just burns tokens.
+    PLATEAU_EPSILON = 0.03
 
     async def _sufficiency_judge(
         self,
@@ -3156,6 +3367,87 @@ class PipelineService:
             "avg_score": avg_score,
             "below_band_count": below_band,
         }
+
+    async def _fetch_recent_user_feedback(
+        self,
+        *,
+        conversation_id: str,
+        limit: int = 5,
+        trace_id: str = "",
+    ) -> str:
+        """Pull recent rows from ``user_feedback`` and render them as a
+        compact context block. Returns "" when there's nothing useful or
+        the lookup fails. NEVER raises.
+        """
+        if not conversation_id:
+            return ""
+
+        def _query() -> List[Dict[str, Any]]:
+            cfg = {
+                "host": getattr(settings, "mysql_host", "localhost"),
+                "port": getattr(settings, "mysql_port", 3306),
+                "user": getattr(settings, "mysql_user", "root"),
+                "password": getattr(settings, "mysql_password", ""),
+                "database": getattr(settings, "mysql_db", "pmos"),
+                "connection_timeout": 5,
+            }
+            conn = mysql.connector.connect(**cfg)
+            try:
+                cur = conn.cursor(dictionary=True)
+                cur.execute(
+                    """
+                    SELECT rating, comment, created_at, turn_id
+                    FROM user_feedback
+                    WHERE conversation_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (conversation_id, int(limit)),
+                )
+                rows = cur.fetchall() or []
+                cur.close()
+                return rows
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        try:
+            loop = asyncio.get_event_loop()
+            rows = await loop.run_in_executor(None, _query)
+        except Exception as exc:
+            try:
+                logger.warning(
+                    "user_feedback_fetch_failed",
+                    layer="service",
+                    error=str(exc)[:300],
+                    trace_id=trace_id,
+                )
+            except Exception:
+                pass
+            return ""
+
+        if not rows:
+            return ""
+
+        lines: List[str] = ["[CARRIED-OVER USER FEEDBACK FROM PRIOR TURNS — adjust your plan accordingly]"]
+        for r in rows:
+            rating = (r.get("rating") or "NEUTRAL").upper()
+            comment = (r.get("comment") or "").strip()
+            if not comment and rating == "NEUTRAL":
+                continue
+            symbol = "👍" if rating == "UP" else ("👎" if rating == "DOWN" else "•")
+            if comment:
+                if len(comment) > 280:
+                    comment = comment[:280] + "…"
+                lines.append(f"- {symbol} {rating}: {comment}")
+            else:
+                lines.append(f"- {symbol} {rating}")
+        if len(lines) == 1:  # only the header
+            return ""
+        lines.append("[END USER FEEDBACK]")
+        return "\n".join(lines)
 
     async def _delta_decompose(
         self,
@@ -3539,6 +3831,14 @@ class PipelineService:
         agent_uuid = agent.agent_id if agent else ""
         agent_id = self._resolve_agent_db_id(agent) or 0
         fallback_index = 0
+        # Phase B.1: track auto-correct retries per (node, agent). Cap at 1
+        # so we don't spin forever — if the same agent still scores below
+        # band after the corrective re-prompt, we fall through to fallback.
+        auto_correct_attempted: bool = False
+        # Phase B.1: when the auto-correct retry runs, we extend the user
+        # task with the corrective context so the LLM actually re-does
+        # the work. None on the first attempt; populated by the corrector.
+        retry_context: Optional[str] = None
 
         # Audit: node execution start
         try:
@@ -3634,11 +3934,20 @@ class PipelineService:
                 if bid_contract:
                     base_prompt += f"\n\n{bid_contract}"
 
+                # Phase B.1: when the prior attempt scored below band on a
+                # HIGH/CRITICAL node, the course corrector hands us a
+                # retry_context describing the failure. Append it to the
+                # task description so the LLM sees explicit instructions
+                # to do better, plus the prior response for reference.
+                effective_description = description
+                if retry_context:
+                    effective_description = f"{description}\n\n{retry_context}"
+
                 llm_response, tool_calls_made = await self._execute_agent_with_tools(
                     agent=agent,
                     agent_id=agent_uuid or str(agent_id),
                     system_prompt=base_prompt,
-                    task_description=description,
+                    task_description=effective_description,
                     trace_id=trace_id,
                     team_id=getattr(self, '_current_team_id', ''),
                     graph_id=graph_id,
@@ -3742,6 +4051,31 @@ class PipelineService:
 
                 # Step 4e: Band check
                 if score >= band_low or recommendation == "proceed":
+                    # Phase B.3: if we got here via an auto-correct retry,
+                    # emit auto_correct.completed with improved=True so the
+                    # timeline can mark the retry as successful.
+                    if auto_correct_attempted:
+                        try:
+                            from app.utils.events import events as _events
+                            await _events.publish(
+                                conversation_id=getattr(self, "_current_conversation_id", "") or "",
+                                kind="auto_correct.completed",
+                                trace_id=trace_id,
+                                graph_id=graph_id,
+                                node_id=node_id,
+                                status="SUCCESS",
+                                payload={
+                                    "agent_id": str(agent_id) if agent_id else "",
+                                    "agent_name": agent.name if agent else None,
+                                    "retried": True,
+                                    "improved": True,
+                                    "final_score": float(score),
+                                    "band_low": float(band_low),
+                                },
+                            )
+                        except Exception:
+                            pass
+
                     await self._graph_mgr.mark_node_success(node_id, score, latency_ms, trace_id=trace_id)
                     logger.info(
                         "Node execution succeeded",
@@ -3752,6 +4086,7 @@ class PipelineService:
                         score=score,
                         latency_ms=latency_ms,
                         tools_used=tool_calls_made,
+                        auto_correct_retried=auto_correct_attempted,
                         trace_id=trace_id,
                     )
 
@@ -3799,6 +4134,80 @@ class PipelineService:
                 )
 
                 if correction.action == CourseAction.AUTO_CORRECT_LOCAL:
+                    # Phase B.1: real retry. If we haven't already burned
+                    # our one auto-correct attempt for this (node, agent)
+                    # AND the corrector handed us a retry_context, re-run
+                    # the inner loop with that context appended. Tracks
+                    # before/after score so the timeline can show the diff.
+                    if (
+                        not auto_correct_attempted
+                        and getattr(correction, "retry_context", None)
+                    ):
+                        auto_correct_attempted = True
+                        prior_score = score
+                        prior_response = llm_response
+                        retry_context = correction.retry_context  # consumed next iter
+
+                        # Phase B.3: emit auto_correct.triggered for the timeline.
+                        try:
+                            from app.utils.events import events as _events
+                            await _events.publish(
+                                conversation_id=getattr(self, "_current_conversation_id", "") or "",
+                                kind="auto_correct.triggered",
+                                trace_id=trace_id,
+                                graph_id=graph_id,
+                                node_id=node_id,
+                                status="BELOW_BAND",
+                                payload={
+                                    "agent_id": str(agent_id) if agent_id else "",
+                                    "agent_name": agent.name if agent else None,
+                                    "prior_score": float(prior_score),
+                                    "band_low": float(band_low),
+                                    "criticality": criticality,
+                                    "prior_response_preview": (prior_response or "")[:280],
+                                },
+                            )
+                        except Exception:
+                            pass
+
+                        logger.info(
+                            "AUTO_CORRECT retry — re-prompting same agent with corrective context",
+                            layer="service",
+                            node_id=node_id,
+                            agent_name=agent.name if agent else "?",
+                            prior_score=prior_score,
+                            band_low=band_low,
+                            trace_id=trace_id,
+                        )
+                        start = time.monotonic()  # reset latency for retry
+                        continue  # re-enter while True with retry_context set
+
+                    # Either we already retried once (and STILL below band)
+                    # or there was no retry_context. Treat the original
+                    # response as auto-corrected (preserves prior behaviour
+                    # so we don't regress the contract for HIGH/CRITICAL).
+                    # Phase B.3: emit auto_correct.completed with the diff.
+                    try:
+                        from app.utils.events import events as _events
+                        await _events.publish(
+                            conversation_id=getattr(self, "_current_conversation_id", "") or "",
+                            kind="auto_correct.completed",
+                            trace_id=trace_id,
+                            graph_id=graph_id,
+                            node_id=node_id,
+                            status="SUCCESS" if auto_correct_attempted else "BELOW_BAND",
+                            payload={
+                                "agent_id": str(agent_id) if agent_id else "",
+                                "agent_name": agent.name if agent else None,
+                                "retried": auto_correct_attempted,
+                                "final_score": float(score),
+                                "band_low": float(band_low),
+                                "improved": auto_correct_attempted and (score >= band_low),
+                            },
+                        )
+                    except Exception:
+                        pass
+
                     await self._graph_mgr.mark_node_success(node_id, score, latency_ms, trace_id=trace_id)
 
                     # Audit: node execution complete (auto-corrected)
@@ -3815,6 +4224,7 @@ class PipelineService:
                                 "latency_ms": latency_ms,
                                 "status": "AUTO_CORRECTED",
                                 "agent_name": agent.name if agent else None,
+                                "retried": auto_correct_attempted,
                             },
                         )
                     except Exception:
@@ -3829,6 +4239,7 @@ class PipelineService:
                         "agent_id": str(agent_id),
                         "agent_name": agent.name if agent else "default",
                         "tools_used": tool_calls_made,
+                        "auto_correct_retried": auto_correct_attempted,
                     }
 
                 # ESCALATE_TO_ORCHESTRATOR -> try fallback agent

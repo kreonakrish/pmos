@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from app.adapters.llm_adapter import LLMAdapter
 from app.config import settings
-from app.services import blackboard
+from app.services import blackboard, budget
 from app.utils.events import events
 from app.utils.logger import logger
 
@@ -536,6 +536,14 @@ async def _execute_sub_agent(
                     raw_tools = await agent_mgmt.get_agent_tools(
                         agent_id=selected_agent_id, trace_id=trace_id,
                     )
+                    # Phase C.4: parse required_capabilities into a hint
+                    # set used for tool scoping. Empty / "general" means
+                    # no filter — preserves prior behavior.
+                    cap_hint = {
+                        c.strip().lower()
+                        for c in (required_capabilities or "").split(",")
+                        if c.strip() and c.strip().lower() != "general"
+                    }
                     for t in raw_tools:
                         tool_config: Dict[str, Any] = {}
                         auth_config = t.get("tool_auth_config") or t.get("auth_config")
@@ -557,6 +565,24 @@ async def _execute_sub_agent(
                                 tool_config["uri"] = endpoint
                             elif tool_type == "API":
                                 tool_config["base_url"] = endpoint
+
+                        # Phase C.4: per-sub-task tool filter. When the
+                        # spawn call named specific capabilities (e.g.
+                        # "database,graph"), only inject tools whose
+                        # type/name overlaps. Cuts prompt bloat AND
+                        # narrows the bid space if the sub-agent loops.
+                        if cap_hint:
+                            tname = (t.get("tool_name") or t.get("name", "")).lower()
+                            ttype = (tool_type or "").lower()
+                            tdesc = (t.get("tool_description") or t.get("description", "")).lower()
+                            matches = (
+                                ttype in cap_hint
+                                or any(c in tname for c in cap_hint)
+                                or any(c in tdesc for c in cap_hint)
+                            )
+                            if not matches:
+                                continue
+
                         sub_tools.append(ToolDefinition(
                             name=t.get("tool_name") or t.get("name", "unknown"),
                             description=t.get("tool_description") or t.get("description", ""),
@@ -564,6 +590,29 @@ async def _execute_sub_agent(
                             tool_id=str(t.get("tool_id", "")),
                             config=tool_config,
                         ))
+                    if cap_hint and not sub_tools:
+                        logger.info(
+                            "Sub-agent capability filter eliminated all tools — "
+                            "falling back to full roster so the sub-agent isn't tool-less",
+                            layer="router",
+                            cap_hint=list(cap_hint),
+                            trace_id=trace_id,
+                        )
+                        # Refetch without the filter — prefer running with
+                        # too many tools over zero tools.
+                        for t in raw_tools:
+                            tool_config = {}
+                            endpoint = t.get("tool_endpoint") or t.get("endpoint") or ""
+                            tool_type = t.get("tool_type", "GENERIC")
+                            if endpoint:
+                                tool_config["endpoint"] = endpoint
+                            sub_tools.append(ToolDefinition(
+                                name=t.get("tool_name") or t.get("name", "unknown"),
+                                description=t.get("tool_description") or t.get("description", ""),
+                                tool_type=tool_type,
+                                tool_id=str(t.get("tool_id", "")),
+                                config=tool_config,
+                            ))
                 except Exception as exc:
                     logger.warning("Failed to fetch sub-agent tools", layer="router",
                                    error=str(exc), trace_id=trace_id)
@@ -583,10 +632,26 @@ async def _execute_sub_agent(
     if memory_adapter and selected_agent_id:
         try:
             agent_id_int = int(selected_agent_id) if selected_agent_id.isdigit() else 0
+            # Phase C.4: scope memory retrieval to the sub-task's
+            # neighborhood — task_type carries the spawn's required_capabilities,
+            # recent_messages includes the parent's context block and the
+            # sub-task description so memory's vector search is targeted
+            # at the sub-task's domain rather than the whole conversation.
+            recent: List[str] = []
+            if context:
+                recent.append(context[:1000])
+            recent.append(task_description)
             mem_data = await memory_adapter.assemble_prompt(
                 agent_id=agent_id_int,
-                context={"task_type": required_capabilities or "general",
-                          "domain": "", "recent_messages": [task_description]},
+                context={
+                    "task_type": required_capabilities or "general",
+                    "domain": "",
+                    "recent_messages": recent,
+                    # Hints downstream consumers (the prompt assembler) can
+                    # read to bias retrieval. Today they're best-effort —
+                    # the assembler may ignore unknown keys.
+                    "sub_agent_depth": new_depth,
+                },
                 trace_id=trace_id,
             )
             mem_prompt = mem_data.get("system_prompt", "")
@@ -984,6 +1049,19 @@ async def agent_execute(body: AgentExecuteRequest, request: Request) -> AgentExe
 
             if result.get("usage"):
                 total_tokens += result["usage"].get("total_tokens", 0)
+                # Phase B.2: feed real-time token spend into the per-conv
+                # budget so sub-agent spawn gates have current numbers.
+                if body.conversation_id:
+                    try:
+                        u = result["usage"]
+                        await budget.add_tokens(
+                            redis_client,
+                            conversation_id=body.conversation_id,
+                            tokens_in=int(u.get("prompt_tokens", 0) or 0),
+                            tokens_out=int(u.get("completion_tokens", 0) or 0),
+                        )
+                    except Exception:
+                        pass
 
             # If no tool calls, we have a text response
             if not result.get("tool_calls"):
@@ -1041,6 +1119,82 @@ async def agent_execute(body: AgentExecuteRequest, request: Request) -> AgentExe
                             }),
                         })
                         continue
+
+                    # Phase B.2: token + spawn-count budget gate. Hits before
+                    # we burn an LLM call to negotiate the sub-agent.
+                    if body.conversation_id:
+                        gate = await budget.can_spawn_sub_agent(
+                            redis_client,
+                            conversation_id=body.conversation_id,
+                        )
+                        if not gate.get("allowed"):
+                            try:
+                                await events.publish(
+                                    conversation_id=body.conversation_id or "",
+                                    kind="subagent.refused",
+                                    trace_id=trace_id,
+                                    graph_id=body.graph_id,
+                                    node_id=body.node_id,
+                                    iteration=iterations,
+                                    round_n=body.iteration_round,
+                                    status="DEVIATED",
+                                    payload={
+                                        "agent_id": body.agent_id,
+                                        "agent_name": body.agent_name,
+                                        "reason": gate.get("reason", ""),
+                                        "snapshot": gate.get("snapshot", {}),
+                                        "task_description": (arguments.get("task_description") or "")[:240],
+                                    },
+                                )
+                            except Exception:
+                                pass
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": json.dumps({
+                                    "error": (
+                                        "Conversation budget exhausted: "
+                                        f"{gate.get('reason','unknown')}. "
+                                        "Handle this task directly with your own tools "
+                                        "or summarize what you have."
+                                    ),
+                                }),
+                            })
+                            continue
+                        # Increment the spawn counter eagerly so concurrent
+                        # spawns don't all squeeze under the same cap.
+                        try:
+                            await budget.add_sub_agent_spawn(
+                                redis_client,
+                                conversation_id=body.conversation_id,
+                            )
+                        except Exception:
+                            pass
+
+                    # Phase B.3: emit subagent.spawned BEFORE the recursive
+                    # call so the timeline can render the parent→child edge
+                    # in real time.
+                    if body.conversation_id:
+                        try:
+                            await events.publish(
+                                conversation_id=body.conversation_id,
+                                kind="subagent.spawned",
+                                trace_id=trace_id,
+                                graph_id=body.graph_id,
+                                node_id=body.node_id,
+                                iteration=iterations,
+                                round_n=body.iteration_round,
+                                payload={
+                                    "parent_agent_id": body.agent_id,
+                                    "parent_agent_name": body.agent_name,
+                                    "depth": body.current_depth + 1,
+                                    "task_description": (arguments.get("task_description") or "")[:240],
+                                    "required_capabilities": (arguments.get("required_capabilities") or "")[:160],
+                                    "context_preview": (arguments.get("context") or "")[:200],
+                                },
+                            )
+                        except Exception:
+                            pass
 
                     sub_result = await _execute_sub_agent(
                         parent_body=body,

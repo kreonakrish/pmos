@@ -8,22 +8,17 @@ import {
   useTheme,
   IconButton,
   Collapse,
-  Tooltip,
 } from '@mui/material';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ExpandLessIcon from '@mui/icons-material/ExpandLess';
-import ThumbUpOutlinedIcon from '@mui/icons-material/ThumbUpOutlined';
-import ThumbDownOutlinedIcon from '@mui/icons-material/ThumbDownOutlined';
-import ThumbUpIcon from '@mui/icons-material/ThumbUp';
-import ThumbDownIcon from '@mui/icons-material/ThumbDown';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Message } from '@/types';
-import apiClient from '@/api/axios';
 import ToolCallCard from './ToolCallCard';
 import StepTimeline from './StepTimeline';
 import CourseCorrectionBanner from './CourseCorrectionBanner';
 import VisualizationBlock from './VisualizationBlock';
+import FeedbackWidget from '@/components/Conversations/FeedbackWidget';
 
 interface Props {
   message: Message;
@@ -212,12 +207,16 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
           )}
 
           {/* Feedback + Timestamp */}
-          <Box sx={{ display: 'flex', alignItems: 'center', mt: 1, gap: 0.5 }}>
+          <Box sx={{ display: 'flex', alignItems: 'flex-start', mt: 1, gap: 0.5 }}>
             {!isUser && message.id !== '__streaming__' && (
-              <FeedbackButtons
-                conversationId={message.conversation_id}
-                messageId={message.id}
-              />
+              <Box sx={{ flex: 1 }}>
+                <FeedbackWidget
+                  conversationId={message.conversation_id}
+                  graphId={(message as Message & { graph_id?: string }).graph_id}
+                  traceId={(message as Message & { trace_id?: string }).trace_id}
+                  turnId={message.id}
+                />
+              </Box>
             )}
             <Typography
               variant="caption"
@@ -235,59 +234,5 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
     </Box>
   );
 };
-
-function FeedbackButtons({ conversationId, messageId }: { conversationId: string; messageId: string }) {
-  const [feedback, setFeedback] = useState<'positive' | 'negative' | null>(null);
-  const [sending, setSending] = useState(false);
-
-  const sendFeedback = async (type: 'positive' | 'negative') => {
-    if (feedback || sending) return;
-    setSending(true);
-    try {
-      await apiClient.post(`/v1/conversations/${conversationId}/feedback`, {
-        message_id: messageId,
-        feedback: type,
-      });
-      setFeedback(type);
-    } catch {
-      // Silently fail — feedback is best-effort
-    } finally {
-      setSending(false);
-    }
-  };
-
-  return (
-    <Box sx={{ display: 'inline-flex', gap: 0 }}>
-      <Tooltip title={feedback === 'positive' ? 'Thanks!' : 'Good response'}>
-        <IconButton
-          size="small"
-          onClick={() => sendFeedback('positive')}
-          disabled={sending || feedback === 'negative'}
-          sx={{
-            width: 26, height: 26,
-            color: feedback === 'positive' ? 'success.main' : 'text.disabled',
-            '&:hover': { color: 'success.main' },
-          }}
-        >
-          {feedback === 'positive' ? <ThumbUpIcon sx={{ fontSize: 16 }} /> : <ThumbUpOutlinedIcon sx={{ fontSize: 16 }} />}
-        </IconButton>
-      </Tooltip>
-      <Tooltip title={feedback === 'negative' ? 'Noted' : 'Poor response'}>
-        <IconButton
-          size="small"
-          onClick={() => sendFeedback('negative')}
-          disabled={sending || feedback === 'positive'}
-          sx={{
-            width: 26, height: 26,
-            color: feedback === 'negative' ? 'error.main' : 'text.disabled',
-            '&:hover': { color: 'error.main' },
-          }}
-        >
-          {feedback === 'negative' ? <ThumbDownIcon sx={{ fontSize: 16 }} /> : <ThumbDownOutlinedIcon sx={{ fontSize: 16 }} />}
-        </IconButton>
-      </Tooltip>
-    </Box>
-  );
-}
 
 export default MessageBubble;

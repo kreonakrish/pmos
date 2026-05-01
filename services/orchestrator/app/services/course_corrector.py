@@ -32,11 +32,17 @@ class CourseCorrectionResult:
         reason: str = "",
         correction_applied: bool = False,
         corrected_response: Optional[str] = None,
+        retry_context: Optional[str] = None,
     ) -> None:
         self.action = action
         self.reason = reason
         self.correction_applied = correction_applied
         self.corrected_response = corrected_response
+        # Phase B.1: when AUTO_CORRECT_LOCAL fires, the corrector hands the
+        # caller a corrective system message describing exactly what went
+        # wrong. The caller (_execute_single_node) re-prompts the same agent
+        # with this context appended; one retry per node is allowed.
+        self.retry_context = retry_context
 
 
 class CourseCorrector:
@@ -170,10 +176,31 @@ class CourseCorrector:
                 trace_id=trace_id,
             )
 
+        # Phase B.1: build the corrective context the caller should append
+        # to the agent's next prompt. Keep it concrete — naming the score,
+        # the band, and a behavior hint gives the LLM something actionable
+        # to reason about. Truncate the prior response so we don't blow up
+        # the prompt; the LLM already saw the full version.
+        prior_preview = (response_text or "").strip()
+        if len(prior_preview) > 800:
+            prior_preview = prior_preview[:800] + "…"
+        retry_context = (
+            "[AUTO_CORRECT — your prior response was below the quality band]\n"
+            f"Prior score: {score:.2f}  |  Required band: ≥{band_low:.2f}  |  Criticality: {criticality}\n"
+            "Common reasons a response scores below band: missing requested information, "
+            "unsupported claims, wrong tool/source, vague summary instead of grounded data, "
+            "ignored a part of the user's question.\n\n"
+            "Re-do the task. Address every aspect of the original instruction. "
+            "If you must call a tool, do so. Cite the source/dataset where relevant. "
+            "Be more thorough and specific than your prior attempt.\n\n"
+            f"PRIOR RESPONSE (for reference, do not just rephrase it):\n{prior_preview}"
+        )
+
         return CourseCorrectionResult(
             action=CourseAction.AUTO_CORRECT_LOCAL,
             reason=f"criticality={criticality} requires immediate correction",
             correction_applied=True,
+            retry_context=retry_context,
         )
 
     async def _escalate_to_orchestrator(

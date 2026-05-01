@@ -212,6 +212,19 @@ router.post('/conversations/:id/feedback', async (req: Request, res: Response): 
   });
 });
 
+/**
+ * GET /v1/conversations/:id/feedback
+ * Phase C.3: list prior feedback rows for the UI's "Carrying forward" badge.
+ */
+router.get('/conversations/:id/feedback', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const { id } = req.params;
+  logger.info('proxy_conversation_feedback_list', { layer: 'router', trace_id: traceId, conversation_id: id });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/orchestrator/conversations/${id}/feedback`,
+  });
+});
+
 // ─── Jobs / Graphs endpoints ────────────────────────────────────────────────
 
 /**

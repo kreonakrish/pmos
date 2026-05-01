@@ -941,3 +941,59 @@ async def get_interactions(
     except Exception as exc:
         logger.error("Interactions fetch failed", layer="router", error=str(exc), trace_id=trace_id)
         return {"interactions": [], "mysql_interactions": [], "sub_agent_relationships": [], "error": str(exc), "trace_id": trace_id}
+
+
+# ---------------------------------------------------------------------------
+# Phase C.3: per-message user feedback (thumbs / comment)
+# ---------------------------------------------------------------------------
+
+
+# Phase C.3: POST /{conversation_id}/feedback is registered in
+# routes/orchestrator.py — the legacy and Phase C handlers were unified
+# there to avoid path collisions. We only own the GET below.
+
+
+@router.get("/{conversation_id}/feedback")
+async def list_user_feedback(
+    conversation_id: str,
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=200),
+) -> Dict[str, Any]:
+    """Return the most recent feedback rows for this conversation.
+
+    Used by the frontend to show the user their prior signals AND by the
+    prompt assembler (server-side) to inject "carrying forward from turn N"
+    context into the next turn's system prompt.
+    """
+    trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    try:
+        conn = get_db()
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            """
+            SELECT id, conversation_id, trace_id, graph_id, turn_id,
+                   user_id, rating, comment, created_at
+            FROM user_feedback
+            WHERE conversation_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (conversation_id, int(limit)),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception as exc:
+        logger.error(
+            "user_feedback_list_failed",
+            layer="router",
+            error=str(exc)[:300],
+            trace_id=trace_id,
+        )
+        return {"items": [], "error": str(exc)[:200], "trace_id": trace_id}
+
+    for r in rows:
+        ts = r.get("created_at")
+        if hasattr(ts, "isoformat"):
+            r["created_at"] = ts.isoformat()
+    return {"items": rows, "trace_id": trace_id}
