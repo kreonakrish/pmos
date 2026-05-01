@@ -76,7 +76,8 @@ function kindLabel(kind: string): string {
     .replace('auto_correct.completed', 'Auto-correct completed')
     .replace('subagent.spawned', 'Sub-agent spawned')
     .replace('subagent.refused', 'Sub-agent refused')
-    .replace('memory.written', 'Memory written');
+    .replace('memory.written', 'Memory written')
+    .replace('ml.rationale', 'ML rationale');
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -297,7 +298,32 @@ function ActivityRow({ ev }: { ev: TimelineEvent }) {
     const s = ev.payload?.score as number | undefined;
     const bl = ev.payload?.band_low as number | undefined;
     const a = ev.payload?.agent_name as string | undefined;
-    summary = `score ${s?.toFixed?.(2) ?? s} (band ≥ ${bl?.toFixed?.(2) ?? bl}) — ${a ?? 'agent'}`;
+    const h = ev.payload?.heuristic_score as number | undefined;
+    const l = ev.payload?.learned_score as number | undefined;
+    const w = ev.payload?.w7_learned as number | undefined;
+    let blendNote = '';
+    if (l != null && w != null && w > 0 && h != null) {
+      blendNote = ` [heuristic ${h.toFixed?.(2) ?? h} + ${w}×learned ${l.toFixed?.(2) ?? l}]`;
+    }
+    summary = `score ${s?.toFixed?.(2) ?? s} (band ≥ ${bl?.toFixed?.(2) ?? bl}) — ${a ?? 'agent'}${blendNote}`;
+  } else if (ev.kind === 'ml.rationale') {
+    const src = ev.payload?.source as string | undefined;
+    if (src === 'bandit') {
+      const pick = ev.payload?.pick_agent_name as string | undefined;
+      const overrode = Boolean(ev.payload?.overrode_bid_winner);
+      const prior = ev.payload?.prior_bid_winner as string | undefined;
+      summary = overrode
+        ? `bandit overrode bid winner ${prior ?? '?'} → ${pick ?? '?'}`
+        : `bandit confirmed bid winner ${pick ?? '?'}`;
+    } else if (src === 'learned_scorer') {
+      const w = ev.payload?.w7 as number | undefined;
+      const h = ev.payload?.heuristic_score as number | undefined;
+      const l = ev.payload?.learned_score as number | undefined;
+      const b = ev.payload?.blended_score as number | undefined;
+      summary = `learned-scorer blend w7=${w}: ${h?.toFixed?.(2) ?? h} → ${b?.toFixed?.(2) ?? b} (learned ${l?.toFixed?.(2) ?? l})`;
+    } else {
+      summary = `ml: ${JSON.stringify(ev.payload).slice(0, 120)}`;
+    }
   } else if (ev.kind === 'memory.refreshed') {
     const ents = (ev.payload?.entities as string[]) ?? [];
     summary = `memory refresh on entities: ${ents.slice(0, 4).join(', ')}${ents.length > 4 ? '…' : ''}`;

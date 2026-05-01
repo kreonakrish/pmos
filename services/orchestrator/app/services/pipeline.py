@@ -2866,8 +2866,18 @@ class PipelineService:
                 except Exception:
                     pass
 
-                # Shadow-mode bandit decision alongside the bid
+                # Phase D.1 — bandit decision (SHADOW or LIVE). When the
+                # ``bandit_live_selection`` flag is set, the bandit's pick
+                # can override the bid winner. The selector itself
+                # downgrades LIVE → FALLBACK when the picked arm has fewer
+                # than MIN_PULLS_FOR_LIVE (=20) historical pulls, so a cold
+                # start can't accidentally promote a noisy estimate over a
+                # confident bid.
                 try:
+                    bandit_mode = (
+                        "LIVE" if getattr(settings, "bandit_live_selection", False)
+                        else "SHADOW"
+                    )
                     context_bucket = f"team:{team_id or 'default'}|type:{bid_request.task_type}"
                     winner_id = neg_result.winner.agent_id if neg_result.winner else ""
                     winner_name = neg_result.winner.agent_name if neg_result.winner else ""
@@ -2880,13 +2890,87 @@ class PipelineService:
                         session_id=session_id,
                         graph_id=graph_id,
                         node_id=node_id,
-                        mode="SHADOW",
+                        mode=bandit_mode,
                     )
                     if bd is not None:
                         bandit_decisions[desc] = bd
+
+                        # If bandit ran in LIVE mode (and didn't get
+                        # auto-downgraded to FALLBACK), surface the
+                        # rationale and rewrite the negotiation winner.
+                        if bd.mode == "LIVE" and bd.bandit_pick_agent_id:
+                            try:
+                                from app.utils.events import events as _events
+                                pick_id = bd.bandit_pick_agent_id
+                                pick_name = bd.bandit_pick_agent_name
+                                overridden = (
+                                    neg_result.winner is not None
+                                    and neg_result.winner.agent_id != pick_id
+                                )
+                                await _events.publish(
+                                    conversation_id=getattr(self, "_current_conversation_id", "") or "",
+                                    kind="ml.rationale",
+                                    trace_id=trace_id,
+                                    graph_id=graph_id,
+                                    node_id=node_id,
+                                    round_n=round_n,
+                                    status="SUCCESS",
+                                    payload={
+                                        "source": "bandit",
+                                        "mode": "LIVE",
+                                        "decision_id": bd.decision_id,
+                                        "context_bucket": context_bucket,
+                                        "pick_agent_id": pick_id,
+                                        "pick_agent_name": pick_name,
+                                        "overrode_bid_winner": overridden,
+                                        "prior_bid_winner": (
+                                            neg_result.winner.agent_name
+                                            if neg_result.winner else None
+                                        ),
+                                        "candidates": [
+                                            {
+                                                "agent_name": c.get("agent_name"),
+                                                "theta": round(c.get("sampled_theta", 0.0), 3),
+                                                "pulls": c.get("pulls", 0),
+                                            }
+                                            for c in (bd.candidates or [])[:6]
+                                        ],
+                                    },
+                                )
+                            except Exception:
+                                pass
+
+                            # Rewrite the negotiation winner so downstream
+                            # agent_assignments + execution use the bandit
+                            # pick. We synthesise a minimal winner shape
+                            # compatible with the existing access pattern.
+                            if (
+                                neg_result.winner is None
+                                or neg_result.winner.agent_id != bd.bandit_pick_agent_id
+                            ):
+                                winning_bidder = next(
+                                    (
+                                        b for b in (neg_result.bidders or [])
+                                        if getattr(b, "agent_id", "") == bd.bandit_pick_agent_id
+                                    ),
+                                    None,
+                                )
+                                if winning_bidder is not None:
+                                    neg_result.winner = winning_bidder
+                                    logger.info(
+                                        "Bandit LIVE override: bid winner replaced by bandit pick",
+                                        layer="service",
+                                        decision_id=bd.decision_id,
+                                        prior=(
+                                            neg_result.winner.agent_name
+                                            if neg_result.winner else None
+                                        ),
+                                        new=bd.bandit_pick_agent_name,
+                                        trace_id=trace_id,
+                                    )
                 except Exception as exc:
                     logger.warning(
-                        "Bandit shadow decision failed (non-fatal)",
+                        "Bandit decision failed (non-fatal)",
                         layer="service",
                         description=desc[:80],
                         error=str(exc),
@@ -4005,7 +4089,75 @@ class PipelineService:
                 band_low = band.get("low", 0.5)
                 recommendation = score_data.get("recommendation", "proceed")
 
+                # Phase D.2 — learned scorer live blend. When
+                # ``scoring_weight_w7_learned`` is > 0, the prediction from
+                # the loaded LearnedScorer model is blended into the live
+                # heuristic score:
+                #     final = (1 - w7) * heuristic + w7 * learned
+                # The learned model is the same one already running in
+                # SHADOW mode (predict_and_log) — flipping w7 above 0 just
+                # promotes its prediction from "logged for analysis" to
+                # "blended into the band check".
+                heuristic_score = float(score)
+                learned_score: Optional[float] = None
+                w7 = float(getattr(settings, "scoring_weight_w7_learned", 0.0) or 0.0)
+                if w7 > 0.0 and self._learned_scorer.is_loaded():
+                    try:
+                        # We compute features here (not via predict_and_log)
+                        # so we can blend before the band check; a separate
+                        # predict_and_log call still fires AFTER step 4-7
+                        # so the offline training table keeps growing.
+                        from app.services.learned_scorer import extract_features
+                        feats = extract_features({
+                            "content": llm_response or "",
+                            "heuristic_score": heuristic_score,
+                            "latency_ms": latency_ms,
+                            "tool_call_count": len(tool_calls_made or []),
+                            "n_task_nodes": 1,
+                            "context_len_chars": len(effective_description or ""),
+                            "graph_depth": 1,
+                        })
+                        learned_score = float(
+                            self._learned_scorer._predict_proba(feats)
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "LearnedScorer live predict failed (non-fatal)",
+                            layer="service",
+                            error=str(exc),
+                            trace_id=trace_id,
+                        )
+                        learned_score = None
+
+                if learned_score is not None and 0.0 < w7 <= 1.0:
+                    blended = (1.0 - w7) * heuristic_score + w7 * learned_score
+                    # Surface the rationale BEFORE replacing score so the
+                    # band check below consumes the blended value.
+                    try:
+                        from app.utils.events import events as _events
+                        await _events.publish(
+                            conversation_id=getattr(self, "_current_conversation_id", "") or "",
+                            kind="ml.rationale",
+                            trace_id=trace_id,
+                            graph_id=graph_id,
+                            node_id=node_id,
+                            payload={
+                                "source": "learned_scorer",
+                                "mode": "LIVE",
+                                "w7": w7,
+                                "heuristic_score": round(heuristic_score, 4),
+                                "learned_score": round(learned_score, 4),
+                                "blended_score": round(blended, 4),
+                                "model_version": self._learned_scorer.version,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    score = blended
+
                 # Phase A: emit score.evaluated for the timeline UI.
+                # Phase D.2: include heuristic + learned components so the
+                # UI can show "live=0.74 (heuristic 0.69 + 0.20×learned 0.91)".
                 try:
                     from app.utils.events import events as _events
                     await _events.publish(
@@ -4019,6 +4171,11 @@ class PipelineService:
                             "agent_id": str(agent_id) if agent_id else "",
                             "agent_name": agent.name if agent else None,
                             "score": float(score),
+                            "heuristic_score": float(heuristic_score),
+                            "learned_score": (
+                                float(learned_score) if learned_score is not None else None
+                            ),
+                            "w7_learned": w7,
                             "band_low": float(band_low),
                             "recommendation": recommendation,
                             "criticality": criticality,
@@ -4640,6 +4797,17 @@ class PipelineService:
         # Build tool executor URL (agent-mgmt tools test endpoint)
         tool_executor_url = f"{settings.agent_mgmt_url}/v1/tools/test"
 
+        # Bugfix: ``agent_id`` reaches this method as the agent's UUID (the
+        # same form agent-mgmt expects for /agents/:id/tools). The sandbox
+        # endpoint's ``agent_id`` payload field is an INTEGER (the
+        # agents.id MySQL primary key) so the prompt assembler / memory
+        # refresh paths can join. Resolve via the cache-aware helper; only
+        # parse direct int when the caller passed a numeric id (legacy
+        # callers / direct invocations).
+        _resolved_db_id = self._resolve_agent_db_id(agent)
+        if _resolved_db_id is None and agent_id and str(agent_id).isdigit():
+            _resolved_db_id = int(agent_id)
+
         payload = {
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -4662,7 +4830,7 @@ class PipelineService:
             "conversation_id": conversation_id,
             # Phase A: identity for blackboard authorship + per-iteration
             # memory refresh + timeline event attribution.
-            "agent_id": int(agent_id) if agent_id else None,
+            "agent_id": _resolved_db_id,
             "agent_name": (agent.name if agent else None),
             "node_id": node_id,
         }

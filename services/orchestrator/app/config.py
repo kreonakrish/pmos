@@ -66,6 +66,16 @@ class Settings(BaseSettings):
     # Sub-agent spawning
     max_sub_agent_depth: int = 3
 
+    # Phase D — ML decision flags (default OFF; flip via env when an
+    # operator is ready). Both are gated by their own safeguards inside
+    # the selectors so flipping them on is non-destructive: bandit
+    # downgrades LIVE → FALLBACK when an arm has < MIN_PULLS_FOR_LIVE,
+    # and learned-scorer w7 is the blend weight on the heuristic score.
+    bandit_live_selection: bool = False        # if True, bandit pick can
+                                               # override the bid winner
+    scoring_weight_w7_learned: float = 0.0     # 0 = ignore learned scorer;
+                                               # 0.2-0.3 typical when live
+
     # Logging
     log_level: str = "INFO"
 

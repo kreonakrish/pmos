@@ -85,6 +85,11 @@ services:
       - AGENT_MGMT_URL=http://host.docker.internal:4001
       - TRANSLATOR_SERVICE_URL=http://host.docker.internal:8005
       - PMOS_MODEL_DIR=/app/models
+      # Phase D — ML decision flags. Default both off so existing
+      # deployments don't change behavior; flip via env override or
+      # a compose-override file when an operator is ready.
+      - BANDIT_LIVE_SELECTION=${BANDIT_LIVE_SELECTION:-false}
+      - SCORING_WEIGHT_W7_LEARNED=${SCORING_WEIGHT_W7_LEARNED:-0.0}
     volumes:
       - ./infra/ml_models:/app/models:ro
 
