@@ -2309,6 +2309,41 @@ class TranslatorPipeline:
     _ENTITY_COUNT_PREDICATE_RE = re.compile(
         r"[<>=!]=?\s*['\"\d]"
     )
+    # Phase 9B — multi-attribute disqualifiers. A question that LEADS with
+    # "how many X" but layers on additional attribute requests ("when did
+    # they …, how long …, current status …, from CODE…") is a multi-
+    # attribute cross-schema question owned by BusinessPattern. We count
+    # signals; ≥2 = demote so we never stamp intent='entity_count_question'
+    # on this shape. Mirrors the orchestrator-side check in entity_count.py.
+    _ENTITY_COUNT_EXTRA_SIGNALS = (
+        # Text continues after a "?" — second sentence territory.
+        re.compile(r"\?\s*[A-Za-z]"),
+        # ", when …" / ", how long …" / ", and what is …" — comma-chained
+        # WH clauses asking for additional attributes.
+        re.compile(
+            r",\s*(?:and\s+)?\b(?:when|how\s+long|what\s+is|what\s+are|"
+            r"what\s+was|where|why)\b",
+            re.IGNORECASE,
+        ),
+        # "current status" / "current state" — categorical attribute ask.
+        re.compile(
+            r"\b(?:current|currently)\s+(?:status|state|condition|standing)\b",
+            re.IGNORECASE,
+        ),
+        # "their status" / "their current balance" — possessive attribute ask.
+        re.compile(
+            r"\btheir\s+(?:current\s+)?"
+            r"(?:status|state|condition|standing|score|balance|tenure)\b",
+            re.IGNORECASE,
+        ),
+        # "how long" — duration request.
+        re.compile(r"\bhow\s+long\b", re.IGNORECASE),
+        # "since when" / "since 2020" / "since the cutover".
+        re.compile(r"\bsince\s+(?:when|then|the|[A-Z0-9])", re.IGNORECASE),
+        # Filter on identifier-shaped code: "from C0005" / "for CAMP-42".
+        # The all-caps lookahead keeps "from california" out.
+        re.compile(r"\b(?:from|under|for)\s+(?:the\s+)?[A-Z][A-Z0-9_-]{2,}\b"),
+    )
     # Filler adjectives the user often layers in. Strip them when
     # extracting the entity noun so we get "loans" out of
     # "how many total active outstanding loans".
@@ -2340,6 +2375,15 @@ class TranslatorPipeline:
         if cls._ENTITY_COUNT_DISQUALIFIERS_RE.search(q_l):
             return False, None
         if cls._ENTITY_COUNT_PREDICATE_RE.search(q_l):
+            return False, None
+
+        # Phase 9B — multi-attribute disqualifier. When the question piles
+        # on additional attribute requests beyond the leading count,
+        # BusinessPattern owns it. Count distinct signals; ≥2 → defer.
+        n_extra = sum(
+            1 for rx in cls._ENTITY_COUNT_EXTRA_SIGNALS if rx.search(q)
+        )
+        if n_extra >= 2:
             return False, None
 
         # Extract the noun after the count verb. Strip filler words.
