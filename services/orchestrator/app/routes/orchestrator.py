@@ -658,6 +658,22 @@ async def get_job(
         for r in (node_rows or []):
             node = {k: (str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v)
                     for k, v in dict(r["n"]).items()}
+            # Phase 22 — surface bid plan / coverage to the UI as structured
+            # JSON so the Decision tab can render it without re-parsing on
+            # the client. Stays None when bidding was skipped or used the
+            # legacy shape; UI hides the section in that case.
+            for raw_field, parsed_field in (
+                ("bid_plan", "bid_plan_parsed"),
+                ("bid_coverage", "bid_coverage_parsed"),
+            ):
+                raw = node.get(raw_field)
+                if isinstance(raw, str) and raw.strip():
+                    try:
+                        node[parsed_field] = json.loads(raw)
+                    except (TypeError, ValueError):
+                        node[parsed_field] = None
+                else:
+                    node[parsed_field] = None
             nodes.append(node)
 
         # Fetch relationships between nodes

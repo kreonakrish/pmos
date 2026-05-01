@@ -118,12 +118,32 @@ class CapabilityNegotiationService:
                 trace_id=trace_id,
             )
 
+        # Phase 8 observability — count structured-vs-legacy bids and the
+        # winner's coverage shape so we can track adoption of the new bid
+        # contract over time and spot agents whose prompt didn't pick up
+        # the new shape.
+        structured_bids = sum(1 for b in all_bids if b.plan_format == "structured")
+        legacy_bids = sum(1 for b in all_bids if b.plan_format == "legacy")
+        winner_coverage_ratio = (
+            winner.coverage.ratio()
+            if winner and winner.coverage is not None
+            else None
+        )
+        winner_plan_steps = len(winner.plan) if winner else 0
+
         logger.info(
             "Capability negotiation completed",
             layer="service",
             task_id=bid_request.task_id,
             winner_agent=winner.agent_id if winner else None,
             winner_confidence=winner.confidence if winner else 0.0,
+            winner_plan_format=winner.plan_format if winner else None,
+            winner_coverage_ratio=winner_coverage_ratio,
+            winner_plan_steps=winner_plan_steps,
+            structured_bids=structured_bids,
+            legacy_bids=legacy_bids,
+            complementary_winners=len(complementary_winners),
+            uncovered_parts=len(uncovered_parts),
             fallback_count=len(fallback_chain),
             total_bids=len(all_bids),
             eligible_bids=len(ranked),

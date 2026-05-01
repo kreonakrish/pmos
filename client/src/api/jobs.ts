@@ -36,6 +36,27 @@ export interface JobNode {
   execution_time_ms: number | null;
   created_at: string;
   updated_at: string;
+
+  /** Phase 22 — bid as capability contract. Present when the agent's bid
+   *  emitted the structured shape (coverage + plan). Null when bidding was
+   *  skipped (schema-meta override) or fell back to the legacy shape. */
+  bid_plan_format?: string | null;
+  bid_plan_parsed?: BidPlanStep[] | null;
+  bid_coverage_parsed?: BidCoverage | null;
+}
+
+export interface BidPlanStep {
+  tool: string;
+  kind: string;       // 'sql' | 'cypher' | 'api' | 'python'
+  sketch: string;
+  expected_columns: string[];
+  purpose: string;
+}
+
+export interface BidCoverage {
+  answerable: string[];
+  not_answerable: string[];
+  reason_missing: string;
 }
 
 /** One candidate row in the pattern-dispatcher decision trace. */

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { Fragment, useState } from 'react';
 import {
   Box,
   Typography,
@@ -23,6 +23,7 @@ import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import { useJobs, useJobDetail } from '@/api/jobs';
 import type { Job } from '@/api/jobs';
 import PatternDecision from '@/components/Jobs/PatternDecision';
+import BidContract from '@/components/Jobs/BidContract';
 
 const STATUS_CONFIG: Record<string, { color: 'success' | 'error' | 'warning' | 'info' | 'default'; icon: React.ReactNode }> = {
   COMPLETED: { color: 'success', icon: <CheckCircleIcon fontSize="small" /> },
@@ -165,29 +166,50 @@ function JobRow({ job }: { job: Job }) {
                   <tbody>
                     {detail.nodes.map((node) => {
                       const nStatusCfg = STATUS_CONFIG[node.status];
+                      const hasContract =
+                        node.bid_plan_format !== 'legacy' &&
+                        ((Array.isArray(node.bid_plan_parsed) &&
+                          node.bid_plan_parsed.length > 0) ||
+                          (node.bid_coverage_parsed &&
+                            ((node.bid_coverage_parsed.answerable?.length ?? 0) +
+                              (node.bid_coverage_parsed.not_answerable?.length ?? 0) >
+                              0)));
                       return (
-                        <tr key={node.node_id}>
-                          <td style={{ padding: '6px 10px' }}>
-                            <Chip label={node.status} size="small"
-                              color={nStatusCfg?.color ?? 'default'} variant="outlined"
-                              sx={{ height: 20, fontSize: '0.65rem' }} />
-                          </td>
-                          <td style={{ padding: '6px 10px', fontWeight: 500 }}>
-                            {node.assigned_agent_name || '-'}
-                          </td>
-                          <td style={{ padding: '6px 10px', maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {node.description}
-                          </td>
-                          <td style={{ padding: '6px 10px', fontFamily: 'monospace' }}>
-                            {node.bid_confidence != null ? `${(node.bid_confidence * 100).toFixed(0)}%` : '-'}
-                          </td>
-                          <td style={{ padding: '6px 10px', fontFamily: 'monospace' }}>
-                            {node.score != null ? node.score.toFixed(3) : '-'}
-                          </td>
-                          <td style={{ padding: '6px 10px', fontFamily: 'monospace' }}>
-                            {node.execution_time_ms != null ? `${node.execution_time_ms}ms` : '-'}
-                          </td>
-                        </tr>
+                        <Fragment key={node.node_id}>
+                          <tr>
+                            <td style={{ padding: '6px 10px' }}>
+                              <Chip label={node.status} size="small"
+                                color={nStatusCfg?.color ?? 'default'} variant="outlined"
+                                sx={{ height: 20, fontSize: '0.65rem' }} />
+                            </td>
+                            <td style={{ padding: '6px 10px', fontWeight: 500 }}>
+                              {node.assigned_agent_name || '-'}
+                            </td>
+                            <td style={{ padding: '6px 10px', maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {node.description}
+                            </td>
+                            <td style={{ padding: '6px 10px', fontFamily: 'monospace' }}>
+                              {node.bid_confidence != null ? `${(node.bid_confidence * 100).toFixed(0)}%` : '-'}
+                            </td>
+                            <td style={{ padding: '6px 10px', fontFamily: 'monospace' }}>
+                              {node.score != null ? node.score.toFixed(3) : '-'}
+                            </td>
+                            <td style={{ padding: '6px 10px', fontFamily: 'monospace' }}>
+                              {node.execution_time_ms != null ? `${node.execution_time_ms}ms` : '-'}
+                            </td>
+                          </tr>
+                          {hasContract && (
+                            <tr>
+                              <td colSpan={6} style={{ padding: 0 }}>
+                                <BidContract
+                                  plan={node.bid_plan_parsed}
+                                  coverage={node.bid_coverage_parsed}
+                                  planFormat={node.bid_plan_format}
+                                />
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
                       );
                     })}
                   </tbody>
