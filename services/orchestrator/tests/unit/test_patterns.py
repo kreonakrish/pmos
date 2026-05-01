@@ -374,6 +374,92 @@ async def test_entity_count_pattern_drops_score_when_no_db_agents():
     assert not m.accepted, "should fall through when no DB/GRAPH agents on team"
 
 
+# ---------------------------------------------------------------------------
+# Phase 9A — multi-attribute disqualifier
+#
+# Even when the translator stamps intent='entity_count_question', a question
+# piling on attribute requests (when/how long/status/from CODE) belongs to
+# BusinessPattern so the new bid-contract / set-cover pipeline can run.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_entity_count_demotes_marketing_campaign_question():
+    """The headline scenario: 'how many loans were originated from the
+    C0005 marketing campaign? When did they originate, how long have we
+    serviced them, and what is their current status?' Pre-Phase-9 this
+    pinned to entity_count and the bid contract pipeline never ran."""
+    ctx = _ctx(
+        "How many loans were originated from the C0005 marketing campaign? "
+        "When did they originate, how long have we serviced them, and what "
+        "is their current status?",
+        translator={"intent": "entity_count_question",
+                    "schema_meta_column": "loans"},
+        team=_team(["DATABASE"], ["DATABASE"], ["DATABASE"], ["PYTHON"]),
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert not m.accepted, (
+        "multi-attribute question must defer to BusinessPattern so the bid "
+        "contract / set-cover pipeline can fire"
+    )
+    assert any("multi-attribute" in e for e in (m.evidence or []))
+
+
+@pytest.mark.asyncio
+async def test_entity_count_still_accepts_simple_count_with_translator():
+    """Single-attribute count ('how many total loans are there in the
+    system') must still route to entity_count — the demotion fires only
+    when 2+ signals are present."""
+    ctx = _ctx(
+        "how many total loans are there in the system",
+        translator={"intent": "entity_count_question",
+                    "schema_meta_column": "loans"},
+        team=_team(["DATABASE"], ["GRAPH"]),
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert m.accepted
+
+
+@pytest.mark.asyncio
+async def test_entity_count_tolerates_one_signal():
+    """A single 'from <CODE>' filter is one signal — not enough to demote.
+    'how many loans from C0005' should still be entity_count (the agent
+    will figure out the filter)."""
+    ctx = _ctx(
+        "how many loans from C0005",
+        translator={"intent": "entity_count_question",
+                    "schema_meta_column": "loans"},
+        team=_team(["DATABASE"]),
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert m.accepted, "single signal should not trip the multi-attribute demotion"
+
+
+@pytest.mark.asyncio
+async def test_entity_count_demotes_compound_status_question():
+    """'How many active loans? What is their current status?' — two
+    distinct attribute asks via the second sentence."""
+    ctx = _ctx(
+        "How many active loans? What is their current status?",
+        translator={"intent": "entity_count_question",
+                    "schema_meta_column": "loans"},
+        team=_team(["DATABASE"]),
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert not m.accepted
+
+
+@pytest.mark.asyncio
+async def test_entity_count_demotes_when_no_translator_intent_too():
+    """Demotion must apply even without translator hint — the regex path
+    also defers to BusinessPattern."""
+    ctx = _ctx(
+        "How many loans? When did they originate and what is their status?",
+        team=_team(["DATABASE"]),
+    )
+    m = await EntityCountPattern().detect(ctx)
+    assert not m.accepted
+
+
 @pytest.mark.asyncio
 async def test_business_pattern_when_translator_bound_entities():
     ctx = _ctx(
