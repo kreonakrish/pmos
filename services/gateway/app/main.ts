@@ -18,6 +18,7 @@ import translatorRouter from './routes/translator';
 import authRouter from './routes/auth';
 import usersRouter from './routes/users';
 import logsRouter from './routes/logs';
+import eventsRouter from './routes/events';
 import { attachWebSocketServer } from './websocket/streamHandler';
 import { seedBootstrapUsers } from './services/authService';
 
@@ -97,6 +98,7 @@ app.use('/v1', scoringRouter);
 app.use('/v1', memoryRouter);
 app.use('/v1', translatorRouter);
 app.use('/v1', logsRouter);
+app.use('/v1', eventsRouter);
 
 // 7. Global error handler (must be last)
 app.use(errorHandler);

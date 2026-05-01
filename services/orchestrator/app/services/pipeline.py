@@ -829,6 +829,213 @@ class PipelineService:
                     trace_id=trace_id,
                 )
 
+            # ─────────────────────────────────────────────────────────────
+            # Phase A.4: PERPETUAL OUTER LOOP (sufficiency gate + delta
+            # re-decomposition). Round 1 was the initial decomposition above.
+            # Subsequent rounds:
+            #   1) ask the sufficiency judge whether the team has fully
+            #      addressed the user's question;
+            #   2) if not, slim-decompose the gaps into 1-3 NEW SUBTASK nodes;
+            #   3) negotiate bids for the new nodes;
+            #   4) re-execute steps 4-7 (status filter ensures only the new
+            #      PENDING nodes run);
+            #   5) re-aggregate over ALL accumulated node_results.
+            # Bounded by self.MAX_OUTER_ROUNDS (default 3) and a no-op short-
+            # circuit when the judge fails or returns no actionable gaps.
+            # Every step publishes a typed event so the UI timeline can
+            # render the deviation with its reason.
+            # ─────────────────────────────────────────────────────────────
+            sufficient = True
+            judge_meta: Dict[str, Any] = {}
+            outer_round_final = 1
+
+            # Pull the detected intent for the judge's prompt (best-effort).
+            _intent_for_judge = ""
+            try:
+                _last = getattr(self, "_last_translation", {}) or {}
+                _intent_for_judge = (_last.get("intent") or "")
+            except Exception:
+                _intent_for_judge = ""
+
+            # Emit decomposition.created (initial round, iteration 0) so the
+            # timeline UI can pin the original sub-task list at the top.
+            try:
+                from app.utils.events import events as _events
+                await _events.publish(
+                    conversation_id=conversation_id,
+                    kind="decomposition.created",
+                    trace_id=trace_id,
+                    graph_id=graph_id,
+                    iteration=0,
+                    round_n=1,
+                    payload={
+                        "intent": _intent_for_judge,
+                        "subtasks": list(node_descriptions or [])[:30],
+                        "n_subtasks": len(node_descriptions or []),
+                    },
+                )
+            except Exception:
+                pass
+
+            # Loop bounds: rounds 2..MAX. Round 1 already happened above.
+            for outer_round in range(2, self.MAX_OUTER_ROUNDS + 1):
+                # 1) Sufficiency judge
+                judge = await self._sufficiency_judge(
+                    user_message=message,
+                    intent=_intent_for_judge,
+                    node_results=node_results,
+                    final_response=final_response,
+                    round_n=outer_round - 1,
+                    trace_id=trace_id,
+                )
+                judge_meta = judge
+
+                try:
+                    from app.utils.events import events as _events
+                    await _events.publish(
+                        conversation_id=conversation_id,
+                        kind="sufficiency.checked",
+                        trace_id=trace_id,
+                        graph_id=graph_id,
+                        round_n=outer_round - 1,
+                        status="SUCCESS" if judge["sufficient"] else "DEVIATED",
+                        payload={
+                            "sufficient": judge["sufficient"],
+                            "gaps": judge.get("gaps") or [],
+                            "reason": judge.get("reason") or "",
+                            "avg_score": judge.get("avg_score"),
+                            "below_band_count": judge.get("below_band_count"),
+                        },
+                    )
+                except Exception:
+                    pass
+
+                if judge["sufficient"]:
+                    sufficient = True
+                    outer_round_final = outer_round - 1
+                    break
+
+                # 2) Delta re-decompose: convert gaps into new SUBTASK nodes
+                prior_summary_lines: List[str] = []
+                for nr in node_results[-10:]:
+                    desc = (nr.get("description") or "")[:120]
+                    sc = nr.get("score")
+                    prior_summary_lines.append(f"- [{sc}] {desc}")
+                prior_summary = "\n".join(prior_summary_lines)
+
+                new_descs = await self._delta_decompose(
+                    graph_id=graph_id,
+                    root_node_id=root_node_id,
+                    user_message=message,
+                    intent=_intent_for_judge,
+                    gaps=judge.get("gaps") or [],
+                    prior_findings_summary=prior_summary,
+                    round_n=outer_round,
+                    trace_id=trace_id,
+                )
+
+                try:
+                    from app.utils.events import events as _events
+                    await _events.publish(
+                        conversation_id=conversation_id,
+                        kind="decomposition.revised",
+                        trace_id=trace_id,
+                        graph_id=graph_id,
+                        round_n=outer_round,
+                        status="DEVIATED",
+                        payload={
+                            "round": outer_round,
+                            "gaps": judge.get("gaps") or [],
+                            "reason": judge.get("reason") or "",
+                            "new_subtasks": new_descs,
+                            "avg_score": judge.get("avg_score"),
+                            "below_band_count": judge.get("below_band_count"),
+                        },
+                    )
+                except Exception:
+                    pass
+
+                if not new_descs:
+                    # Judge said insufficient but couldn't propose new tasks —
+                    # nothing more we can do; accept the current answer.
+                    sufficient = False
+                    outer_round_final = outer_round - 1
+                    break
+
+                # 3) Negotiate bids for the new descriptions only
+                delta_negotiation: Dict[str, NegotiationResult] = {}
+                delta_assignments: Dict[str, Agent] = {}
+                if all_agents:
+                    try:
+                        delta_negotiation, _ = await self._step3_negotiate(
+                            graph_id=graph_id,
+                            node_descriptions=new_descs,
+                            team_agents=all_agents,
+                            trace_id=trace_id,
+                            team_id=team_id,
+                            session_id=session_id,
+                            round_n=outer_round,
+                        )
+                        for desc, neg in delta_negotiation.items():
+                            if neg.winner:
+                                w = next(
+                                    (a for a in all_agents
+                                     if a.agent_id == neg.winner.agent_id),
+                                    None,
+                                )
+                                if w:
+                                    delta_assignments[desc] = w
+                    except Exception as exc:
+                        logger.warning(
+                            "delta_negotiation_failed",
+                            layer="service",
+                            error=str(exc)[:300],
+                            trace_id=trace_id,
+                        )
+
+                # 4) Execute the new PENDING nodes; the status filter inside
+                #    _step4_to_7_execution skips already-completed nodes.
+                delta_results = await self._step4_to_7_execution(
+                    graph_id=graph_id,
+                    root_node_id=root_node_id,
+                    node_descriptions=new_descs,
+                    primary=primary,
+                    fallbacks=fallbacks,
+                    message=message,
+                    trace_id=trace_id,
+                    agent_assignments=delta_assignments,
+                    negotiation_results=delta_negotiation,
+                    team_context=team_context,
+                )
+                node_results.extend(delta_results)
+
+                # 5) Re-aggregate using whichever strategy was selected.
+                if self._current_aggregation_strategy == "python_reduce":
+                    final_response = await self._step8_python_reduce(
+                        message=message,
+                        node_results=node_results,
+                        graph_id=graph_id,
+                        primary=primary,
+                        trace_id=trace_id,
+                        instructions=self._current_aggregation_instructions or "",
+                    )
+                else:
+                    final_response = await self._step8_aggregation(
+                        message=message,
+                        node_results=node_results,
+                        graph_id=graph_id,
+                        primary=primary,
+                        trace_id=trace_id,
+                    )
+
+                outer_round_final = outer_round
+                # Loop continues — next round's sufficiency check decides.
+
+            # Final sufficiency event when the loop runs through all rounds
+            # without breaking (i.e. cap reached but still insufficient).
+            if outer_round_final >= self.MAX_OUTER_ROUNDS and not judge_meta.get("sufficient", True):
+                sufficient = False
+
             # Step 9: RESPONSE & LEARNING
             primary_db_id = self._resolve_agent_db_id(primary)
             if primary_db_id is None:
@@ -904,6 +1111,36 @@ class PipelineService:
             except Exception:
                 pass
 
+            # Phase A: emit pipeline.completed for the timeline UI.
+            try:
+                from app.utils.events import events as _events
+                _final_scores = [
+                    nr.get("score") for nr in (node_results or [])
+                    if nr.get("score") is not None
+                ]
+                _final_avg = (
+                    sum(_final_scores) / len(_final_scores)
+                ) if _final_scores else None
+                await _events.publish(
+                    conversation_id=conversation_id,
+                    kind="pipeline.completed",
+                    trace_id=trace_id,
+                    graph_id=graph_id,
+                    round_n=outer_round_final,
+                    status="COMPLETE" if sufficient else "DEVIATED",
+                    payload={
+                        "sufficient": sufficient,
+                        "rounds": outer_round_final,
+                        "n_nodes": len(node_results or []),
+                        "avg_score": _final_avg,
+                        "duration_ms": elapsed_ms,
+                        "judge_reason": (judge_meta.get("reason") or "")[:300],
+                        "remaining_gaps": (judge_meta.get("gaps") or [])[:8],
+                    },
+                )
+            except Exception:
+                pass
+
             return {
                 "session_id": session_id,
                 "graph_id": graph_id,
@@ -914,6 +1151,8 @@ class PipelineService:
                 "clarification_question": None,
                 "auditor_issue_id": issue_id,
                 "auditor_issue_kind": issue_kind,
+                "outer_rounds": outer_round_final,
+                "sufficient": sufficient,
             }
 
         except Exception as exc:
@@ -2315,6 +2554,7 @@ class PipelineService:
         trace_id: str,
         team_id: str = "",
         session_id: str = "",
+        round_n: int = 1,
     ) -> Tuple[Dict[str, NegotiationResult], Dict[str, BanditDecision]]:
         """Run capability negotiation for each subtask description.
 
@@ -2350,6 +2590,27 @@ class PipelineService:
                 dataset_bindings=dataset_bindings,
             )
 
+            # Phase A: emit bid.opened so the timeline UI can show the
+            # candidate set before the team has responded.
+            try:
+                from app.utils.events import events as _events
+                await _events.publish(
+                    conversation_id=getattr(self, "_current_conversation_id", "") or "",
+                    kind="bid.opened",
+                    trace_id=trace_id,
+                    graph_id=graph_id,
+                    node_id=node_id,
+                    round_n=round_n,
+                    payload={
+                        "description": desc[:240],
+                        "candidates": [a.name for a in team_agents][:30],
+                        "n_candidates": len(team_agents),
+                        "dataset_bindings": dataset_bindings[:20],
+                    },
+                )
+            except Exception:
+                pass
+
             try:
                 neg_result = await self._negotiation.negotiate(
                     bid_request=bid_request,
@@ -2357,6 +2618,47 @@ class PipelineService:
                     trace_id=trace_id,
                 )
                 results[desc] = neg_result
+
+                # Phase A: emit bid.closed with the winner + runner-up snapshot.
+                try:
+                    from app.utils.events import events as _events
+                    bid_payload: Dict[str, Any] = {
+                        "description": desc[:240],
+                        "winner": None,
+                        "runners_up": [],
+                    }
+                    if neg_result.winner:
+                        bid_payload["winner"] = {
+                            "agent_id": neg_result.winner.agent_id,
+                            "agent_name": neg_result.winner.agent_name,
+                            "confidence": neg_result.winner.confidence,
+                        }
+                    bidders = getattr(neg_result, "bidders", None) or []
+                    runners: List[Dict[str, Any]] = []
+                    for b in list(bidders)[:5]:
+                        try:
+                            if neg_result.winner and getattr(b, "agent_id", "") == neg_result.winner.agent_id:
+                                continue
+                            runners.append({
+                                "agent_id": getattr(b, "agent_id", ""),
+                                "agent_name": getattr(b, "agent_name", ""),
+                                "confidence": getattr(b, "confidence", None),
+                            })
+                        except Exception:
+                            continue
+                    bid_payload["runners_up"] = runners
+                    await _events.publish(
+                        conversation_id=getattr(self, "_current_conversation_id", "") or "",
+                        kind="bid.closed",
+                        trace_id=trace_id,
+                        graph_id=graph_id,
+                        node_id=node_id,
+                        round_n=round_n,
+                        status="SUCCESS" if neg_result.winner else "ERROR",
+                        payload=bid_payload,
+                    )
+                except Exception:
+                    pass
 
                 # Shadow-mode bandit decision alongside the bid
                 try:
@@ -2568,8 +2870,16 @@ class PipelineService:
         negotiation_results = negotiation_results or {}
         node_results: List[Dict[str, Any]] = []
         graph_nodes = await self._graph_mgr.get_graph_nodes(graph_id, trace_id=trace_id)
-        # Filter to SUBTASK nodes only (skip root)
-        subtask_nodes = [n for n in graph_nodes if n.get("node_type") == "SUBTASK"]
+        # Filter to SUBTASK nodes only (skip root). Phase A.4: also drop nodes
+        # that were already completed in a prior outer-loop round so this
+        # method is idempotent — re-calling it on the same graph after delta
+        # decomposition only executes the *new* PENDING nodes.
+        _executed_states = {"COMPLETED", "FAILED", "ESCALATED"}
+        subtask_nodes = [
+            n for n in graph_nodes
+            if n.get("node_type") == "SUBTASK"
+            and (n.get("status") or "").upper() not in _executed_states
+        ]
 
         # Determine if we can execute nodes in parallel
         # Group nodes by whether their assigned agent has execution_mode='parallel'
@@ -2713,6 +3023,230 @@ class PipelineService:
                         node_results.append(expanded_result)
 
         return node_results
+
+    # ------------------------------------------------------------------
+    # Phase A.4: outer sufficiency loop + delta re-decomposition
+    # ------------------------------------------------------------------
+
+    # Cap outer rounds to bound cost. Round 1 is the initial decomposition
+    # already executed by the existing pipeline; rounds 2..MAX add delta
+    # nodes from the sufficiency judge's identified gaps.
+    MAX_OUTER_ROUNDS = 3
+    SUFFICIENCY_BAND = 0.7  # forces sufficient=False if avg score below this
+
+    async def _sufficiency_judge(
+        self,
+        *,
+        user_message: str,
+        intent: str,
+        node_results: List[Dict[str, Any]],
+        final_response: str,
+        round_n: int,
+        trace_id: str,
+    ) -> Dict[str, Any]:
+        """LLM judge: did the team fully address the user's question?
+
+        Returns ``{"sufficient": bool, "gaps": [str], "reason": str,
+        "avg_score": float|None, "below_band_count": int}``. Never raises —
+        returns ``sufficient=True`` on any failure so a broken judge cannot
+        prevent the pipeline from returning.
+        """
+        scores: List[float] = []
+        findings: List[Dict[str, Any]] = []
+        for nr in node_results or []:
+            s = nr.get("score")
+            if s is not None:
+                try:
+                    scores.append(float(s))
+                except Exception:
+                    pass
+            findings.append({
+                "task": (nr.get("description") or "")[:240],
+                "response": (nr.get("llm_response") or "")[:480],
+                "score": s,
+                "status": nr.get("status"),
+            })
+
+        avg_score = (sum(scores) / len(scores)) if scores else None
+        below_band = sum(1 for s in scores if s < self.SUFFICIENCY_BAND)
+
+        # Cheap escape hatch: nothing to judge.
+        if not findings:
+            return {
+                "sufficient": True,
+                "gaps": [],
+                "reason": "no node results to judge",
+                "avg_score": avg_score,
+                "below_band_count": below_band,
+            }
+
+        prompt = (
+            "You evaluate whether a team of AI agents has fully addressed a user's question.\n\n"
+            f"USER QUESTION:\n{(user_message or '')[:2000]}\n\n"
+            f"DETECTED INTENT: {intent or 'unknown'}\n\n"
+            f"ACCUMULATED FINDINGS ({len(findings)} sub-tasks executed across {round_n} round(s)):\n"
+            f"{json.dumps(findings[:20], default=str)[:6000]}\n\n"
+            f"PROPOSED FINAL ANSWER:\n{(final_response or '')[:2000]}\n\n"
+            "DECIDE:\n"
+            "1. Does the proposed final answer fully address every aspect of the user's question?\n"
+            "2. If not, list specific gaps that would benefit from additional sub-tasks.\n"
+            "3. Be strict but not pedantic — only mark insufficient when a real, actionable gap remains.\n\n"
+            "Output STRICT JSON only (no prose):\n"
+            '{"sufficient": true|false, "gaps": ["concrete gap 1", "concrete gap 2"], "reason": "one-line"}'
+        )
+
+        try:
+            raw = await self._llm.complete(
+                messages=[{"role": "user", "content": prompt}],
+                trace_id=trace_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "sufficiency_judge_llm_failed",
+                layer="service",
+                error=str(exc)[:300],
+                trace_id=trace_id,
+            )
+            return {
+                "sufficient": True,  # don't keep looping when the judge breaks
+                "gaps": [],
+                "reason": f"judge failed: {str(exc)[:120]}",
+                "avg_score": avg_score,
+                "below_band_count": below_band,
+            }
+
+        data: Dict[str, Any] = {}
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw.strip())
+            except Exception:
+                m = re.search(r"\{.*\}", raw, re.DOTALL)
+                if m:
+                    try:
+                        data = json.loads(m.group(0))
+                    except Exception:
+                        data = {}
+
+        sufficient_judge = bool(data.get("sufficient", True))
+        gaps = [str(g)[:300] for g in (data.get("gaps") or []) if g]
+        reason = str(data.get("reason") or "")[:500]
+
+        # Score gate: even if the LLM judge says sufficient, force another
+        # round when the average score is below the adaptive band — this is
+        # how Property 3 (feedback closes the loop) plugs into Property 1.
+        score_forces_iter = (
+            avg_score is not None
+            and avg_score < self.SUFFICIENCY_BAND
+            and below_band > 0
+            and round_n < self.MAX_OUTER_ROUNDS
+        )
+        if score_forces_iter and sufficient_judge:
+            sufficient_judge = False
+            reason = (
+                f"score gate forced iteration: avg={avg_score:.2f} < band {self.SUFFICIENCY_BAND}"
+                f" ({below_band} below-band node(s)). " + reason
+            )
+            if not gaps:
+                gaps = ["scores indicate weak coverage; team should refine the lowest-scoring sub-tasks"]
+
+        return {
+            "sufficient": sufficient_judge,
+            "gaps": gaps,
+            "reason": reason,
+            "avg_score": avg_score,
+            "below_band_count": below_band,
+        }
+
+    async def _delta_decompose(
+        self,
+        *,
+        graph_id: str,
+        root_node_id: str,
+        user_message: str,
+        intent: str,
+        gaps: List[str],
+        prior_findings_summary: str,
+        round_n: int,
+        trace_id: str,
+    ) -> List[str]:
+        """Slim re-decomposition: turn the judge's gap list into 1-3 new
+        SUBTASK nodes attached to the existing graph at iteration=round_n.
+        Returns the list of new sub-task descriptions actually added.
+        """
+        if not gaps:
+            return []
+
+        prompt = (
+            "You are a task decomposer adding follow-up sub-tasks to an in-flight team execution.\n"
+            "The team already produced an answer that the sufficiency judge marked INSUFFICIENT.\n\n"
+            f"USER QUESTION:\n{(user_message or '')[:1500]}\n\n"
+            f"DETECTED INTENT: {intent or 'unknown'}\n\n"
+            f"PRIOR FINDINGS SUMMARY (truncated):\n{(prior_findings_summary or '')[:2500]}\n\n"
+            "REMAINING GAPS the team must close:\n"
+            + "\n".join(f"- {g}" for g in gaps[:8]) + "\n\n"
+            "Produce 1-3 NEW concrete, executable sub-tasks that close these gaps. "
+            "Do NOT repeat work that's already been done. Each sub-task should be one sentence.\n\n"
+            "Output STRICT JSON only — an array of strings:\n"
+            '["sub-task 1", "sub-task 2"]'
+        )
+
+        try:
+            raw = await self._llm.complete(
+                messages=[{"role": "user", "content": prompt}],
+                trace_id=trace_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "delta_decompose_llm_failed",
+                layer="service",
+                error=str(exc)[:300],
+                trace_id=trace_id,
+            )
+            return []
+
+        new_descs: List[str] = []
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw.strip())
+                if isinstance(parsed, list):
+                    new_descs = [str(t).strip() for t in parsed if t]
+            except Exception:
+                m = re.search(r"\[.*\]", raw, re.DOTALL)
+                if m:
+                    try:
+                        parsed = json.loads(m.group(0))
+                        if isinstance(parsed, list):
+                            new_descs = [str(t).strip() for t in parsed if t]
+                    except Exception:
+                        pass
+
+        # Cap to 3 to bound cost; drop empties.
+        new_descs = [d for d in new_descs if d][:3]
+        if not new_descs:
+            return []
+
+        # Persist new SUBTASK nodes attached to the existing root.
+        for desc in new_descs:
+            try:
+                await self._graph_mgr.add_node(
+                    graph_id=graph_id,
+                    parent_id=root_node_id,
+                    description=desc,
+                    node_type=NodeType.SUBTASK,
+                    depth=1,
+                    iteration=round_n,
+                    trace_id=trace_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "delta_decompose_add_node_failed",
+                    layer="service",
+                    error=str(exc)[:300],
+                    desc=desc[:120],
+                    trace_id=trace_id,
+                )
+
+        return new_descs
 
     # ------------------------------------------------------------------
     # Speculative execution helpers (CRITICAL tasks)
@@ -3161,6 +3695,29 @@ class PipelineService:
                 band = score_data.get("band", {})
                 band_low = band.get("low", 0.5)
                 recommendation = score_data.get("recommendation", "proceed")
+
+                # Phase A: emit score.evaluated for the timeline UI.
+                try:
+                    from app.utils.events import events as _events
+                    await _events.publish(
+                        conversation_id=getattr(self, "_current_conversation_id", "") or "",
+                        kind="score.evaluated",
+                        trace_id=trace_id,
+                        graph_id=graph_id,
+                        node_id=node_id,
+                        status="SUCCESS" if (score >= band_low or recommendation == "proceed") else "BELOW_BAND",
+                        payload={
+                            "agent_id": str(agent_id) if agent_id else "",
+                            "agent_name": agent.name if agent else None,
+                            "score": float(score),
+                            "band_low": float(band_low),
+                            "recommendation": recommendation,
+                            "criticality": criticality,
+                            "latency_ms": latency_ms,
+                        },
+                    )
+                except Exception:
+                    pass
 
                 # Schema-meta override: each broadcast subtask is bound to
                 # ONE agent's datasources by design — partial coverage is
@@ -3692,6 +4249,11 @@ class PipelineService:
             "current_depth": 0,
             "max_sub_agent_depth": settings.max_sub_agent_depth,
             "conversation_id": conversation_id,
+            # Phase A: identity for blackboard authorship + per-iteration
+            # memory refresh + timeline event attribution.
+            "agent_id": int(agent_id) if agent_id else None,
+            "agent_name": (agent.name if agent else None),
+            "node_id": node_id,
         }
 
         logger.info(

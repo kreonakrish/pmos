@@ -23,6 +23,7 @@ import {
 import MenuIcon from '@mui/icons-material/Menu';
 import AccountTreeIcon from '@mui/icons-material/AccountTree';
 import SwapHorizIcon from '@mui/icons-material/SwapHoriz';
+import TimelineIcon from '@mui/icons-material/Timeline';
 import AddIcon from '@mui/icons-material/Add';
 import { useNavigate } from 'react-router-dom';
 import { formatDistanceToNow, isToday, isYesterday, isThisWeek } from 'date-fns';
@@ -466,6 +467,13 @@ const ConversationsPage: React.FC = () => {
                 onClick={() => navigate(`/conversations/${activeConversationId}/interactions`)}
               >
                 Interactions
+              </Button>
+              <Button
+                size="small"
+                startIcon={<TimelineIcon />}
+                onClick={() => navigate(`/conversations/${activeConversationId}/timeline`)}
+              >
+                Timeline
               </Button>
             </>
           )}

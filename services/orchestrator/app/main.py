@@ -24,12 +24,14 @@ from app.adapters.translator_adapter import TranslatorAdapter
 from app.config import settings
 from app.routes import catalog as catalog_router
 from app.routes import conversations as conv_router
+from app.routes import events as events_router
 from app.routes import governance as gov_router
 from app.routes import health as health_router
 from app.routes import ml_insights as ml_router
 from app.routes import orchestrator as orch_router
 from app.routes import sandbox as sandbox_router
 from app.services.pipeline import PipelineService
+from app.utils.events import init_event_publisher
 from app.utils.logger import logger
 from app.utils.telemetry import REQUEST_DURATION, REQUEST_TOTAL
 
@@ -50,6 +52,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await neo4j.connect()
     await ontology_neo4j.connect()
     await redis.connect()
+
+    # Phase A: bind the timeline event publisher to the live Redis client.
+    init_event_publisher(redis)
 
     llm = LLMAdapter()
     memory = MemoryAdapter()
@@ -277,3 +282,4 @@ app.include_router(sandbox_router.router)
 app.include_router(gov_router.router)
 app.include_router(ml_router.router)
 app.include_router(catalog_router.router)
+app.include_router(events_router.router)

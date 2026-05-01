@@ -17,6 +17,7 @@ import AdminRolesPage from '@/pages/Admin/Roles';
 import HomePage from '@/pages/Home';
 import ConversationsPage from '@/pages/Conversations';
 import TaskDecompositionPage from '@/pages/TaskDecomposition';
+import TimelinePage from '@/pages/Timeline';
 import AgentInteractionPage from '@/pages/AgentInteraction';
 import JobsPage from '@/pages/Jobs';
 import ToolStudioPage from '@/pages/ToolStudio';
@@ -116,6 +117,9 @@ export default function App() {
               } />
               <Route path="/conversations/:id/decomposition" element={
                 <PermissionGate anyOf={['conversations.read']} redirect><TaskDecompositionPage /></PermissionGate>
+              } />
+              <Route path="/conversations/:id/timeline" element={
+                <PermissionGate anyOf={['conversations.read']} redirect><TimelinePage /></PermissionGate>
               } />
               <Route path="/conversations/:id/interactions" element={
                 <PermissionGate anyOf={['conversations.read']} redirect><AgentInteractionPage /></PermissionGate>

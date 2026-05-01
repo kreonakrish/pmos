@@ -8,15 +8,105 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from app.adapters.llm_adapter import LLMAdapter
+from app.config import settings
+from app.services import blackboard
+from app.utils.events import events
 from app.utils.logger import logger
+
+
+# ---------------------------------------------------------------------------
+# Phase A.3 helpers — per-iteration memory refresh
+# ---------------------------------------------------------------------------
+
+# Captures plausible entity strings inside tool results: identifiers, snake/dot
+# separated names, capitalized phrases. Intentionally permissive — the LLM is
+# the final consumer and can ignore noise.
+_ENTITY_RE = re.compile(
+    r"\b("
+    r"[A-Z][A-Z0-9_]{2,}"             # SCREAMING_SNAKE
+    r"|[A-Z][a-z]+(?:[A-Z][a-z]+)+"    # CamelCase
+    r"|[a-z][a-z0-9]*(?:[._][a-z][a-z0-9]*)+"  # snake.dotted
+    r")\b"
+)
+
+
+def _extract_entities(text: str, *, limit: int = 12) -> List[str]:
+    """Pull entity-like tokens from a string, deduped, capped."""
+    if not text or not isinstance(text, str):
+        return []
+    seen: List[str] = []
+    seen_set: set = set()
+    for m in _ENTITY_RE.finditer(text[:8000]):  # cap scan range for cost
+        tok = m.group(1)
+        if len(tok) < 3 or len(tok) > 80:
+            continue
+        if tok.lower() in seen_set:
+            continue
+        seen_set.add(tok.lower())
+        seen.append(tok)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+async def _memory_refresh(
+    *,
+    agent_id: Optional[int],
+    entities: List[str],
+    trace_id: str,
+) -> str:
+    """Best-effort: ask memory service for episodic context related to the new
+    entities discovered in this iteration. Returns a compact context string,
+    or "" if nothing useful (or memory unavailable).
+    """
+    if not entities or not agent_id:
+        return ""
+    query = " ".join(entities[:6])
+    try:
+        url = f"{settings.memory_service_url}/v1/memory/retrieve"
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.get(
+                url,
+                params={
+                    "agent_id": int(agent_id),
+                    "tier": "episodic",
+                    "query": query,
+                    "k": 3,
+                },
+                headers={"x-request-id": trace_id or ""},
+            )
+            if resp.status_code != 200:
+                return ""
+            data = resp.json()
+    except Exception:
+        return ""
+
+    results = data.get("results") or []
+    if not results:
+        return ""
+
+    lines = ["[MEMORY REFRESH — episodic findings related to entities you just discovered]"]
+    for r in results[:3]:
+        content = r.get("content") or r.get("summary") or ""
+        if not content:
+            continue
+        if len(content) > 320:
+            content = content[:320] + "…"
+        lines.append(f"- {content}")
+    if len(lines) == 1:  # only the header
+        return ""
+    lines.append("[END MEMORY REFRESH]")
+    return "\n".join(lines)
 
 router = APIRouter(prefix="/v1/sandbox", tags=["sandbox"])
 
@@ -278,6 +368,14 @@ class AgentExecuteRequest(BaseModel):
     current_depth: int = 0
     max_sub_agent_depth: int = 3
     conversation_id: Optional[str] = None
+    # Phase A: identity for the executing agent. Used for blackboard authorship
+    # filtering (so an agent doesn't read its own publishes back) and for
+    # per-iteration memory refresh against the agent's tier. Optional so legacy
+    # callers (e.g., direct sandbox tests) keep working.
+    agent_id: Optional[int] = None
+    agent_name: Optional[str] = None
+    node_id: Optional[str] = None
+    iteration_round: int = 0  # outer-loop round (Phase A.4); sandbox just echoes it
 
 class ToolCallRecord(BaseModel):
     tool_name: str
@@ -785,8 +883,93 @@ async def agent_execute(body: AgentExecuteRequest, request: Request) -> AgentExe
         iterations = 0
         final_response = ""
 
+        # ── Phase A: blackboard + memory refresh setup ─────────────────
+        # Cursor "$" = only entries arriving from now on, so we don't replay
+        # the entire stream. Each non-first iteration consumes from this cursor
+        # and advances it. Only meaningful if conversation_id is present.
+        redis_client = getattr(request.app.state, "redis", None)
+        bb_cursor: str = "$"
+        # Buffer the entities seen across this run so we don't repeatedly
+        # query memory with the same string each iteration.
+        seen_entities_global: set = set()
+        # Track whether a memory refresh is pending — set when new entities
+        # are discovered inside the tool-call loop, consumed before next LLM turn.
+        pending_new_entities: List[str] = []
+
         while iterations < body.max_iterations:
             iterations += 1
+
+            # ── Phase A.2/A.3: inject team context + memory refresh ────
+            # Skip on iteration 1 — there's no prior tool result yet, and the
+            # initial system+user messages already carry the assembled prompt.
+            if iterations > 1 and body.conversation_id:
+                try:
+                    new_entries, bb_cursor = await blackboard.consume_new(
+                        redis_client,
+                        conversation_id=body.conversation_id,
+                        last_id=bb_cursor,
+                        exclude_agent_id=str(body.agent_id) if body.agent_id else "",
+                    )
+                    if new_entries:
+                        ctx = blackboard.format_team_context(new_entries)
+                        if ctx:
+                            messages.append({"role": "user", "content": ctx})
+                except Exception:
+                    pass  # observability MUST NOT break the loop
+
+                # Memory refresh — fire only when we actually discovered new
+                # entities in the prior iteration's tool results.
+                if pending_new_entities:
+                    try:
+                        refresh_text = await _memory_refresh(
+                            agent_id=body.agent_id,
+                            entities=pending_new_entities,
+                            trace_id=trace_id,
+                        )
+                        if refresh_text:
+                            messages.append({"role": "user", "content": refresh_text})
+                            try:
+                                await events.publish(
+                                    conversation_id=body.conversation_id or "",
+                                    kind="memory.refreshed",
+                                    trace_id=trace_id,
+                                    graph_id=body.graph_id,
+                                    node_id=body.node_id,
+                                    iteration=iterations,
+                                    round_n=body.iteration_round,
+                                    payload={
+                                        "agent_id": body.agent_id,
+                                        "agent_name": body.agent_name,
+                                        "entities": pending_new_entities[:10],
+                                        "preview": refresh_text[:280],
+                                    },
+                                )
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    pending_new_entities = []
+
+            # Emit a per-iteration event so the timeline can render the
+            # agent's reasoning steps.
+            try:
+                await events.publish(
+                    conversation_id=body.conversation_id or "",
+                    kind="agent.iteration",
+                    trace_id=trace_id,
+                    graph_id=body.graph_id,
+                    node_id=body.node_id,
+                    iteration=iterations,
+                    round_n=body.iteration_round,
+                    payload={
+                        "agent_id": body.agent_id,
+                        "agent_name": body.agent_name,
+                        "depth": body.current_depth,
+                        "msg_count": len(messages),
+                    },
+                )
+            except Exception:
+                pass
 
             # Call LLM with tools (provider-aware)
             result = await _llm_adapter.complete_with_tools(
@@ -909,6 +1092,29 @@ async def agent_execute(body: AgentExecuteRequest, request: Request) -> AgentExe
                     })
                     continue
 
+                # Phase A: emit tool.call event before execution so the UI can
+                # show "in flight" state while we wait for the tool.
+                try:
+                    await events.publish(
+                        conversation_id=body.conversation_id or "",
+                        kind="tool.call",
+                        trace_id=trace_id,
+                        graph_id=body.graph_id,
+                        node_id=body.node_id,
+                        iteration=iterations,
+                        round_n=body.iteration_round,
+                        payload={
+                            "agent_id": body.agent_id,
+                            "agent_name": body.agent_name,
+                            "tool_id": tool_def.tool_id,
+                            "tool_name": tool_def.name,
+                            "tool_type": tool_def.tool_type,
+                            "args_preview": json.dumps(arguments, default=str)[:400],
+                        },
+                    )
+                except Exception:
+                    pass
+
                 tool_result = await _execute_tool(
                     tool_executor_url=body.tool_executor_url,
                     tool_def=tool_def,
@@ -935,6 +1141,67 @@ async def agent_execute(body: AgentExecuteRequest, request: Request) -> AgentExe
                     "tool_call_id": tc["id"],
                     "content": content,
                 })
+
+                # ── Phase A: post-tool fan-out ─────────────────────────
+                # 1) Extract entities for next iteration's memory refresh.
+                # 2) Publish a tool.result event for the UI timeline.
+                # 3) Publish a blackboard tool_result_summary so siblings see it.
+                try:
+                    new_entities = _extract_entities(content)
+                    fresh = [e for e in new_entities if e.lower() not in seen_entities_global]
+                    for e in fresh:
+                        seen_entities_global.add(e.lower())
+                    if fresh:
+                        pending_new_entities.extend(fresh[:10])
+                except Exception:
+                    fresh = []
+
+                try:
+                    await events.publish(
+                        conversation_id=body.conversation_id or "",
+                        kind="tool.result",
+                        trace_id=trace_id,
+                        graph_id=body.graph_id,
+                        node_id=body.node_id,
+                        iteration=iterations,
+                        round_n=body.iteration_round,
+                        status="SUCCESS" if tool_result.get("success") else "ERROR",
+                        payload={
+                            "agent_id": body.agent_id,
+                            "agent_name": body.agent_name,
+                            "tool_id": tool_def.tool_id,
+                            "tool_name": tool_def.name,
+                            "tool_type": tool_def.tool_type,
+                            "success": tool_result.get("success", False),
+                            "latency_ms": tool_result.get("latency_ms", 0),
+                            "preview": content[:400],
+                            "discovered_entities": fresh[:10],
+                        },
+                    )
+                except Exception:
+                    pass
+
+                if body.conversation_id:
+                    try:
+                        await blackboard.publish(
+                            redis_client,
+                            conversation_id=body.conversation_id,
+                            kind="tool_result_summary",
+                            agent_id=str(body.agent_id) if body.agent_id else "",
+                            agent_name=body.agent_name or "",
+                            node_id=body.node_id or "",
+                            iteration=iterations,
+                            payload={
+                                "tool_name": tool_def.name,
+                                "tool_type": tool_def.tool_type,
+                                "success": bool(tool_result.get("success")),
+                                "summary": (content[:240] + "…") if len(content) > 240 else content,
+                                "discovered_entities": fresh[:10],
+                            },
+                            trace_id=trace_id,
+                        )
+                    except Exception:
+                        pass
 
             logger.info(
                 "Agent tool-use iteration",
