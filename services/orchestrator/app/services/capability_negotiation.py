@@ -767,7 +767,18 @@ class CapabilityNegotiationService:
     # ------------------------------------------------------------------
 
     def rank_bids(self, bids: List[BidResponse]) -> List[BidResponse]:
-        """Rank eligible bids by weighted score: confidence, memory relevance, latency."""
+        """Rank eligible bids by weighted score.
+
+        Score = w_cov × coverage_ratio
+              + w_conf × confidence
+              + w_mem × memory_relevance
+              + w_lat × latency_score
+
+        When a bid carries no structured coverage (``plan_format='legacy'``
+        or absent ``BidCoverage``) the coverage term defaults to 1.0 so
+        legacy bids aren't penalised — they fall back to the pre-Phase-22
+        score weights once the coverage term is neutralised.
+        """
         eligible = [b for b in bids if b.eligible and b.error is None]
         if not eligible:
             # If none are eligible, try all non-error bids
@@ -776,12 +787,17 @@ class CapabilityNegotiationService:
         w_conf = settings.bid_confidence_weight
         w_mem = settings.bid_memory_weight
         w_lat = settings.bid_latency_weight
+        w_cov = settings.bid_coverage_weight
 
         def score(bid: BidResponse) -> float:
             # Latency: lower is better, normalize to 0-1 (inverse)
             lat_score = 1.0 / (1.0 + bid.estimated_latency_ms / 1000.0)
+            cov_score = (
+                bid.coverage.ratio() if bid.coverage is not None else 1.0
+            )
             return (
-                w_conf * bid.confidence
+                w_cov * cov_score
+                + w_conf * bid.confidence
                 + w_mem * bid.memory_relevance
                 + w_lat * lat_score
             )

@@ -443,6 +443,94 @@ async def test_assign_winner_persists_plan_and_coverage_on_tasknode():
     assert set_call["params"]["plan_format"] == "structured"
 
 
+# ---------------------------------------------------------------------------
+# Coverage-aware ranking (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _bid(
+    *,
+    agent_id: str,
+    confidence: float = 0.7,
+    answerable: List[str] | None = None,
+    not_answerable: List[str] | None = None,
+    plan_format: str = "structured",
+    eligible: bool = True,
+    error: str | None = None,
+) -> BidResponse:
+    cov = None
+    if answerable is not None or not_answerable is not None:
+        cov = BidCoverage(
+            answerable=answerable or [],
+            not_answerable=not_answerable or [],
+        )
+    return BidResponse(
+        agent_id=agent_id,
+        agent_name=agent_id,
+        confidence=confidence,
+        eligible=eligible,
+        error=error,
+        coverage=cov,
+        plan_format=plan_format,
+    )
+
+
+def test_rank_prefers_full_coverage_over_partial_at_same_confidence():
+    svc = _make_service()
+    full = _bid(agent_id="full", confidence=0.7,
+                answerable=["a", "b", "c", "d"], not_answerable=[])
+    partial = _bid(agent_id="partial", confidence=0.7,
+                   answerable=["a"], not_answerable=["b", "c", "d"])
+    ranked = svc.rank_bids([partial, full])
+    assert ranked[0].agent_id == "full"
+
+
+def test_rank_legacy_bid_treated_as_neutral_coverage():
+    """A legacy bid (no coverage) should rank ~as if it had coverage=1.0,
+    so it competes on confidence + memory + latency only — not penalised."""
+    svc = _make_service()
+    legacy_high_conf = _bid(agent_id="legacy", confidence=0.95,
+                            plan_format="legacy")
+    structured_partial = _bid(agent_id="structured", confidence=0.95,
+                              answerable=["a"], not_answerable=["b", "c", "d"])
+    ranked = svc.rank_bids([structured_partial, legacy_high_conf])
+    # Legacy treats coverage as 1.0; partial has 0.25 — legacy wins.
+    assert ranked[0].agent_id == "legacy"
+
+
+def test_rank_high_coverage_can_beat_higher_confidence():
+    """A bid that covers 4/4 parts at 0.7 confidence should beat one that
+    covers 1/4 parts at 0.85 confidence — that's the whole point of
+    coverage-aware ranking."""
+    svc = _make_service()
+    high_cov = _bid(agent_id="high_cov", confidence=0.7,
+                    answerable=["a", "b", "c", "d"], not_answerable=[])
+    high_conf_low_cov = _bid(agent_id="high_conf", confidence=0.85,
+                             answerable=["a"], not_answerable=["b", "c", "d"])
+    ranked = svc.rank_bids([high_conf_low_cov, high_cov])
+    assert ranked[0].agent_id == "high_cov"
+
+
+def test_rank_drops_ineligible_and_errored():
+    svc = _make_service()
+    good = _bid(agent_id="good", confidence=0.7, answerable=["a"])
+    bad_eligible = _bid(agent_id="bad_e", confidence=0.99,
+                        answerable=["a", "b"], eligible=False)
+    bad_error = _bid(agent_id="bad_err", confidence=0.99,
+                     answerable=["a", "b"], error="boom")
+    ranked = svc.rank_bids([bad_error, bad_eligible, good])
+    assert [r.agent_id for r in ranked] == ["good"]
+
+
+def test_rank_falls_back_to_non_error_when_nothing_eligible():
+    svc = _make_service()
+    a = _bid(agent_id="a", confidence=0.6, eligible=False)
+    b = _bid(agent_id="b", confidence=0.4, eligible=False)
+    ranked = svc.rank_bids([a, b])
+    # Neither is eligible — fallback to ranking ineligible-but-not-errored.
+    assert len(ranked) == 2
+    assert ranked[0].agent_id == "a"  # higher confidence wins among legacies
+
+
 @pytest.mark.asyncio
 async def test_assign_winner_persists_empty_plan_when_legacy():
     svc = _make_service()

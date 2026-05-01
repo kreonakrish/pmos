@@ -54,9 +54,14 @@ class Settings(BaseSettings):
 
     # Capability negotiation (bidding)
     bid_timeout_sec: float = 15.0
-    bid_confidence_weight: float = 0.6
-    bid_memory_weight: float = 0.25
-    bid_latency_weight: float = 0.15
+    bid_confidence_weight: float = 0.45
+    bid_memory_weight: float = 0.15
+    bid_latency_weight: float = 0.10
+    # Phase 22 — weight on the bid's self-declared coverage ratio
+    # (answerable / (answerable + not_answerable)). When a bid carries no
+    # structured coverage (legacy shape), the coverage term is treated as
+    # 1.0 — neutral — so legacy bids aren't unfairly demoted.
+    bid_coverage_weight: float = 0.30
 
     # Sub-agent spawning
     max_sub_agent_depth: int = 3
