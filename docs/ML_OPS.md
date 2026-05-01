@@ -268,8 +268,103 @@ into the pipeline hot path.
 - **Scheduling**: all three ML batch scripts (`compute_node2vec.py`,
   `train_learned_scorer.py`, `discover_sops.py`) are still manual. Needs
   host cron / Windows Task Scheduler / k8s CronJob wiring — deployment-dependent.
-- **Flip 1A to LIVE** once any context bucket reaches `pulls >= 20`.
-- **Flip 1B to LIVE** by raising `w7_learned_quality` in scoring_weights once
-  MAE vs heuristic stabilizes and val accuracy on real feedback is good.
 - **GNN-based scoring** as the ambitious successor to 1B — not started;
   would reuse Node2Vec features as input.
+
+> Phase D below ships the live wiring for both 1A and 1B behind config
+> flags — the "Flip 1A/1B to LIVE" line items above are now handled by
+> setting `BANDIT_LIVE_SELECTION=true` and raising
+> `SCORING_WEIGHT_W7_LEARNED` above 0 in the env.
+
+---
+
+## Phase D — flipping bandit + learned scorer LIVE
+
+The shadow plumbing for both 1A (contextual bandit) and 1B (learned
+scorer) was always there; Phase D wires them through to actual decisions
+behind two config flags. Both default OFF so existing deployments don't
+change behavior. The selectors keep their own safeguards so flipping a
+flag on a cold cluster degrades gracefully rather than hurting quality.
+
+### Flags
+
+Set in `.env` (or pass as compose env override at restart time):
+
+```bash
+BANDIT_LIVE_SELECTION=true        # 1A → LIVE
+SCORING_WEIGHT_W7_LEARNED=0.2     # 1B → LIVE at blend weight w7
+```
+
+`docker-compose.yml` passes both into the orchestrator container via
+`${BANDIT_LIVE_SELECTION:-false}` / `${SCORING_WEIGHT_W7_LEARNED:-0.0}`,
+so restarting just the orchestrator picks up changes:
+
+```bash
+BANDIT_LIVE_SELECTION=true SCORING_WEIGHT_W7_LEARNED=0.2 \
+  ./scripts/deploy.sh restart orchestrator
+```
+
+### What happens when each flips
+
+| Flag | Off | On |
+|------|-----|-----|
+| `BANDIT_LIVE_SELECTION` | Bandit logs what it would have picked alongside the bid winner. Bid winner is the actual selection. | `_step3_negotiate` calls `BanditSelector.select(mode='LIVE')`. If the picked arm has ≥ `MIN_PULLS_FOR_LIVE` (20) pulls, `neg_result.winner` is rewritten to the bandit's pick. Otherwise the selector auto-downgrades to FALLBACK and the bid winner stands. |
+| `SCORING_WEIGHT_W7_LEARNED` | Heuristic score from `services/scoring/` is the live score. Learned scorer's prediction is logged via `predict_and_log` for offline analysis only. | `_execute_single_node` blends: `score = (1 - w7) * heuristic + w7 * learned`, then runs the band check on the blended value. The shadow `predict_and_log` still fires after step 4-7 so the training table keeps growing. |
+
+### Cold-start safeguards (don't disable these)
+
+- **Bandit MIN_PULLS_FOR_LIVE = 20** (`services/orchestrator/app/services/bandit_selector.py`).
+  An arm with fewer pulls is treated as too noisy to commit to; the
+  selector returns mode=FALLBACK and the caller keeps the bid winner.
+- **Bandit EXPLORATION_EPSILON = 0.10**. 10% of decisions still pick a
+  random arm to keep under-pulled arms refreshed.
+- **Learned-scorer w7 in [0.0, 1.0]**. The blend is no-op at w7=0; w7=1
+  ignores the heuristic entirely. Typical live values are 0.2–0.3.
+
+### What the user sees in the Timeline
+
+Both promotions emit a typed `ml.rationale` event into
+`pipeline_events` and the `pmos:events:<conv_id>` SSE stream. The
+Decomposition Timeline UI renders it inline:
+
+- **bandit**: `bandit overrode bid winner X → Y` or `bandit confirmed Y`.
+  Payload includes `decision_id`, `prior_bid_winner`, `pick_agent_name`,
+  candidate Beta `theta` + `pulls` snapshot for the top 6 arms.
+- **learned_scorer**: `blend w7=0.2: 0.67 → 0.72 (learned 0.92)`.
+  Payload includes `heuristic_score`, `learned_score`, `blended_score`,
+  `model_version`. The accompanying `score.evaluated` row also gains
+  `heuristic_score`, `learned_score`, `w7_learned` for the band check.
+
+### Recommended rollout order
+
+1. Verify the shadow tables are populating: `learned_scorer_predictions`
+   (1B) and `bandit_decisions` / `bandit_agent_state` (1A) should grow on
+   every conversation.
+2. Run `scripts/train_learned_scorer.py` until val accuracy on real
+   user-feedback rows stabilizes.
+3. **Flip 1B first** at `SCORING_WEIGHT_W7_LEARNED=0.2`. Watch
+   `score.evaluated.blended_score` vs `heuristic_score` divergence in
+   ML Insights.
+4. **Flip 1A** once any context bucket has accumulated ≥ 20 pulls
+   (queryable from `bandit_agent_state.pulls`). Watch the
+   `ml.rationale` source=bandit override count in the Timeline as a
+   freshness signal.
+5. Tune w7 upward to 0.3 if the learned scorer continues to outperform
+   heuristic on user-feedback ground truth.
+
+### Code touch points
+
+- `services/orchestrator/app/config.py` — `bandit_live_selection`,
+  `scoring_weight_w7_learned` settings.
+- `services/orchestrator/app/services/pipeline.py`
+  - `_step3_negotiate` reads the bandit flag and runs LIVE; promotes the
+    bandit pick to `neg_result.winner` when the decision is LIVE.
+  - `_execute_single_node` blends learned + heuristic when w7 > 0, emits
+    `ml.rationale` and an extended `score.evaluated` payload.
+- `services/orchestrator/app/services/bandit_selector.py` — already
+  carries `MIN_PULLS_FOR_LIVE` + `EXPLORATION_EPSILON` safeguards.
+- `services/orchestrator/app/services/learned_scorer.py` — used directly
+  via `_predict_proba` for the live blend; `predict_and_log` still runs
+  after step 4-7 for the training table.
+- `client/src/pages/Timeline/index.tsx` — `ml.rationale` row rendering;
+  `score.evaluated` blend annotation.
