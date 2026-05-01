@@ -96,6 +96,16 @@ class CapabilityNegotiationService:
         winner = ranked[0] if ranked else None
         fallback_chain = ranked[1:] if len(ranked) > 1 else []
 
+        # 3b. Complementary-cover (Phase 4). When the top winner can't
+        # cover the question alone, pick a set of bids whose answerable
+        # parts span the question. Pipeline-side splicing reads
+        # ``complementary_winners`` to spawn sibling subtask nodes — one
+        # per chosen agent.
+        complementary_winners, uncovered_parts = self._compute_set_cover(
+            ranked_bids=ranked,
+            top_winner=winner,
+        )
+
         elapsed_ms = int((time.monotonic() - start) * 1000)
 
         # 4. Write assignment to Neo4j
@@ -129,6 +139,8 @@ class CapabilityNegotiationService:
             all_bids=all_bids,
             negotiation_time_ms=elapsed_ms,
             trace_id=trace_id,
+            complementary_winners=complementary_winners,
+            uncovered_parts=uncovered_parts,
         )
 
     # ------------------------------------------------------------------
@@ -948,6 +960,86 @@ class CapabilityNegotiationService:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_set_cover(
+        ranked_bids: List[BidResponse],
+        top_winner: Optional[BidResponse],
+    ) -> Tuple[List[BidResponse], List[str]]:
+        """Greedy set cover across structured bids.
+
+        Returns ``(chosen, uncovered_parts)``. ``chosen`` is non-empty only
+        when the top winner can't cover the question alone — at least 2
+        bids are needed to span the declared parts. The first entry is
+        always the top winner (so pipeline-side splicing knows which
+        sibling slot is the "primary" node).
+
+        When called with no structured bids (everything is legacy / no
+        coverage), returns ``([], [])`` and the caller falls back to the
+        single-winner path.
+        """
+        if top_winner is None or top_winner.coverage is None:
+            return [], []
+
+        # Union of all parts declared by any structured bid — that's the
+        # question's surface area as bidders perceive it.
+        all_parts: set[str] = set()
+        for b in ranked_bids:
+            if b.coverage:
+                all_parts.update(b.coverage.answerable)
+                all_parts.update(b.coverage.not_answerable)
+
+        if not all_parts:
+            return [], []
+
+        # If the top winner already covers everything declared, no need to
+        # complement.
+        top_answerable = set(top_winner.coverage.answerable)
+        if all_parts.issubset(top_answerable):
+            return [], []
+
+        # Greedy set cover: at each step, pick the bid that adds the most
+        # uncovered parts. Stop when full coverage or no more progress.
+        structured = [
+            b for b in ranked_bids
+            if b.coverage and b.coverage.answerable and b.error is None
+        ]
+        if not structured:
+            return [], []
+
+        chosen: List[BidResponse] = []
+        chosen_ids: set[str] = set()
+        covered: set[str] = set()
+
+        # Seed with the top winner — pipeline reuses its existing node.
+        chosen.append(top_winner)
+        chosen_ids.add(top_winner.agent_id)
+        covered |= top_answerable
+
+        while covered < all_parts:
+            best: Optional[BidResponse] = None
+            best_gain = 0
+            for b in structured:
+                if b.agent_id in chosen_ids:
+                    continue
+                gain = len(set(b.coverage.answerable) - covered)
+                if gain > best_gain:
+                    best = b
+                    best_gain = gain
+            if best is None or best_gain == 0:
+                break
+            chosen.append(best)
+            chosen_ids.add(best.agent_id)
+            covered |= set(best.coverage.answerable)
+
+        uncovered = sorted(all_parts - covered)
+
+        # If only the top winner ended up chosen, no complementary mode —
+        # callers want None/empty in that case.
+        if len(chosen) <= 1:
+            return [], uncovered
+
+        return chosen, uncovered
 
     @staticmethod
     def _coerce_coverage(raw: Any) -> Optional[BidCoverage]:

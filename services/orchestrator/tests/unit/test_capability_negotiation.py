@@ -531,6 +531,138 @@ def test_rank_falls_back_to_non_error_when_nothing_eligible():
     assert ranked[0].agent_id == "a"  # higher confidence wins among legacies
 
 
+# ---------------------------------------------------------------------------
+# Set cover (Phase 4)
+# ---------------------------------------------------------------------------
+
+def test_set_cover_returns_empty_when_top_winner_covers_everything():
+    bids = [
+        _bid(agent_id="full", confidence=0.9,
+             answerable=["count", "dates", "tenure", "status"]),
+        _bid(agent_id="partial", confidence=0.6,
+             answerable=["count"], not_answerable=["dates", "tenure", "status"]),
+    ]
+    chosen, uncovered = CapabilityNegotiationService._compute_set_cover(
+        ranked_bids=bids, top_winner=bids[0],
+    )
+    assert chosen == []
+    assert uncovered == []
+
+
+def test_set_cover_finds_three_complementary_winners_for_marketing_query():
+    """The headline scenario. No single agent covers
+    marketing→origination→servicing; greedy picks one per slice."""
+    mkt = _bid(
+        agent_id="mkt", confidence=0.85,
+        answerable=["campaign loan_ids"],
+        not_answerable=["origination_date", "servicing tenure", "current status"],
+    )
+    orig = _bid(
+        agent_id="orig", confidence=0.85,
+        answerable=["origination_date", "originated count"],
+        not_answerable=["campaign loan_ids", "servicing tenure", "current status"],
+    )
+    serv = _bid(
+        agent_id="serv", confidence=0.85,
+        answerable=["servicing tenure", "current status"],
+        not_answerable=["campaign loan_ids", "origination_date"],
+    )
+    chosen, uncovered = CapabilityNegotiationService._compute_set_cover(
+        ranked_bids=[mkt, orig, serv], top_winner=mkt,
+    )
+    assert len(chosen) == 3
+    assert chosen[0].agent_id == "mkt"  # top winner seeded first
+    assert {b.agent_id for b in chosen} == {"mkt", "orig", "serv"}
+    assert uncovered == []
+
+
+def test_set_cover_records_uncovered_when_no_bid_owns_a_part():
+    a = _bid(agent_id="a", confidence=0.8,
+             answerable=["count"], not_answerable=["dates", "status"])
+    b = _bid(agent_id="b", confidence=0.7,
+             answerable=["dates"], not_answerable=["count", "status"])
+    chosen, uncovered = CapabilityNegotiationService._compute_set_cover(
+        ranked_bids=[a, b], top_winner=a,
+    )
+    assert {x.agent_id for x in chosen} == {"a", "b"}
+    assert uncovered == ["status"]
+
+
+def test_set_cover_returns_empty_when_top_winner_has_no_coverage():
+    legacy = _bid(agent_id="legacy", confidence=0.9, plan_format="legacy")
+    chosen, uncovered = CapabilityNegotiationService._compute_set_cover(
+        ranked_bids=[legacy], top_winner=legacy,
+    )
+    assert chosen == []
+    assert uncovered == []
+
+
+def test_set_cover_skips_legacy_bids_in_search():
+    """Legacy bids have no coverage — they cannot complement structured ones."""
+    structured = _bid(agent_id="s", confidence=0.7,
+                      answerable=["a"], not_answerable=["b"])
+    legacy = _bid(agent_id="L", confidence=0.95, plan_format="legacy")
+    chosen, uncovered = CapabilityNegotiationService._compute_set_cover(
+        ranked_bids=[structured, legacy], top_winner=structured,
+    )
+    # Only "s" is structured; no progress on "b" — single-winner mode.
+    assert chosen == []
+    assert uncovered == ["b"]
+
+
+def test_set_cover_picks_the_minimum_set_greedy():
+    """Greedy picks the bid with the largest unique gain at each step;
+    once a redundant bid wouldn't add anything new it's skipped."""
+    a = _bid(agent_id="a", confidence=0.9,
+             answerable=["x", "y"], not_answerable=["z"])
+    b = _bid(agent_id="b", confidence=0.8,
+             answerable=["x"], not_answerable=["y", "z"])  # subset of a
+    c = _bid(agent_id="c", confidence=0.8,
+             answerable=["z"], not_answerable=["x", "y"])
+    chosen, uncovered = CapabilityNegotiationService._compute_set_cover(
+        ranked_bids=[a, b, c], top_winner=a,
+    )
+    assert {x.agent_id for x in chosen} == {"a", "c"}  # b skipped — adds nothing
+    assert uncovered == []
+
+
+@pytest.mark.asyncio
+async def test_negotiate_populates_complementary_winners_on_result():
+    """End-to-end via negotiate(): top winner has gaps → result carries
+    complementary_winners."""
+    svc = _make_service()
+
+    # Stub broadcast_bid_request to avoid the LLM round trip.
+    bids = [
+        _bid(agent_id="mkt", confidence=0.85,
+             answerable=["campaign"], not_answerable=["origination", "tenure"]),
+        _bid(agent_id="orig", confidence=0.8,
+             answerable=["origination"], not_answerable=["campaign", "tenure"]),
+        _bid(agent_id="serv", confidence=0.8,
+             answerable=["tenure"], not_answerable=["campaign", "origination"]),
+    ]
+
+    async def _stub_broadcast(*a, **kw):
+        return bids
+
+    svc.broadcast_bid_request = _stub_broadcast  # type: ignore[assignment]
+
+    # Stub assign_winner_to_graph and dataset filter so they're no-ops.
+    svc.assign_winner_to_graph = AsyncMock()  # type: ignore[assignment]
+    svc._apply_dataset_binding_filter = AsyncMock()  # type: ignore[assignment]
+
+    result = await svc.negotiate(
+        bid_request=BidRequest(task_id="t-1", task_description="cross-schema q"),
+        team_agents=[],
+    )
+    assert result.winner is not None
+    assert len(result.complementary_winners) == 3
+    assert {b.agent_id for b in result.complementary_winners} == {
+        "mkt", "orig", "serv",
+    }
+    assert result.uncovered_parts == []
+
+
 @pytest.mark.asyncio
 async def test_assign_winner_persists_empty_plan_when_legacy():
     svc = _make_service()

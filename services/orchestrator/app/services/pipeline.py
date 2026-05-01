@@ -2430,6 +2430,115 @@ class PipelineService:
                     trace_id=trace_id,
                 )
 
+        # ------------------------------------------------------------------
+        # Phase 4 — complementary cover. When a negotiation produced
+        # multiple complementary winners (no single bid spans the question),
+        # spawn additional sibling subtask nodes — one per non-top winner —
+        # each tailored to that agent's `coverage.answerable` slice. The
+        # original subtask node keeps the top winner; the new nodes get
+        # their own assigned_agent_id stamped. The execution step picks
+        # them up in the next graph_nodes refresh.
+        # ------------------------------------------------------------------
+        complementary_spawned = 0
+        for original_desc, neg_result in list(results.items()):
+            cw = neg_result.complementary_winners or []
+            if len(cw) <= 1:
+                continue
+            original_node = next(
+                (n for n in subtask_nodes if n.get("description") == original_desc),
+                None,
+            )
+            parent_id = (
+                original_node.get("parent_id")
+                or original_node.get("parent_node_id")
+                or ""
+            ) if original_node else ""
+            depth = int(original_node.get("depth") or 1) if original_node else 1
+            criticality = (
+                original_node.get("criticality") or Criticality.MEDIUM
+            ) if original_node else Criticality.MEDIUM
+            ds_bindings = (
+                [str(b) for b in (original_node.get("dataset_bindings") or [])]
+                if original_node else []
+            )
+
+            # cw[0] is the top winner — already assigned to the original
+            # node by `assign_winner_to_graph`. Skip and spawn the rest.
+            for sibling_winner in cw[1:]:
+                slice_text = ", ".join(
+                    sibling_winner.coverage.answerable
+                    if sibling_winner.coverage
+                    else []
+                ) or "complementary slice"
+                new_desc = (
+                    f"[{sibling_winner.agent_name} slice: {slice_text}] {original_desc}"
+                )
+                try:
+                    new_node_id = await self._graph_mgr.add_node(
+                        graph_id=graph_id,
+                        parent_id=parent_id or None,
+                        description=new_desc,
+                        criticality=criticality,
+                        depth=depth,
+                        trace_id=trace_id,
+                        dataset_bindings=ds_bindings or None,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to spawn complementary sibling node; "
+                        "skipping",
+                        layer="service",
+                        graph_id=graph_id,
+                        original_desc=original_desc[:80],
+                        sibling_agent=sibling_winner.agent_name,
+                        error=str(exc),
+                        trace_id=trace_id,
+                    )
+                    continue
+
+                # Stamp this sibling's assignment onto its own node so the
+                # execution step picks the right agent.
+                try:
+                    await self._negotiation.assign_winner_to_graph(
+                        task_id=new_node_id,
+                        graph_id=graph_id,
+                        winner=sibling_winner,
+                        fallback_chain=[],
+                        trace_id=trace_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to stamp complementary winner on graph",
+                        layer="service",
+                        graph_id=graph_id,
+                        new_node_id=new_node_id,
+                        error=str(exc),
+                        trace_id=trace_id,
+                    )
+
+                # Mirror the result into the per-description map so the
+                # caller's assignment loop picks up this agent.
+                sibling_result = NegotiationResult(
+                    task_id=new_node_id,
+                    task_description=new_desc,
+                    winner=sibling_winner,
+                    fallback_chain=[],
+                    all_bids=neg_result.all_bids,
+                    negotiation_time_ms=neg_result.negotiation_time_ms,
+                    trace_id=trace_id,
+                )
+                results[new_desc] = sibling_result
+                complementary_spawned += 1
+
+        if complementary_spawned:
+            logger.info(
+                "Complementary cover expanded subtasks",
+                layer="service",
+                graph_id=graph_id,
+                spawned=complementary_spawned,
+                trace_id=trace_id,
+            )
+
         return results, bandit_decisions
 
     # ------------------------------------------------------------------
