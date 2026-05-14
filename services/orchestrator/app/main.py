@@ -25,6 +25,7 @@ from app.config import settings
 from app.routes import catalog as catalog_router
 from app.routes import conversations as conv_router
 from app.routes import events as events_router
+from app.routes import finops as finops_router
 from app.routes import governance as gov_router
 from app.routes import health as health_router
 from app.routes import ml_insights as ml_router
@@ -281,5 +282,6 @@ app.include_router(conv_router.router)
 app.include_router(sandbox_router.router)
 app.include_router(gov_router.router)
 app.include_router(ml_router.router)
+app.include_router(finops_router.router)
 app.include_router(catalog_router.router)
 app.include_router(events_router.router)

@@ -12,8 +12,43 @@ import httpx
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.services.cost_recorder import record_llm_call
+from app.services.finops_context import finops_attribution
 from app.utils.logger import logger
 from app.utils.telemetry import LLM_CALL_TOTAL, LLM_LATENCY
+
+
+def _resolve_attribution(
+    trace_id: str,
+    conversation_id: Optional[str],
+    user_id: Optional[str],
+    team_id: Optional[str],
+    agent_id: Optional[str],
+    tool_invocation_id: Optional[str],
+) -> Dict[str, Any]:
+    """Caller kwargs win; fall back to per-task FinOps context for any
+    field the caller didn't supply. trace_id is special — adapter callers
+    always pass it, so we use it directly (the contextvar is just a tiebreaker)."""
+    ctx = finops_attribution()
+    return {
+        "trace_id": trace_id or ctx.get("trace_id"),
+        "conversation_id": conversation_id if conversation_id is not None else ctx.get("conversation_id"),
+        "user_id": user_id if user_id is not None else ctx.get("user_id"),
+        "team_id": team_id if team_id is not None else ctx.get("team_id"),
+        "agent_id": agent_id if agent_id is not None else ctx.get("agent_id"),
+        "tool_invocation_id": tool_invocation_id,
+    }
+
+
+def _safe_record(**kwargs) -> None:
+    """Fire-and-forget cost recording — wrap in create_task so the LLM
+    response is never blocked or affected by recording failures."""
+    try:
+        asyncio.create_task(record_llm_call(**kwargs))
+    except Exception:
+        # If we're not inside a running loop (sync context), skip — the call
+        # path that owns this adapter always runs under FastAPI's event loop.
+        pass
 
 
 def _detect_provider(model: str) -> str:
@@ -54,6 +89,12 @@ class LLMAdapter:
         max_tokens: Optional[int] = None,
         trace_id: str = "",
         provider: Optional[str] = None,
+        # Financial Governance attribution (all optional, default None)
+        conversation_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        tool_invocation_id: Optional[str] = None,
     ) -> str:
         model = model or settings.llm_model
         temperature = temperature if temperature is not None else settings.llm_temperature
@@ -63,21 +104,42 @@ class LLMAdapter:
         async with self._semaphore:
             start = time.monotonic()
             try:
-                content = await self._dispatch_complete(provider, messages, model, temperature, max_tokens, trace_id)
+                content, usage = await self._dispatch_complete(provider, messages, model, temperature, max_tokens, trace_id)
                 elapsed = time.monotonic() - start
                 LLM_CALL_TOTAL.labels(model=model, status="success").inc()
                 LLM_LATENCY.labels(model=model).observe(elapsed)
                 logger.info("LLM call completed", layer="adapter", model=model, provider=provider,
                             duration_ms=int(elapsed * 1000), trace_id=trace_id)
+                attrib = _resolve_attribution(trace_id, conversation_id, user_id, team_id, agent_id, tool_invocation_id)
+                _safe_record(
+                    service_name="orchestrator",
+                    provider=provider, model=model,
+                    prompt_tokens=(usage or {}).get("prompt_tokens", 0),
+                    completion_tokens=(usage or {}).get("completion_tokens", 0),
+                    latency_ms=int(elapsed * 1000),
+                    finish_reason="stop", had_tool_calls=False,
+                    **attrib,
+                )
                 return content
             except Exception as exc:
                 elapsed = time.monotonic() - start
                 LLM_CALL_TOTAL.labels(model=model, status="error").inc()
                 logger.error("LLM call failed", layer="adapter", model=model, provider=provider,
                              error=str(exc), duration_ms=int(elapsed * 1000), trace_id=trace_id)
+                attrib = _resolve_attribution(trace_id, conversation_id, user_id, team_id, agent_id, tool_invocation_id)
+                _safe_record(
+                    service_name="orchestrator",
+                    provider=provider, model=model,
+                    prompt_tokens=0, completion_tokens=0,
+                    latency_ms=int(elapsed * 1000),
+                    error=str(exc),
+                    **attrib,
+                )
                 raise
 
-    async def _dispatch_complete(self, provider: str, messages, model, temperature, max_tokens, trace_id) -> str:
+    async def _dispatch_complete(self, provider: str, messages, model, temperature, max_tokens, trace_id):
+        """Returns (content_text, usage_dict) where usage_dict has
+        prompt_tokens / completion_tokens / total_tokens, or None if unknown."""
         if provider == "openai":
             return await self._openai_complete(messages, model, temperature, max_tokens)
         elif provider == "anthropic":
@@ -101,6 +163,12 @@ class LLMAdapter:
         max_tokens: Optional[int] = None,
         trace_id: str = "",
         provider: Optional[str] = None,
+        # Financial Governance attribution (all optional, default None)
+        conversation_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        tool_invocation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         model = model or settings.llm_model
         temperature = temperature if temperature is not None else settings.llm_temperature
@@ -116,11 +184,11 @@ class LLMAdapter:
                     result = await self._anthropic_complete_with_tools(messages, tools, model, temperature, max_tokens, trace_id)
                 elif provider == "google":
                     # Google doesn't have native function calling via our simple adapter — fall back to text
-                    content = await self._google_complete(messages, model, temperature, max_tokens, trace_id)
-                    result = {"content": content, "tool_calls": None, "finish_reason": "stop", "usage": None}
+                    content, usage = await self._google_complete(messages, model, temperature, max_tokens, trace_id)
+                    result = {"content": content, "tool_calls": None, "finish_reason": "stop", "usage": usage}
                 elif provider == "ollama":
-                    content = await self._ollama_complete(messages, model, temperature, max_tokens)
-                    result = {"content": content, "tool_calls": None, "finish_reason": "stop", "usage": None}
+                    content, usage = await self._ollama_complete(messages, model, temperature, max_tokens)
+                    result = {"content": content, "tool_calls": None, "finish_reason": "stop", "usage": usage}
                 else:
                     raise ValueError(f"Unsupported LLM provider: {provider}")
 
@@ -130,23 +198,50 @@ class LLMAdapter:
                 logger.info("LLM tool call completed", layer="adapter", model=model, provider=provider,
                             duration_ms=int(elapsed * 1000), finish_reason=result.get("finish_reason"),
                             has_tool_calls=bool(result.get("tool_calls")), trace_id=trace_id)
+                usage = result.get("usage") or {}
+                attrib = _resolve_attribution(trace_id, conversation_id, user_id, team_id, agent_id, tool_invocation_id)
+                _safe_record(
+                    service_name="orchestrator",
+                    provider=provider, model=model,
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0),
+                    latency_ms=int(elapsed * 1000),
+                    finish_reason=result.get("finish_reason"),
+                    had_tool_calls=bool(result.get("tool_calls")),
+                    **attrib,
+                )
                 return result
             except Exception as exc:
                 elapsed = time.monotonic() - start
                 LLM_CALL_TOTAL.labels(model=model, status="error").inc()
                 logger.error("LLM tool call failed", layer="adapter", model=model, provider=provider,
                              error=str(exc), duration_ms=int(elapsed * 1000), trace_id=trace_id)
+                attrib = _resolve_attribution(trace_id, conversation_id, user_id, team_id, agent_id, tool_invocation_id)
+                _safe_record(
+                    service_name="orchestrator",
+                    provider=provider, model=model,
+                    prompt_tokens=0, completion_tokens=0,
+                    latency_ms=int(elapsed * 1000),
+                    error=str(exc),
+                    **attrib,
+                )
                 raise
 
     # ==================================================================
     # OpenAI
     # ==================================================================
-    async def _openai_complete(self, messages, model, temperature, max_tokens) -> str:
+    async def _openai_complete(self, messages, model, temperature, max_tokens):
         client = self._get_openai()
         response = await client.chat.completions.create(
             model=model, messages=messages, temperature=temperature, max_tokens=max_tokens,
         )
-        return response.choices[0].message.content or ""
+        usage = response.usage
+        usage_dict = {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        } if usage else None
+        return (response.choices[0].message.content or ""), usage_dict
 
     async def _openai_complete_with_tools(self, messages, tools, model, temperature, max_tokens) -> Dict[str, Any]:
         client = self._get_openai()
@@ -185,7 +280,7 @@ class LLMAdapter:
     # ==================================================================
     # Anthropic
     # ==================================================================
-    async def _anthropic_complete(self, messages, model, temperature, max_tokens, trace_id="") -> str:
+    async def _anthropic_complete(self, messages, model, temperature, max_tokens, trace_id=""):
         api_key = settings.anthropic_api_key
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not configured. Set it in .env to use Anthropic models.")
@@ -226,7 +321,13 @@ class LLMAdapter:
 
         # Extract text from content blocks
         text_parts = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
-        return "\n".join(text_parts)
+        usage_raw = data.get("usage", {}) or {}
+        usage_dict = {
+            "prompt_tokens": int(usage_raw.get("input_tokens", 0)),
+            "completion_tokens": int(usage_raw.get("output_tokens", 0)),
+            "total_tokens": int(usage_raw.get("input_tokens", 0)) + int(usage_raw.get("output_tokens", 0)),
+        }
+        return "\n".join(text_parts), usage_dict
 
     async def _anthropic_complete_with_tools(self, messages, tools, model, temperature, max_tokens, trace_id="") -> Dict[str, Any]:
         api_key = settings.anthropic_api_key
@@ -332,7 +433,7 @@ class LLMAdapter:
     # ==================================================================
     # Google (Gemini via REST API)
     # ==================================================================
-    async def _google_complete(self, messages, model, temperature, max_tokens, trace_id="") -> str:
+    async def _google_complete(self, messages, model, temperature, max_tokens, trace_id=""):
         api_key = settings.google_api_key
         if not api_key:
             raise ValueError("GOOGLE_API_KEY not configured. Set it in .env to use Google models.")
@@ -361,15 +462,21 @@ class LLMAdapter:
             data = resp.json()
 
         candidates = data.get("candidates", [])
+        usage_raw = data.get("usageMetadata", {}) or {}
+        usage_dict = {
+            "prompt_tokens": int(usage_raw.get("promptTokenCount", 0)),
+            "completion_tokens": int(usage_raw.get("candidatesTokenCount", 0)),
+            "total_tokens": int(usage_raw.get("totalTokenCount", 0)),
+        }
         if candidates:
             parts = candidates[0].get("content", {}).get("parts", [])
-            return "".join(p.get("text", "") for p in parts)
-        return ""
+            return "".join(p.get("text", "") for p in parts), usage_dict
+        return "", usage_dict
 
     # ==================================================================
     # Ollama (local, OpenAI-compatible API)
     # ==================================================================
-    async def _ollama_complete(self, messages, model, temperature, max_tokens) -> str:
+    async def _ollama_complete(self, messages, model, temperature, max_tokens):
         base_url = settings.ollama_base_url.rstrip("/")
         payload = {
             "model": model, "messages": messages,
@@ -380,4 +487,11 @@ class LLMAdapter:
             resp = await client.post(f"{base_url}/api/chat", json=payload)
             resp.raise_for_status()
             data = resp.json()
-        return data.get("message", {}).get("content", "")
+        prompt_tokens = int(data.get("prompt_eval_count", 0))
+        completion_tokens = int(data.get("eval_count", 0))
+        usage_dict = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        return data.get("message", {}).get("content", ""), usage_dict

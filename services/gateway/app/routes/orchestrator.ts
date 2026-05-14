@@ -369,6 +369,50 @@ router.post('/ml/sops/proposals/:id/reject', async (req: Request, res: Response)
   });
 });
 
+// ─── Financial Governance routes ───────────────────────────────────────────
+function finopsProxy(pathname: string) {
+  return async (req: Request, res: Response): Promise<void> => {
+    const traceId = (req as Request & { id?: string }).id;
+    const qs = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+    logger.info('proxy_finops', { layer: 'router', trace_id: traceId, path: pathname });
+    await proxyRequest(req, res, {
+      targetUrl: `${config.ORCHESTRATOR_URL}${pathname}${qs}`,
+    });
+  };
+}
+
+router.get('/finops/summary',       finopsProxy('/v1/finops/summary'));
+router.get('/finops/breakdown',     finopsProxy('/v1/finops/breakdown'));
+router.get('/finops/conversations', finopsProxy('/v1/finops/conversations'));
+router.get('/finops/pricing',       finopsProxy('/v1/finops/pricing'));
+router.get('/finops/whatif',        finopsProxy('/v1/finops/whatif'));
+
+router.get('/finops/conversations/:cid', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const cid = (req.params as Record<string, string>).cid || '';
+  logger.info('proxy_finops_conv_detail', { layer: 'router', trace_id: traceId, conversation_id: cid });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/finops/conversations/${encodeURIComponent(cid)}`,
+  });
+});
+
+router.post('/finops/pricing', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  logger.info('proxy_finops_pricing_create', { layer: 'router', trace_id: traceId });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/finops/pricing`,
+  });
+});
+
+router.put('/finops/pricing/:pid', async (req: Request, res: Response): Promise<void> => {
+  const traceId = (req as Request & { id?: string }).id;
+  const pid = (req.params as Record<string, string>).pid || '';
+  logger.info('proxy_finops_pricing_update', { layer: 'router', trace_id: traceId, pricing_id: pid });
+  await proxyRequest(req, res, {
+    targetUrl: `${config.ORCHESTRATOR_URL}/v1/finops/pricing/${encodeURIComponent(pid)}`,
+  });
+});
+
 // ─── Data Catalog (systems integration) routes ─────────────────────────────
 function catalogProxy(pathname: string) {
   return async (req: Request, res: Response): Promise<void> => {

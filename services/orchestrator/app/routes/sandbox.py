@@ -910,6 +910,7 @@ async def agent_execute(body: AgentExecuteRequest, request: Request) -> AgentExe
     4. Aggregate all partial responses into one final response
     """
     trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    user_id_hdr = request.headers.get("x-user-id")
     start = time.monotonic()
     all_tool_calls: List[ToolCallRecord] = []
     total_tokens = 0
@@ -925,6 +926,31 @@ async def agent_execute(body: AgentExecuteRequest, request: Request) -> AgentExe
     )
 
     all_sub_agent_calls: List[Dict[str, Any]] = []
+
+    # Financial Governance — set per-task attribution so every nested LLM call
+    # in this endpoint (and its sub-agent fan-out) gets recorded with the
+    # correct agent_id / conversation_id / user_id / team_id. ContextVars are
+    # per asyncio task, so this scope ends naturally with the request.
+    try:
+        from app.services.finops_context import (
+            _trace_id as _fo_trace_id,
+            _conversation_id as _fo_conv_id,
+            _user_id as _fo_user_id,
+            _team_id as _fo_team_id,
+            _agent_id as _fo_agent_id,
+        )
+        if trace_id:
+            _fo_trace_id.set(trace_id)
+        if body.conversation_id:
+            _fo_conv_id.set(body.conversation_id)
+        if user_id_hdr:
+            _fo_user_id.set(user_id_hdr)
+        if body.team_id:
+            _fo_team_id.set(body.team_id)
+        if body.agent_id is not None:
+            _fo_agent_id.set(str(body.agent_id))
+    except Exception:
+        pass
 
     try:
         # Build tool name -> definition mapping

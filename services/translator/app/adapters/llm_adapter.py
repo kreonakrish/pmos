@@ -3,6 +3,10 @@
 Pared down to ``complete()`` only since the translator pipeline does not need
 tool-use yet. Keep behaviour identical across providers for easy A/B switching
 via the ``LLM_PROVIDER`` env var.
+
+Token usage and cost are recorded to the shared pmos.llm_call_log table via
+``services.cost_recorder.record_llm_call`` (Financial Governance) — fire and
+forget so the LLM response path is never blocked.
 """
 
 from __future__ import annotations
@@ -15,6 +19,8 @@ import httpx
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.services.cost_recorder import record_llm_call
+from app.services.finops_context import finops_attribution
 from app.utils.logger import logger
 
 
@@ -31,6 +37,34 @@ def _detect_provider(model: str) -> str:
     return settings.llm_provider
 
 
+def _safe_record(**kwargs) -> None:
+    try:
+        asyncio.create_task(record_llm_call(**kwargs))
+    except Exception:
+        pass
+
+
+def _resolve_attribution(
+    trace_id: str,
+    conversation_id: Optional[str],
+    user_id: Optional[str],
+    team_id: Optional[str],
+    agent_id: Optional[str],
+    tool_invocation_id: Optional[str],
+) -> Dict[str, Any]:
+    """Caller kwargs win; fall back to per-task FinOps context for any
+    field the caller didn't supply."""
+    ctx = finops_attribution()
+    return {
+        "trace_id": trace_id or ctx.get("trace_id"),
+        "conversation_id": conversation_id if conversation_id is not None else ctx.get("conversation_id"),
+        "user_id": user_id if user_id is not None else ctx.get("user_id"),
+        "team_id": team_id if team_id is not None else ctx.get("team_id"),
+        "agent_id": agent_id if agent_id is not None else ctx.get("agent_id"),
+        "tool_invocation_id": tool_invocation_id,
+    }
+
+
 class LLMAdapter:
     """Provider-agnostic async LLM client bounded by MAX_CONCURRENT_LLM_CALLS."""
 
@@ -44,8 +78,6 @@ class LLMAdapter:
         return self._openai
 
     async def health_check(self) -> bool:
-        """Lightweight connectivity probe. Returns True if at least one provider
-        has credentials configured. Does NOT call the API to avoid spend."""
         return bool(
             settings.openai_api_key
             or settings.anthropic_api_key
@@ -60,6 +92,12 @@ class LLMAdapter:
         max_tokens: Optional[int] = None,
         trace_id: str = "",
         provider: Optional[str] = None,
+        # Financial Governance attribution (all optional)
+        conversation_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        tool_invocation_id: Optional[str] = None,
     ) -> str:
         model = model or settings.llm_model
         temperature = temperature if temperature is not None else settings.llm_temperature
@@ -69,31 +107,38 @@ class LLMAdapter:
         async with self._semaphore:
             start = time.monotonic()
             try:
-                content = await self._dispatch(provider, messages, model, temperature, max_tokens, trace_id)
+                content, usage = await self._dispatch(provider, messages, model, temperature, max_tokens, trace_id)
                 elapsed = time.monotonic() - start
                 logger.info(
-                    "LLM call completed",
-                    layer="adapter",
-                    model=model,
-                    provider=provider,
-                    duration_ms=int(elapsed * 1000),
-                    trace_id=trace_id,
+                    "LLM call completed", layer="adapter", model=model, provider=provider,
+                    duration_ms=int(elapsed * 1000), trace_id=trace_id,
+                )
+                attrib = _resolve_attribution(trace_id, conversation_id, user_id, team_id, agent_id, tool_invocation_id)
+                _safe_record(
+                    service_name="translator", provider=provider, model=model,
+                    prompt_tokens=(usage or {}).get("prompt_tokens", 0),
+                    completion_tokens=(usage or {}).get("completion_tokens", 0),
+                    latency_ms=int(elapsed * 1000), finish_reason="stop",
+                    **attrib,
                 )
                 return content
             except Exception as exc:
                 elapsed = time.monotonic() - start
                 logger.error(
-                    "LLM call failed",
-                    layer="adapter",
-                    model=model,
-                    provider=provider,
-                    error=str(exc),
-                    duration_ms=int(elapsed * 1000),
-                    trace_id=trace_id,
+                    "LLM call failed", layer="adapter", model=model, provider=provider,
+                    error=str(exc), duration_ms=int(elapsed * 1000), trace_id=trace_id,
+                )
+                attrib = _resolve_attribution(trace_id, conversation_id, user_id, team_id, agent_id, tool_invocation_id)
+                _safe_record(
+                    service_name="translator", provider=provider, model=model,
+                    prompt_tokens=0, completion_tokens=0,
+                    latency_ms=int(elapsed * 1000), error=str(exc),
+                    **attrib,
                 )
                 raise
 
-    async def _dispatch(self, provider, messages, model, temperature, max_tokens, trace_id) -> str:
+    async def _dispatch(self, provider, messages, model, temperature, max_tokens, trace_id):
+        """Returns (content, usage_dict)."""
         if provider == "openai":
             return await self._openai_complete(messages, model, temperature, max_tokens)
         if provider == "anthropic":
@@ -105,14 +150,20 @@ class LLMAdapter:
         raise ValueError(f"Unsupported LLM provider: {provider}")
 
     # ------------------------------------------------------------------
-    async def _openai_complete(self, messages, model, temperature, max_tokens) -> str:
+    async def _openai_complete(self, messages, model, temperature, max_tokens):
         client = self._get_openai()
         response = await client.chat.completions.create(
             model=model, messages=messages, temperature=temperature, max_tokens=max_tokens,
         )
-        return response.choices[0].message.content or ""
+        usage = response.usage
+        usage_dict = {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        } if usage else None
+        return (response.choices[0].message.content or ""), usage_dict
 
-    async def _anthropic_complete(self, messages, model, temperature, max_tokens) -> str:
+    async def _anthropic_complete(self, messages, model, temperature, max_tokens):
         api_key = settings.anthropic_api_key
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not configured.")
@@ -147,9 +198,15 @@ class LLMAdapter:
             resp.raise_for_status()
             data = resp.json()
         text_parts = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
-        return "\n".join(text_parts)
+        usage_raw = data.get("usage", {}) or {}
+        usage_dict = {
+            "prompt_tokens": int(usage_raw.get("input_tokens", 0)),
+            "completion_tokens": int(usage_raw.get("output_tokens", 0)),
+            "total_tokens": int(usage_raw.get("input_tokens", 0)) + int(usage_raw.get("output_tokens", 0)),
+        }
+        return "\n".join(text_parts), usage_dict
 
-    async def _google_complete(self, messages, model, temperature, max_tokens) -> str:
+    async def _google_complete(self, messages, model, temperature, max_tokens):
         api_key = settings.google_api_key
         if not api_key:
             raise ValueError("GOOGLE_API_KEY not configured.")
@@ -176,12 +233,18 @@ class LLMAdapter:
             resp.raise_for_status()
             data = resp.json()
         candidates = data.get("candidates", [])
+        usage_raw = data.get("usageMetadata", {}) or {}
+        usage_dict = {
+            "prompt_tokens": int(usage_raw.get("promptTokenCount", 0)),
+            "completion_tokens": int(usage_raw.get("candidatesTokenCount", 0)),
+            "total_tokens": int(usage_raw.get("totalTokenCount", 0)),
+        }
         if candidates:
             parts = candidates[0].get("content", {}).get("parts", [])
-            return "".join(p.get("text", "") for p in parts)
-        return ""
+            return "".join(p.get("text", "") for p in parts), usage_dict
+        return "", usage_dict
 
-    async def _ollama_complete(self, messages, model, temperature, max_tokens) -> str:
+    async def _ollama_complete(self, messages, model, temperature, max_tokens):
         base_url = settings.ollama_base_url.rstrip("/")
         payload = {
             "model": model,
@@ -193,4 +256,11 @@ class LLMAdapter:
             resp = await client.post(f"{base_url}/api/chat", json=payload)
             resp.raise_for_status()
             data = resp.json()
-        return data.get("message", {}).get("content", "")
+        prompt_tokens = int(data.get("prompt_eval_count", 0))
+        completion_tokens = int(data.get("eval_count", 0))
+        usage_dict = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        return data.get("message", {}).get("content", ""), usage_dict

@@ -4731,12 +4731,14 @@ class PipelineService:
             from app.adapters.llm_adapter import _detect_provider
             provider = _detect_provider(model)
 
-        llm_response = await self._llm.complete(
-            messages=messages,
-            model=model,
-            trace_id=trace_id,
-            provider=provider,
-        )
+        from app.services.finops_context import set_finops_context
+        with set_finops_context(agent_id=(agent.agent_id if agent else None)):
+            llm_response = await self._llm.complete(
+                messages=messages,
+                model=model,
+                trace_id=trace_id,
+                provider=provider,
+            )
         return llm_response, []
 
     async def _call_sandbox_agent_execute(

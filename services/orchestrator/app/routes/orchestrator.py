@@ -18,6 +18,7 @@ from typing import Literal
 from pydantic import BaseModel
 from app.middleware.rbac import require_permission
 from app.models.pipeline import ChatRequest, ChatResponse, SessionResponse, StreamChunk
+from app.services.finops_context import set_finops_context
 from app.utils.logger import logger
 from app.utils.telemetry import REQUEST_DURATION, REQUEST_TOTAL
 
@@ -42,6 +43,7 @@ async def chat(
     request: Request,
 ) -> Any:
     trace_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    user_id_hdr = request.headers.get("x-user-id")
     pipeline = _get_pipeline(request)
     start = time.monotonic()
 
@@ -56,17 +58,23 @@ async def chat(
 
     if body.stream:
         return StreamingResponse(
-            _stream_pipeline(pipeline, body, trace_id),
+            _stream_pipeline(pipeline, body, trace_id, user_id_hdr),
             media_type="text/event-stream",
         )
 
     try:
-        result = await pipeline.execute(
-            conversation_id=body.conversation_id,
-            message=body.message,
-            team_id=body.team_id,
+        with set_finops_context(
             trace_id=trace_id,
-        )
+            conversation_id=body.conversation_id,
+            user_id=user_id_hdr,
+            team_id=body.team_id,
+        ):
+            result = await pipeline.execute(
+                conversation_id=body.conversation_id,
+                message=body.message,
+                team_id=body.team_id,
+                trace_id=trace_id,
+            )
         elapsed = time.monotonic() - start
         REQUEST_DURATION.labels(method="POST", path="/v1/orchestrator/chat").observe(elapsed)
         REQUEST_TOTAL.labels(method="POST", path="/v1/orchestrator/chat", status="200").inc()
@@ -98,7 +106,7 @@ async def chat(
         raise HTTPException(status_code=500, detail={"error": str(exc), "code": "PIPELINE_ERROR", "trace_id": trace_id})
 
 
-async def _stream_pipeline(pipeline, body: ChatRequest, trace_id: str) -> AsyncIterator[str]:
+async def _stream_pipeline(pipeline, body: ChatRequest, trace_id: str, user_id: Optional[str] = None) -> AsyncIterator[str]:
     """Yield SSE chunks while executing the pipeline."""
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:
@@ -112,12 +120,18 @@ async def _stream_pipeline(pipeline, body: ChatRequest, trace_id: str) -> AsyncI
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
 
-        result = await pipeline.execute(
-            conversation_id=body.conversation_id,
-            message=body.message,
-            team_id=body.team_id,
+        with set_finops_context(
             trace_id=trace_id,
-        )
+            conversation_id=body.conversation_id,
+            user_id=user_id,
+            team_id=body.team_id,
+        ):
+            result = await pipeline.execute(
+                conversation_id=body.conversation_id,
+                message=body.message,
+                team_id=body.team_id,
+                trace_id=trace_id,
+            )
 
         final_chunk = StreamChunk(
             type="complete",

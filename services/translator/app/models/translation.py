@@ -22,6 +22,9 @@ class TranslationRequest(BaseModel):
     team_id: Optional[str] = None
     conversation_id: Optional[str] = None
     trace_id: Optional[str] = None
+    # Financial Governance — orchestrator forwards user_id so translator-side
+    # LLM calls land in pmos.llm_call_log with the right user attribution.
+    user_id: Optional[str] = None
     # Phase F7 — multi-turn clarification dialog. Each entry is a dict with
     # at least ``role`` ('user'|'translator') and ``content``. The pipeline
     # truncates to MAX_DIALOG_TURNS internally before LLM use.

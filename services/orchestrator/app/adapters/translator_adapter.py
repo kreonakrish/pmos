@@ -28,8 +28,17 @@ class TranslatorAdapter:
         conversation_id: str = "",
         trace_id: str = "",
         prior_turns: Optional[List[Dict[str, Any]]] = None,
+        user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Phase F7: ``prior_turns`` is forwarded verbatim. Defaults to []."""
+        # FinOps: pull user_id from per-task context if the caller didn't pass one.
+        if user_id is None:
+            try:
+                from app.services.finops_context import finops_attribution
+                user_id = finops_attribution().get("user_id")
+            except Exception:
+                user_id = None
+
         url = f"{self._base_url}/v1/translate"
         payload: Dict[str, Any] = {
             "question": question,
@@ -37,6 +46,7 @@ class TranslatorAdapter:
             "conversation_id": conversation_id,
             "trace_id": trace_id,
             "prior_turns": list(prior_turns or []),
+            "user_id": user_id,
         }
         headers = {"x-request-id": trace_id} if trace_id else {}
 

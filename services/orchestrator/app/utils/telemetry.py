@@ -30,6 +30,27 @@ LLM_LATENCY = Histogram(
     ["model"],
 )
 
+# Financial Governance — token counters and dollar-cost counter, labeled by
+# model+provider+service so /v1/finops can break costs down across the three
+# Python services (orchestrator, translator, meta-assembly).
+LLM_PROMPT_TOKENS = Counter(
+    "llm_prompt_tokens_total",
+    "Total prompt (input) tokens consumed by LLM calls",
+    ["model", "provider", "service"],
+)
+
+LLM_COMPLETION_TOKENS = Counter(
+    "llm_completion_tokens_total",
+    "Total completion (output) tokens produced by LLM calls",
+    ["model", "provider", "service"],
+)
+
+LLM_COST_USD = Counter(
+    "llm_cost_usd_total",
+    "Total USD cost of LLM calls (computed from model_pricing table)",
+    ["model", "provider", "service"],
+)
+
 
 def get_metrics() -> tuple[bytes, str]:
     """Return Prometheus metrics in text exposition format."""

@@ -35,13 +35,25 @@ async def translate(req: TranslationRequest, request: Request) -> TranslationRes
         conversation_id=req.conversation_id,
     )
 
-    result = await pipeline.translate(
-        question=req.question,
-        team_id=req.team_id or "",
-        conversation_id=req.conversation_id or "",
+    # Financial Governance — set per-request attribution so internal LLM
+    # calls in the translator pipeline land in pmos.llm_call_log with the
+    # right conversation/user/team. Forwarded by the orchestrator on the
+    # TranslationRequest body.
+    from app.services.finops_context import set_finops_context
+
+    with set_finops_context(
         trace_id=trace_id,
-        prior_turns=req.prior_turns or [],
-    )
+        conversation_id=req.conversation_id,
+        user_id=req.user_id,
+        team_id=req.team_id,
+    ):
+        result = await pipeline.translate(
+            question=req.question,
+            team_id=req.team_id or "",
+            conversation_id=req.conversation_id or "",
+            trace_id=trace_id,
+            prior_turns=req.prior_turns or [],
+        )
     # ``result`` is a TranslationResult TypedDict — pydantic validates on return.
     return TranslationResponse(**result)
 

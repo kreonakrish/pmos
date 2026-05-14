@@ -30,6 +30,7 @@ import DocumentsPage from '@/pages/Documents';
 import ModelGovernancePage from '@/pages/ModelGovernance';
 import AuditorIssuesPage from '@/pages/AuditorIssues';
 import MLInsightsPage from '@/pages/MLInsights';
+import FinancialGovernancePage from '@/pages/FinancialGovernance';
 import DataCatalogPage from '@/pages/DataCatalog';
 import SchemaGraphPage from '@/pages/SchemaGraph';
 import TranslatorPage from '@/pages/Translator';
@@ -162,6 +163,9 @@ export default function App() {
               } />
               <Route path="/ml-insights" element={
                 <PermissionGate anyOf={['ml_insights.read']} redirect><MLInsightsPage /></PermissionGate>
+              } />
+              <Route path="/financial-governance" element={
+                <PermissionGate anyOf={['models.read']} redirect><FinancialGovernancePage /></PermissionGate>
               } />
               <Route path="/data-catalog" element={
                 <PermissionGate anyOf={['catalog.read']} redirect><DataCatalogPage /></PermissionGate>
