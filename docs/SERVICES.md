@@ -11,6 +11,7 @@
 | rag | Python 3.11, FastAPI, Qdrant, FAISS | 8002 | pmos-rag | Document ingestion, chunking, retrieval, re-ranking |
 | scoring | Python 3.11, FastAPI, numpy | 8003 | pmos-scoring | Score computation, adaptive bands, RL weight updates |
 | meta-assembly | Python 3.11, FastAPI, openai | 8004 | pmos-meta-assembly | Gap detection, spec generation, sandbox execution |
+| translator | Python 3.11, FastAPI, Neo4j, Qdrant | 8005 | pmos-translator | Ontology-grounded NL→domain translation, intent extraction |
 
 ## Backing Services
 
@@ -71,6 +72,14 @@
 **Neo4j nodes owned:** TaskGraph, TaskNode, ExecutionEvent, AgentInteraction, AgentCapabilityNode, SOPNode
 **MySQL tables owned:** conversations, messages, task_assignments, execution_graph_log, agent_interactions
 
+**Financial Governance (FinOps) endpoints** — token-cost reporting across every LLM call (orchestrator / translator / meta-assembly), all sourced from `pmos.llm_call_log`. Backs the **Financial Governance** frontend page:
+- `GET /v1/finops/summary?period=24h|7d|30d|all` — KPI strip + daily trend + top breakdowns
+- `GET /v1/finops/breakdown?group_by=service|team|agent|model|conversation|user` — drill-down aggregator
+- `GET /v1/finops/conversations` — top conversations by cost
+- `GET /v1/finops/conversations/:id` — per-LLM-call timeline for one conversation
+- `GET/POST/PUT /v1/finops/pricing` — editable per-MTok `model_pricing` rates
+- `GET /v1/finops/whatif?agent_id=&candidate_model=` — projected savings on an agent model swap
+
 ---
 
 ## Memory (port 8001)
@@ -130,3 +139,18 @@
 
 **Produces:** `events:capability_added` Redis stream
 **Safety:** All generated code runs in isolated subprocess with timeout + memory limits
+
+---
+
+## Translator (port 8005)
+
+**Owns:** Ontology-grounded natural-language translation. Converts a raw user question into a structured, domain-aware decomposition the orchestrator can route — extracts intent, resolves canonical entities, binds them to datasets, and emits per-domain subtasks. The orchestrator calls this *before* decomposition via `TranslatorAdapter`; any failure degrades gracefully to the bare decomposition prompt (`fallback_used=true`).
+
+**Key endpoints:**
+- `POST /v1/translate` — translate an NL question. Returns `{intent, domain, canonical_entities, relationships, dataset_bindings, domain_subtasks, used_ontology_subgraph, ontology_versions, matched_reports, clarification_needed, schema_meta_column, fallback_used}`
+- `POST /v1/translator/examples` — promote a vetted translation into the `translation_examples` Qdrant collection (few-shot retrieval corpus)
+- `GET /health` — Neo4j + Qdrant + LLM readiness
+
+**Consumes:** Ontology Neo4j (business ontology graph — `BusinessAttribute -MAPS_TO-> DataColumn -> DataAsset`), Qdrant (`translation_examples` few-shot collection), an LLM provider.
+
+**Notes:** Multi-turn clarification supported via `prior_turns`. Internal LLM calls are attributed to `pmos.llm_call_log` for Financial Governance (orchestrator forwards `user_id`/`conversation_id`/`team_id` on the request body).
